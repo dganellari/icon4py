@@ -65,7 +65,7 @@ def cloud_x_ice(t, qc, qi, dt):
     # Homogeneous freezing
     result = jnp.where((qc > const.qmin) & (t < const.tfrz_hom), qc / dt, 0.0)
     # Melting
-    tmelt = const.cpd / const.rd  # Approximation for tmelt from t_d
+    tmelt = const.tmelt
     result = jnp.where((qi > const.qmin) & (t > tmelt), -qi / dt, result)
     return result
 
@@ -76,7 +76,7 @@ def graupel_to_rain(t, p, rho, dvsw0, qg):
     B_MELT = 0.6
     C1_MELT = 12.31698
     C2_MELT = 7.39441e-05
-    tmelt = const.cpd / const.rd
+    tmelt = const.tmelt
     mask = (t > jnp.maximum(tmelt, tmelt - const.tx * dvsw0)) & (qg > const.qmin)
     return jnp.where(
         mask,
@@ -125,7 +125,7 @@ def ice_to_snow(qi, ns, lam, sticking_eff):
 
 def rain_to_graupel(t, rho, qc, qr, qi, qs, mi, dvsw, dt):
     """Conversion rate from rain to graupel (freezing + collection)."""
-    tmelt = const.cpd / const.rd
+    tmelt = const.tmelt
     TFRZ_RAIN = tmelt - 2.0
     A1 = 9.95e-5
     B1 = 1.75
@@ -160,7 +160,7 @@ def rain_to_graupel(t, rho, qc, qr, qi, qs, mi, dvsw, dt):
 
 def rain_to_vapor(t, rho, qc, qr, dvsw, dt):
     """Conversion rate from rain to vapor (evaporation)."""
-    tmelt = const.cpd / const.rd
+    tmelt = const.tmelt
     B1_RV = 0.16667
     B2_RV = 0.55555
     C1_RV = 0.61
@@ -194,7 +194,7 @@ def snow_to_graupel(t, rho, qc, qs):
 
 def snow_to_rain(t, p, rho, dvsw0, qs):
     """Conversion rate from snow to rain (melting)."""
-    tmelt = const.cpd / const.rd
+    tmelt = const.tmelt
     C1_SR = 79.6863
     C2_SR = 0.612654e-3
     A_SR = const.tx - 389.5
@@ -214,7 +214,7 @@ def vapor_x_graupel(t, p, rho, qg, dvsw, dvsi, dvsw0, dt):
     Positive = vapor deposits on graupel.
     Negative = graupel sublimes to vapor.
     """
-    tmelt = const.cpd / const.rd
+    tmelt = const.tmelt
     A1_VG = 0.398561
     A2_VG = -0.00152398
     A3 = 2554.99
@@ -271,7 +271,7 @@ def vapor_x_snow(t, p, rho, qs, ns, lam, eta, ice_dep, dvsw, dvsi, dvsw0, dt):
     Positive = vapor deposits on snow.
     Negative = snow sublimes to vapor.
     """
-    tmelt = const.cpd / const.rd
+    tmelt = const.tmelt
     NU = 1.75e-5
     A0_VS = 1.0
     A1_VS = 0.4182 * jnp.sqrt(const.v0s / NU)

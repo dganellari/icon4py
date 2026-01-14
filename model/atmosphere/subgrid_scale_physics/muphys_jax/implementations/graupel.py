@@ -256,11 +256,11 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     vc_i = props.vel_scale_factor_ice(xrho)
     vc_g = props.vel_scale_factor_default(xrho)
 
-    # Fall speed parameters
-    PREFACTOR_R, EXPONENT_R, OFFSET_R = 130.0, 0.5, 0.0
-    PREFACTOR_S, EXPONENT_S, OFFSET_S = const.v0s, const.v1s, 0.0
-    PREFACTOR_I, EXPONENT_I, OFFSET_I = 27.7, 0.216, 0.0
-    PREFACTOR_G, EXPONENT_G, OFFSET_G = 442.0, 0.89, 0.0
+    # Fall speed parameters (from GT4Py idx namespace)
+    PREFACTOR_R, EXPONENT_R, OFFSET_R = 14.58, 0.111, 1.0e-12
+    PREFACTOR_S, EXPONENT_S, OFFSET_S = 57.80, 0.16666666666666666, 1.0e-12
+    PREFACTOR_I, EXPONENT_I, OFFSET_I = 1.25, 0.160, 1.0e-12
+    PREFACTOR_G, EXPONENT_G, OFFSET_G = 12.24, 0.217, 1.0e-08
 
     # Run 4 precipitation scans
     result_r = precip_scan(

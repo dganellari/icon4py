@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""
+JAX graupel driver compatible with GT4Py run_graupel_only.py interface.
+Uses the same NetCDF input files and produces comparable output.
+
+Usage:
+    python run_graupel_jax.py -o output.nc -b xla input.nc 10 30.0 100.0
+"""
+
+import argparse
+import pathlib
+import time
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import netCDF4
+import numpy as np
+
+from muphys_jax.core.definitions import Q
+from muphys_jax.implementations.graupel import graupel_run
+
+
+def _calc_dz(z: np.ndarray) -> np.ndarray:
+    """Calculate layer thickness from geometric height (same as GT4Py version)."""
+    ksize = z.shape[0]
+    dz = np.zeros(z.shape, np.float64)
+    zh = 1.5 * z[ksize - 1, :] - 0.5 * z[ksize - 2, :]
+    for k in range(ksize - 1, -1, -1):
+        zh_new = 2.0 * z[k, :] - zh
+        dz[k, :] = -zh + zh_new
+        zh = zh_new
+    return dz
+
+
+class GraupelInput(NamedTuple):
+    """Input data for graupel scheme."""
+    ncells: int
+    nlev: int
+    dz: jnp.ndarray
+    p: jnp.ndarray
+    rho: jnp.ndarray
+    t: jnp.ndarray
+    q: Q
+
+    @classmethod
+    def load(cls, filename: pathlib.Path | str) -> "GraupelInput":
+        """Load input from NetCDF file."""
+        with netCDF4.Dataset(filename, mode="r") as ncfile:
+            # Get dimensions
+            try:
+                ncells = len(ncfile.dimensions["cell"])
+            except KeyError:
+                ncells = len(ncfile.dimensions["ncells"])
+            nlev = len(ncfile.dimensions["height"])
+
+            # Calculate layer thickness
+            dz = _calc_dz(ncfile.variables["zg"])
+            dz = np.transpose(dz)  # (height, ncells) -> (ncells, height)
+
+            # Load variables (transpose from (height, ncells) to (ncells, height))
+            def load_var(varname: str) -> np.ndarray:
+                var = ncfile.variables[varname]
+                if var.dimensions[0] == "time":
+                    var = var[0, :, :]
+                return np.transpose(var).astype(np.float64)
+
+            # Create Q structure
+            q = Q(
+                v=jnp.array(load_var("hus")),   # specific humidity (vapor)
+                c=jnp.array(load_var("clw")),   # cloud liquid water
+                r=jnp.array(load_var("qr")),    # rain
+                s=jnp.array(load_var("qs")),    # snow
+                i=jnp.array(load_var("cli")),   # cloud ice
+                g=jnp.array(load_var("qg")),    # graupel
+            )
+
+            return cls(
+                ncells=ncells,
+                nlev=nlev,
+                dz=jnp.array(dz),
+                t=jnp.array(load_var("ta")),
+                p=jnp.array(load_var("pfull")),
+                rho=jnp.array(load_var("rho")),
+                q=q,
+            )
+
+
+class GraupelOutput(NamedTuple):
+    """Output data from graupel scheme."""
+    t: np.ndarray
+    q: Q
+    pflx: np.ndarray
+    pr: np.ndarray
+    ps: np.ndarray
+    pi: np.ndarray
+    pg: np.ndarray
+    pre: np.ndarray
+
+    def write(self, filename: pathlib.Path | str):
+        """Write output to NetCDF file."""
+        ncells = self.t.shape[0]
+        nlev = self.t.shape[1]
+
+        with netCDF4.Dataset(filename, mode="w") as ncfile:
+            ncfile.createDimension("ncells", ncells)
+            ncfile.createDimension("height", nlev)
+
+            def write_field(varname: str, data: np.ndarray):
+                var = ncfile.createVariable(varname, np.float64, ("height", "ncells"))
+                var[...] = data.transpose()
+
+            write_field("ta", self.t)
+            write_field("hus", self.q.v)
+            write_field("clw", self.q.c)
+            write_field("cli", self.q.i)
+            write_field("qr", self.q.r)
+            write_field("qs", self.q.s)
+            write_field("qg", self.q.g)
+            write_field("pflx", self.pflx)
+            write_field("prr_gsp", self.pr)
+            write_field("prs_gsp", self.ps)
+            write_field("pri_gsp", self.pi)
+            write_field("prg_gsp", self.pg)
+            write_field("pre_gsp", self.pre)
+
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        description="Run JAX graupel scheme (compatible with GT4Py run_graupel_only.py)"
+    )
+    parser.add_argument(
+        "-o", metavar="output_file", dest="output_file", help="output filename", default="output.nc"
+    )
+    parser.add_argument(
+        "-b", metavar="backend", dest="backend", help="JAX backend (xla or iree)", default="xla"
+    )
+    parser.add_argument("input_file", help="input NetCDF data file")
+    parser.add_argument("itime", help="number of iterations", nargs="?", type=int, default=0)
+    parser.add_argument("dt", help="timestep (seconds)", nargs="?", type=float, default=30.0)
+    parser.add_argument("qnc", help="cloud droplet number concentration (m^-3)", nargs="?", type=float, default=100.0)
+
+    return parser.parse_args()
+
+
+def main():
+    args = get_args()
+
+    # Set JAX backend
+    import os
+    os.environ["JAX_BACKEND"] = args.backend
+    print(f"Using JAX backend: {args.backend}")
+    print(f"JAX devices: {jax.devices()}")
+    print(f"JAX default backend: {jax.default_backend()}")
+
+    # Load input data
+    print(f"Loading input from: {args.input_file}")
+    inp = GraupelInput.load(pathlib.Path(args.input_file))
+    print(f"Grid size: {inp.ncells} cells × {inp.nlev} levels")
+    print(f"Temperature range: {np.array(inp.t).min():.1f} - {np.array(inp.t).max():.1f} K")
+    print(f"Timestep: {args.dt} s")
+    print(f"Cloud droplet concentration: {args.qnc} m^-3")
+
+    # Warmup compilation
+    print("\nWarming up (JIT compilation)...")
+    t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
+        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc
+    )
+    # Block until compilation completes
+    t_out.block_until_ready()
+    print("Compilation complete!")
+
+    # Run iterations with timing
+    start_time = None
+    num_iters = int(args.itime)
+
+    for iteration in range(num_iters + 1):
+        if iteration == 1:  # Start timing after first warmup iteration
+            start_time = time.time()
+
+        t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
+            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc
+        )
+
+    # Block until all computations complete
+    t_out.block_until_ready()
+    end_time = time.time()
+
+    if start_time is not None:
+        elapsed_time = end_time - start_time
+        print(f"\nFor {num_iters} iterations it took {elapsed_time:.4f} seconds!")
+        print(f"Time per iteration: {elapsed_time / num_iters:.4f} seconds")
+
+    # Convert outputs to numpy
+    print("\nConverting outputs to numpy arrays...")
+    out = GraupelOutput(
+        t=np.array(t_out),
+        q=Q(
+            v=np.array(q_out.v),
+            c=np.array(q_out.c),
+            r=np.array(q_out.r),
+            s=np.array(q_out.s),
+            i=np.array(q_out.i),
+            g=np.array(q_out.g),
+        ),
+        pflx=np.array(pflx),
+        pr=np.array(pr),
+        ps=np.array(ps),
+        pi=np.array(pi),
+        pg=np.array(pg),
+        pre=np.array(pre),
+    )
+
+    # Verification
+    print("\nOutput verification:")
+    print(f"Temperature range: {out.t.min():.1f} - {out.t.max():.1f} K")
+    print(f"Temperature change: {(out.t - np.array(inp.t)).mean():.2e} K")
+    print(f"Max precipitation flux: {out.pflx.max():.2e}")
+
+    # Write output
+    print(f"\nWriting output to: {args.output_file}")
+    out.write(args.output_file)
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()

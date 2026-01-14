@@ -154,17 +154,13 @@ def temperature_scan_step(previous_level, inputs):
     """
     t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask = inputs
 
-    # Heat capacity constants
-    cvd = 717.0  # Dry air specific heat at constant volume
-    cvv = 1418.0  # Water vapor specfic heat at constant volume
-
     # Activation mask (cumulative OR from top to bottom)
     current_level_activated = previous_level.activated | mask
 
     # Energy flux from precipitation (always compute)
     eflx_new = dt * (
-        pr * (const.clw * t - cvd * t_kp1 - const.lvc) +
-        pflx_tot * (const.ci * t - cvd * t_kp1 - const.lsc)
+        pr * (const.clw * t - const.cvd * t_kp1 - const.lvc) +
+        pflx_tot * (const.ci * t - const.cvd * t_kp1 - const.lsc)
     )
 
     # Internal energy update
@@ -172,7 +168,7 @@ def temperature_scan_step(previous_level, inputs):
 
     # Calculate temperature from internal energy
     qtot = qliq + qice + qv  # total water specific mass
-    cv = (cvd * (1.0 - qtot) + cvv * qv + const.clw * qliq + const.ci * qice) * rho * dz
+    cv = (const.cvd * (1.0 - qtot) + const.cvv * qv + const.clw * qliq + const.ci * qice) * rho * dz
     t_new = (e_int + rho * dz * (qliq * const.lvc + qice * const.lsc)) / cv
 
     # Conditional selection based on activation mask

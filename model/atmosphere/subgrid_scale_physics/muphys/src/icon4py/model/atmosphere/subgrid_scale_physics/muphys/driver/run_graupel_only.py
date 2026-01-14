@@ -66,19 +66,33 @@ def main():
     args = get_args()
 
     backend = model_backends.BACKENDS[args.backend]
+    print(f"Using GT4Py backend: {args.backend}")
+
     allocator = model_backends.get_allocator(backend)
 
+    print(f"Loading input from: {args.input_file}")
     inp = common.GraupelInput.load(filename=pathlib.Path(args.input_file), allocator=allocator)
+    print(f"Grid size: {inp.ncells} cells × {inp.nlev} levels")
+
+    # Get input statistics
+    import numpy as np
+    t_np = inp.t.asnumpy()
+    print(f"Temperature range: {t_np.min():.1f} - {t_np.max():.1f} K")
+    print(f"Timestep: {float(args.dt)} s")
+    print(f"Cloud droplet concentration: {float(args.qnc)} m^-3")
+
     out = common.GraupelOutput.allocate(
         domain=gtx.domain({dims.CellDim: inp.ncells, dims.KDim: inp.nlev}), allocator=allocator
     )
 
+    print("\nWarming up (JIT compilation)...")
     graupel_run_program = setup_graupel(inp, dt=args.dt, qnc=args.qnc, backend=backend)
+    print("Compilation complete!")
 
     start_time = None
     for _x in range(int(args.itime) + 1):
         if _x == 1:  # Only start timing second iteration
-            device_utils.sync(backend)
+            device_utils.sync(allocator)
             start_time = time.time()
 
         graupel_run_program(
@@ -96,14 +110,25 @@ def main():
             pg=out.pg,
             pre=out.pre,
         )
-    device_utils.sync(backend)
+    device_utils.sync(allocator)
     end_time = time.time()
 
     if start_time is not None:
         elapsed_time = end_time - start_time
-        print("For", int(args.itime), "iterations it took", elapsed_time, "seconds!")
+        print(f"\nFor {int(args.itime)} iterations it took {elapsed_time:.4f} seconds!")
+        print(f"Time per iteration: {elapsed_time / int(args.itime):.4f} seconds")
 
+    # Output verification
+    print("\nOutput verification:")
+    t_out_np = out.t.asnumpy()
+    print(f"Temperature range: {t_out_np.min():.1f} - {t_out_np.max():.1f} K")
+    print(f"Temperature change: {(t_out_np - t_np).mean():.2e} K")
+    pflx_np = out.pflx.asnumpy()
+    print(f"Max precipitation flux: {pflx_np.max():.2e}")
+
+    print(f"\nWriting output to: {args.output_file}")
     out.write(args.output_file)
+    print("Done!")
 
 
 if __name__ == "__main__":
