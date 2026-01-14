@@ -8,141 +8,140 @@
 
 """
 Scan operators for vertical physics in muphys microphysics.
+
+Optimized for GPU execution with:
+- lax.pow for better kernel fusion
+- lax.select for branchless conditionals
+- Batched precipitation scans via vmap for parallel execution
 """
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .definitions import PrecipState, TempState
+from .definitions import TempState
 from .common import constants as const
 
 
-def precip_scan_step(previous_level, inputs):
+def precip_scan_step_fast(carry, inputs):
     """
-    Single step of precipitation scan operator.
+    Optimized precipitation scan step using tuple carry.
 
-    This is the scan function that processes one vertical level at a time.
-
-    Args:
-        previous_level: PrecipState from the level above (or initial state)
-        inputs: Tuple of (prefactor, exponent, offset, zeta, vc, q, rho, mask)
-
-    Returns:
-        current_level: PrecipState for this level
-        current_level: PrecipState (output to accumulate)
+    Carry: (q_update, flx, rho_prev, vc_prev, activated) - 5 arrays
+    Inputs: (prefactor, exponent, offset, zeta, vc, q, rho, mask)
     """
+    q_prev, flx_prev, rho_prev, vc_prev, activated_prev = carry
     prefactor, exponent, offset, zeta, vc, q, rho, mask = inputs
 
-    # Update activation mask (activated if any previous level or current level is masked)
-    current_level_activated = previous_level.activated | mask
+    # Update activation mask
+    activated = activated_prev | mask
 
     # Calculate precipitation flux with terminal velocity
     rho_x = q * rho
-    flx_eff = (rho_x / zeta) + 2.0 * previous_level.flx
+    flx_eff = (rho_x / zeta) + 2.0 * flx_prev
 
-    # Inlined fall speed calculation
-    flx_partial = jnp.minimum(
-        rho_x * vc * prefactor * jnp.power(rho_x + offset, exponent),
-        flx_eff
-    )
+    # Inlined fall speed - use lax.pow for better fusion
+    fall_speed = prefactor * lax.pow(rho_x + offset, exponent)
+    flx_partial = lax.min(rho_x * vc * fall_speed, flx_eff)
 
     # Density-weighted specific mass from previous level
-    rhox_prev = (previous_level.q_update + q) * 0.5 * previous_level.rho
+    rhox_prev = (q_prev + q) * 0.5 * rho_prev
 
-    # Terminal velocity (depends on previous level activation)
-    vt = jnp.where(
-        previous_level.activated,
-        previous_level.vc * prefactor * jnp.power(rhox_prev + offset, exponent),
-        0.0
-    )
+    # Terminal velocity - branchless with lax.select
+    vt_active = vc_prev * prefactor * lax.pow(rhox_prev + offset, exponent)
+    vt = lax.select(activated_prev, vt_active, jnp.zeros_like(q))
 
-    # Update specific mass and flux (depends on current level activation)
-    next_q_update = jnp.where(
-        current_level_activated,
-        (zeta * (flx_eff - flx_partial)) / ((1.0 + zeta * vt) * rho),
-        q
-    )
+    # Compute activated values
+    q_activated = (zeta * (flx_eff - flx_partial)) / ((1.0 + zeta * vt) * rho)
+    flx_activated = (q_activated * rho * vt + flx_partial) * 0.5
 
-    next_flx = jnp.where(
-        current_level_activated,
-        (next_q_update * rho * vt + flx_partial) * 0.5,
-        0.0
-    )
+    # Branchless selection
+    q_out = lax.select(activated, q_activated, q)
+    flx_out = lax.select(activated, flx_activated, jnp.zeros_like(q))
 
-    current_level = PrecipState(
-        q_update=next_q_update,
-        flx=next_flx,
-        rho=rho,
-        vc=vc,
-        activated=current_level_activated,
-    )
+    new_carry = (q_out, flx_out, rho, vc, activated)
+    outputs = (q_out, flx_out)
 
-    return current_level, current_level
+    return new_carry, outputs
 
 
-def precip_scan(prefactor, exponent, offset, zeta, vc, q, rho, mask):
+def _single_species_scan(params, zeta, rho, q, vc, mask):
     """
-    Precipitation scan operator for vertical sedimentation.
-
-    Scans vertically (forward, top to bottom) to compute precipitation sedimentation.
+    Single species precipitation scan for use with vmap.
 
     Args:
-        prefactor: Fall speed prefactor - shape (ncells, nlev)
-        exponent: Fall speed exponent - shape (ncells, nlev)
-        offset: Fall speed offset - shape (ncells, nlev)
-        zeta: dt/(2*dz) time/space ratio - shape (ncells, nlev)
-        vc: Fall speed correction - shape (ncells, nlev)
-        q: Specific mass of hydrometeor - shape (ncells, nlev)
-        rho: Air density - shape (ncells, nlev)
-        mask: Activation mask - shape (ncells, nlev)
+        params: (prefactor, exponent, offset) - scalars
+        zeta: dt/(2*dz) - shape (ncells, nlev)
+        rho: density - shape (ncells, nlev)
+        q: specific mass - shape (ncells, nlev)
+        vc: velocity correction - shape (ncells, nlev)
+        mask: activation mask - shape (ncells, nlev)
 
     Returns:
-        PrecipState with q_update, flx, rho, vc, activated - each shape (ncells, nlev)
+        (q_update, flx) - each shape (ncells, nlev)
     """
+    prefactor, exponent, offset = params
     ncells, nlev = q.shape
 
-    # Initial state (all zeros/False)
-    init_state = PrecipState(
-        q_update=jnp.zeros(ncells),
-        flx=jnp.zeros(ncells),
-        rho=jnp.zeros(ncells),
-        vc=jnp.zeros(ncells),
-        activated=jnp.zeros(ncells, dtype=bool),
+    # Broadcast parameters
+    prefactor_arr = jnp.broadcast_to(prefactor, (nlev, ncells))
+    exponent_arr = jnp.broadcast_to(exponent, (nlev, ncells))
+    offset_arr = jnp.broadcast_to(offset, (nlev, ncells))
+
+    init_carry = (
+        jnp.zeros(ncells),
+        jnp.zeros(ncells),
+        jnp.zeros(ncells),
+        jnp.zeros(ncells),
+        jnp.zeros(ncells, dtype=bool),
     )
 
-    # Transpose to (nlev, ncells) for scanning over axis 0
-    inputs = (
-        prefactor.T,  # (nlev, ncells)
-        exponent.T,
-        offset.T,
-        zeta.T,
-        vc.T,
-        q.T,
-        rho.T,
-        mask.T,
+    inputs = (prefactor_arr, exponent_arr, offset_arr, zeta.T, vc.T, q.T, rho.T, mask.T)
+
+    final_carry, outputs = lax.scan(precip_scan_step_fast, init_carry, inputs)
+    q_out, flx_out = outputs
+
+    return q_out.T, flx_out.T
+
+
+def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
+    """
+    Batch 4 precipitation scans together for better GPU utilization.
+
+    Uses jax.vmap to run all 4 species (rain, snow, ice, graupel) in parallel.
+
+    Args:
+        params_list: List of 4 (prefactor, exponent, offset) tuples
+        zeta: Common zeta array - shape (ncells, nlev)
+        rho: Common rho array - shape (ncells, nlev)
+        q_list: List of 4 q arrays [qr, qs, qi, qg]
+        vc_list: List of 4 vc arrays
+        mask_list: List of 4 mask arrays
+
+    Returns:
+        List of 4 (q_update, flx) tuples
+    """
+    # Stack inputs for vectorization
+    params_stacked = jnp.array(params_list)  # (4, 3)
+    q_stacked = jnp.stack(q_list, axis=0)  # (4, ncells, nlev)
+    vc_stacked = jnp.stack(vc_list, axis=0)  # (4, ncells, nlev)
+    mask_stacked = jnp.stack(mask_list, axis=0)  # (4, ncells, nlev)
+
+    # vmap over the 4 species (axis 0)
+    batched_scan = jax.vmap(
+        lambda p, q, vc, m: _single_species_scan(p, zeta, rho, q, vc, m),
+        in_axes=(0, 0, 0, 0)
     )
 
-    # Scan over vertical levels (axis 0)
-    final_state, outputs = lax.scan(precip_scan_step, init_state, inputs)
+    q_updates, flxs = batched_scan(params_stacked, q_stacked, vc_stacked, mask_stacked)
 
-    # Transpose outputs back to (ncells, nlev)
-    result = PrecipState(
-        q_update=outputs.q_update.T,
-        flx=outputs.flx.T,
-        rho=outputs.rho.T,
-        vc=outputs.vc.T,
-        activated=outputs.activated.T,
-    )
-
-    return result
+    # Unstack results
+    return [(q_updates[i], flxs[i]) for i in range(4)]
 
 
 def temperature_scan_step(previous_level, inputs):
     """
     Single step of temperature update scan operator.
-
-    Computes temperature changes from latent heat and precipitation flux.
 
     Args:
         previous_level: TempState from the level above (or initial state)
@@ -150,75 +149,32 @@ def temperature_scan_step(previous_level, inputs):
 
     Returns:
         current_level: TempState for this level
-        current_level: TempState (output to accumlate)
+        current_level: TempState (output to accumulate)
     """
     t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask = inputs
 
     # Activation mask (cumulative OR from top to bottom)
     current_level_activated = previous_level.activated | mask
 
-    # Energy flux from precipitation (always compute)
+    # Energy flux from precipitation
+    cvd_t_kp1 = const.cvd * t_kp1
     eflx_new = dt * (
-        pr * (const.clw * t - const.cvd * t_kp1 - const.lvc) +
-        pflx_tot * (const.ci * t - const.cvd * t_kp1 - const.lsc)
+        pr * (const.clw * t - cvd_t_kp1 - const.lvc) +
+        pflx_tot * (const.ci * t - cvd_t_kp1 - const.lsc)
     )
 
     # Internal energy update
     e_int = ei_old + previous_level.eflx - eflx_new
 
     # Calculate temperature from internal energy
-    qtot = qliq + qice + qv  # total water specific mass
-    cv = (const.cvd * (1.0 - qtot) + const.cvv * qv + const.clw * qliq + const.ci * qice) * rho * dz
-    t_new = (e_int + rho * dz * (qliq * const.lvc + qice * const.lsc)) / cv
+    qtot = qliq + qice + qv
+    rho_dz = rho * dz
+    cv = (const.cvd * (1.0 - qtot) + const.cvv * qv + const.clw * qliq + const.ci * qice) * rho_dz
+    t_new = (e_int + rho_dz * (qliq * const.lvc + qice * const.lsc)) / cv
 
-    # Conditional selection based on activation mask
-    eflx = jnp.where(current_level_activated, eflx_new, previous_level.eflx)
-    t_out = jnp.where(current_level_activated, t_new, t)
+    # Branchless selection
+    eflx = lax.select(current_level_activated, eflx_new, previous_level.eflx)
+    t_out = lax.select(current_level_activated, t_new, t)
 
-    current_level = TempState(t=t_out, eflx=eflx, activated=current_level_activated)
-
-    return current_level, current_level
-
-
-def temperature_scan(zeta, lheat, q_update, rho):
-    """
-    Temperature update scan operator.
-
-    Scans vertically (forward, top to bottom) to compute temperature changes
-    from latent heat release due to phase transitions.
-
-    Args:
-        zeta: dt/(2*dz) time/space ratio - shape (ncells, nlev)
-        lheat: Latent heat coefficient - shape (ncells, nlev)
-        q_update: Specific mass change from precipitation - shape (ncells, nlev)
-        rho: Air density - shape (ncells, nlev)
-
-    Returns:
-        TempState with te_update and flx - each shape (ncells, nlev)
-    """
-    ncells, nlev = q_update.shape
-
-    # Initial state (all zeros)
-    init_state = TempState(
-        te_update=jnp.zeros(ncells),
-        flx=jnp.zeros(ncells),
-    )
-
-    # Transpose to (nlev, ncells) for scanning over axis 0
-    inputs = (
-        zeta.T,       # (nlev, ncells)
-        lheat.T,
-        q_update.T,
-        rho.T,
-    )
-
-    # Scan over vertical levels (axis 0)
-    final_state, outputs = lax.scan(temperature_scan_step, init_state, inputs)
-
-    # Transpose outputs back to (ncells, nlev)
-    result = TempState(
-        te_update=outputs.te_update.T,
-        flx=outputs.flx.T,
-    )
-
-    return result
+    result = TempState(t=t_out, eflx=eflx, activated=current_level_activated)
+    return result, result

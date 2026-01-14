@@ -22,7 +22,7 @@ from ..core.common.backend import jit_compile
 from ..core import transitions as trans
 from ..core import properties as props
 from ..core import thermo
-from ..core.scans import precip_scan, precip_scan_step, temperature_scan_step
+from ..core.scans import temperature_scan_step, precip_scan_batched
 
 
 # ============================================================================
@@ -241,6 +241,8 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     """
     Apply precipitation sedimentation and temperature effects.
     From graupel.py:366-424.
+
+    Optimized to batch all 4 precipitation scans via vmap for better GPU utilization.
     """
     # Store initial state for energy calculation
     qliq = q_in.c + q_in.r
@@ -257,35 +259,26 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     vc_g = props.vel_scale_factor_default(xrho)
 
     # Fall speed parameters (from GT4Py idx namespace)
-    PREFACTOR_R, EXPONENT_R, OFFSET_R = 14.58, 0.111, 1.0e-12
-    PREFACTOR_S, EXPONENT_S, OFFSET_S = 57.80, 0.16666666666666666, 1.0e-12
-    PREFACTOR_I, EXPONENT_I, OFFSET_I = 1.25, 0.160, 1.0e-12
-    PREFACTOR_G, EXPONENT_G, OFFSET_G = 12.24, 0.217, 1.0e-08
+    # Order: rain, snow, ice, graupel
+    params_list = [
+        (14.58, 0.111, 1.0e-12),                    # rain
+        (57.80, 0.16666666666666666, 1.0e-12),      # snow
+        (1.25, 0.160, 1.0e-12),                     # ice
+        (12.24, 0.217, 1.0e-08),                    # graupel
+    ]
 
-    # Run 4 precipitation scans
-    result_r = precip_scan(
-        jnp.full_like(zeta, PREFACTOR_R), jnp.full_like(zeta, EXPONENT_R),
-        jnp.full_like(zeta, OFFSET_R), zeta, vc_r, q_in.r, rho, kmin_r
+    # Run batched precipitation scans (all 4 species in parallel via vmap)
+    results = precip_scan_batched(
+        params_list,
+        zeta,
+        rho,
+        [q_in.r, q_in.s, q_in.i, q_in.g],
+        [vc_r, vc_s, vc_i, vc_g],
+        [kmin_r, kmin_s, kmin_i, kmin_g],
     )
-    qr, pr = result_r.q_update, result_r.flx
 
-    result_s = precip_scan(
-        jnp.full_like(zeta, PREFACTOR_S), jnp.full_like(zeta, EXPONENT_S),
-        jnp.full_like(zeta, OFFSET_S), zeta, vc_s, q_in.s, rho, kmin_s
-    )
-    qs, ps = result_s.q_update, result_s.flx
-
-    result_i = precip_scan(
-        jnp.full_like(zeta, PREFACTOR_I), jnp.full_like(zeta, EXPONENT_I),
-        jnp.full_like(zeta, OFFSET_I), zeta, vc_i, q_in.i, rho, kmin_i
-    )
-    qi, pi = result_i.q_update, result_i.flx
-
-    result_g = precip_scan(
-        jnp.full_like(zeta, PREFACTOR_G), jnp.full_like(zeta, EXPONENT_G),
-        jnp.full_like(zeta, OFFSET_G), zeta, vc_g, q_in.g, rho, kmin_g
-    )
-    qg, pg = result_g.q_update, result_g.flx
+    # Unpack results: rain, snow, ice, graupel
+    (qr, pr), (qs, ps), (qi, pi), (qg, pg) = results
 
     # Update for temperature scan
     qliq = q_in.c + qr
