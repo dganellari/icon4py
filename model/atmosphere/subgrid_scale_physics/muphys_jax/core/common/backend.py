@@ -8,29 +8,11 @@
 
 """
 Backend configuration for JAX muphys implementation.
-Switch between XLA and IREE backends via environment variable.
 """
 
-import os
 import jax
 
-# Backend selection via environment variable
-BACKEND = os.getenv('JAX_BACKEND', 'xla').lower()
+# Use JAX JIT compilation
+jit_compile = jax.jit
 
-if BACKEND == 'iree':
-    try:
-        from jax.experimental.jax2iree import jax2iree_jit as jit_compile
-        print(f"[muphys_jax] Using IREE backend")
-    except ImportError:
-        print(f"[muphys_jax] IREE not available, falling back to XLA")
-        print(f"[muphys_jax] Install with: pip install iree-compiler iree-runtime")
-        jit_compile = jax.jit
-        BACKEND = 'xla'
-elif BACKEND == 'xla':
-    jit_compile = jax.jit
-    print(f"[muphys_jax] Using XLA backend")
-else:
-    raise ValueError(f"Unknown JAX_BACKEND: {BACKEND}. Use 'xla' or 'iree'")
-
-# Export for use in other modules
-__all__ = ['jit_compile', 'BACKEND']
+__all__ = ['jit_compile']
