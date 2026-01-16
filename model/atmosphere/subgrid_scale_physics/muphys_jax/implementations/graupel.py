@@ -32,7 +32,7 @@ from ..core.scans import temperature_scan_step, precip_scan_batched
 def q_t_update(t, p, rho, q, dt, qnc):
     """
     Update water species and temperature via phase transitions.
-    This is the massive 200-line function from graupel.py:158-362.
+    Corresponds to graupel.py:158-362 in the GT4Py implementation.
     """
     # Activation mask
     mask = jnp.where(

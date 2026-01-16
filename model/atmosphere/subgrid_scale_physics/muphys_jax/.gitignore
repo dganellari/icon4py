@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+
+# MLIR output files
+*.mlir
+*.vmfb
+mlir_output/
+
+# NetCDF test outputs
+junk*.nc
+*.nc
+
+# System files
+.DS_Store

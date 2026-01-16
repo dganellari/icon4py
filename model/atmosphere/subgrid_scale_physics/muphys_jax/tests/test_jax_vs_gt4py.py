@@ -132,14 +132,13 @@ def run_gt4py_version(dz, te, p, rho, q_v, q_c, q_r, q_s, q_i, q_g, dt, qnc):
         print("The current GT4Py implementation expects specific field formats.")
         return None, None, None
 
-    # Note: GT4Py implementation requires GT4Py fields and domains
-    # This is a simplified comparison - full comparison would need:
+    # GT4Py implementation requires field conversion and domain setup:
     # 1. Convert numpy arrays to GT4Py fields
     # 2. Set up proper grid domains
     # 3. Call GT4Py program with domain specification
 
     print("GT4Py comparison requires field conversion and domain setup")
-    print("This is not a simple 1:1 comparison due to framework differences")
+    print("Direct comparison requires GT4Py field arrays")
 
     return None, None, None
 
