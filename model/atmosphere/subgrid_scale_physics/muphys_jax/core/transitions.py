@@ -12,6 +12,7 @@ Implements all 14 phase transitions between water species.
 """
 
 import jax.numpy as jnp
+
 from .common import constants as const
 
 
@@ -81,7 +82,7 @@ def graupel_to_rain(t, p, rho, dvsw0, qg):
     return jnp.where(
         mask,
         (C1_MELT / p + C2_MELT) * (t - tmelt + A_MELT * dvsw0) * jnp.power(qg * rho, B_MELT),
-        0.0
+        0.0,
     )
 
 
@@ -96,14 +97,14 @@ def ice_to_graupel(rho, qr, qg, qi, sticking_eff):
     result = jnp.where(
         (qi > const.qmin) & (qg > const.qmin),
         sticking_eff * qi * C_AGG_CT * jnp.power(rho * qg, B_AGG_CT),
-        0.0
+        0.0,
     )
 
     # Collection by rain
     result = jnp.where(
         (qi > const.qmin) & (qr > const.qmin),
         result + A_CT * qi * jnp.power(rho * qr, B_CT),
-        result
+        result,
     )
     return result
 
@@ -118,8 +119,9 @@ def ice_to_snow(qi, ns, lam, sticking_eff):
     mask = qi > const.qmin
     return jnp.where(
         mask,
-        sticking_eff * (C_IAU * jnp.maximum(0.0, qi - QI0) + qi * C_AGG * ns * jnp.power(lam, B_AGG)),
-        0.0
+        sticking_eff
+        * (C_IAU * jnp.maximum(0.0, qi - QI0) + qi * C_AGG * ns * jnp.power(lam, B_AGG)),
+        0.0,
     )
 
 
@@ -143,7 +145,7 @@ def rain_to_graupel(t, rho, qc, qr, qi, qs, mi, dvsw, dt):
     result = jnp.where(
         mask & (t > const.tfrz_hom) & maskinner,
         (jnp.exp(C2 * (TFRZ_RAIN - t)) - C3) * (A1 * jnp.power(qr * rho, B1)),
-        0.0
+        0.0,
     )
 
     # Homogeneous freezing
@@ -153,7 +155,7 @@ def rain_to_graupel(t, rho, qc, qr, qi, qs, mi, dvsw, dt):
     result = jnp.where(
         (jnp.minimum(qi, qr) > const.qmin) & (qs > QS_CRIT),
         result + A2 * (qi / mi) * jnp.power(rho * qr, B2),
-        result
+        result,
     )
     return result
 
@@ -177,10 +179,13 @@ def rain_to_vapor(t, rho, qc, qr, dvsw, dt):
     return jnp.where(
         mask,
         jnp.minimum(
-            A1_RV * (A2_RV + A3_RV * jnp.power(qr * rho, B1_RV)) * (-dvsw) * jnp.power(qr * rho, B2_RV),
-            evap_max
+            A1_RV
+            * (A2_RV + A3_RV * jnp.power(qr * rho, B1_RV))
+            * (-dvsw)
+            * jnp.power(qr * rho, B2_RV),
+            evap_max,
         ),
-        0.0
+        0.0,
     )
 
 
@@ -202,9 +207,7 @@ def snow_to_rain(t, p, rho, dvsw0, qs):
 
     mask = (t > jnp.maximum(tmelt, tmelt - const.tx * dvsw0)) & (qs > const.qmin)
     return jnp.where(
-        mask,
-        (C1_SR / p + C2_SR) * (t - tmelt + A_SR * dvsw0) * jnp.power(qs * rho, B_SR),
-        0.0
+        mask, (C1_SR / p + C2_SR) * (t - tmelt + A_SR * dvsw0) * jnp.power(qs * rho, B_SR), 0.0
     )
 
 
@@ -235,9 +238,7 @@ def vapor_x_graupel(t, p, rho, qg, dvsw, dvsi, dvsw0, dt):
     result_mid = (A7 + A8 * p) * dvsw * jnp.power(qg * rho, B_VG)
 
     result = jnp.where(
-        t < tmelt,
-        result_cold,
-        jnp.where(t > (tmelt - const.tx * dvsw0), result_warm, result_mid)
+        t < tmelt, result_cold, jnp.where(t > (tmelt - const.tx * dvsw0), result_warm, result_mid)
     )
 
     return jnp.where(qg > const.qmin, jnp.maximum(result, -qg / dt), 0.0)
@@ -259,7 +260,7 @@ def vapor_x_ice(qi, mi, eta, dvsi, rho, dt):
     result = jnp.where(
         result > 0.0,
         jnp.minimum(result, dvsi / dt),
-        jnp.maximum(jnp.maximum(result, dvsi / dt), -qi / dt)
+        jnp.maximum(jnp.maximum(result, dvsi / dt), -qi / dt),
     )
 
     return jnp.where(qi > const.qmin, result, 0.0)
@@ -286,8 +287,12 @@ def vapor_x_snow(t, p, rho, qs, ns, lam, eta, ice_dep, dvsw, dvsi, dvsw0, dt):
     C4_VS = -0.146293e-6
 
     # Below freezing: deposition/sublimation
-    result_cold = (CNX * ns * eta / rho) * (A0_VS + A1_VS * jnp.power(lam, A2_VS)) * dvsi / (lam * lam + EPS)
-    result_cold = jnp.where((result_cold > 0.0), jnp.minimum(result_cold, dvsi / dt - ice_dep), result_cold)
+    result_cold = (
+        (CNX * ns * eta / rho) * (A0_VS + A1_VS * jnp.power(lam, A2_VS)) * dvsi / (lam * lam + EPS)
+    )
+    result_cold = jnp.where(
+        (result_cold > 0.0), jnp.minimum(result_cold, dvsi / dt - ice_dep), result_cold
+    )
     result_cold = jnp.where((qs <= QS_LIM), jnp.minimum(result_cold, 0.0), result_cold)
 
     # Above tmelt - tx*dvsw0: melting with dvsw0
@@ -297,9 +302,7 @@ def vapor_x_snow(t, p, rho, qs, ns, lam, eta, ice_dep, dvsw, dvsi, dvsw0, dt):
     result_mid = (C3_VS + C4_VS * p) * dvsw * jnp.power(qs * rho, B_VS)
 
     result = jnp.where(
-        t < tmelt,
-        result_cold,
-        jnp.where(t > (tmelt - const.tx * dvsw0), result_warm, result_mid)
+        t < tmelt, result_cold, jnp.where(t > (tmelt - const.tx * dvsw0), result_warm, result_mid)
     )
 
     return jnp.where(qs > const.qmin, jnp.maximum(result, -qs / dt), 0.0)

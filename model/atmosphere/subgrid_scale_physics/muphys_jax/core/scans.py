@@ -19,8 +19,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .definitions import TempState
 from .common import constants as const
+from .definitions import TempState
 
 
 def precip_scan_step_fast(carry, inputs):
@@ -129,8 +129,7 @@ def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
 
     # vmap over the 4 species (axis 0)
     batched_scan = jax.vmap(
-        lambda p, q, vc, m: _single_species_scan(p, zeta, rho, q, vc, m),
-        in_axes=(0, 0, 0, 0)
+        lambda p, q, vc, m: _single_species_scan(p, zeta, rho, q, vc, m), in_axes=(0, 0, 0, 0)
     )
 
     q_updates, flxs = batched_scan(params_stacked, q_stacked, vc_stacked, mask_stacked)
@@ -159,8 +158,8 @@ def temperature_scan_step(previous_level, inputs):
     # Energy flux from precipitation
     cvd_t_kp1 = const.cvd * t_kp1
     eflx_new = dt * (
-        pr * (const.clw * t - cvd_t_kp1 - const.lvc) +
-        pflx_tot * (const.ci * t - cvd_t_kp1 - const.lsc)
+        pr * (const.clw * t - cvd_t_kp1 - const.lvc)
+        + pflx_tot * (const.ci * t - cvd_t_kp1 - const.lsc)
     )
 
     # Internal energy update

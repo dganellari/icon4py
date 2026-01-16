@@ -10,10 +10,11 @@
 Test complete graupel_jax implementation.
 """
 
-import numpy as np
 import jax.numpy as jnp
-from muphys_jax.implementations.graupel import graupel_run
+import numpy as np
 from muphys_jax.core.definitions import Q
+from muphys_jax.implementations.graupel import graupel_run
+
 
 def test_graupel_basic():
     """Test that graupel_run executes without errors."""
@@ -42,11 +43,11 @@ def test_graupel_basic():
     # Initial water species (small random values)
     q_in = Q(
         v=np.random.uniform(1e-4, 1e-3, (ncells, nlev)),  # vapor
-        c=np.random.uniform(0.0, 1e-5, (ncells, nlev)),   # cloud
-        r=np.random.uniform(0.0, 1e-6, (ncells, nlev)),   # rain
-        s=np.random.uniform(0.0, 1e-6, (ncells, nlev)),   # snow
-        i=np.random.uniform(0.0, 1e-7, (ncells, nlev)),   # ice
-        g=np.random.uniform(0.0, 1e-7, (ncells, nlev)),   # graupel
+        c=np.random.uniform(0.0, 1e-5, (ncells, nlev)),  # cloud
+        r=np.random.uniform(0.0, 1e-6, (ncells, nlev)),  # rain
+        s=np.random.uniform(0.0, 1e-6, (ncells, nlev)),  # snow
+        i=np.random.uniform(0.0, 1e-7, (ncells, nlev)),  # ice
+        g=np.random.uniform(0.0, 1e-7, (ncells, nlev)),  # graupel
     )
 
     # Convert to JAX arrays
@@ -71,16 +72,11 @@ def test_graupel_basic():
     # Run graupel
     print("\nRunning graupel_run (JIT compilation + execution)...")
     import time
+
     start = time.time()
 
     t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-        jnp.array(dz),
-        jnp.array(te),
-        jnp.array(p),
-        jnp.array(rho),
-        q_in_jax,
-        dt,
-        qnc
+        jnp.array(dz), jnp.array(te), jnp.array(p), jnp.array(rho), q_in_jax, dt, qnc
     )
 
     # Block until computation completes
@@ -103,7 +99,7 @@ def test_graupel_basic():
         g=np.array(q_out.g),
     )
 
-    print(f"\nWater species (mean):")
+    print("\nWater species (mean):")
     print(f"  Vapor:   {q_out_np.v.mean():.2e} kg/kg (change: {(q_out_np.v - q_in.v).mean():.2e})")
     print(f"  Cloud:   {q_out_np.c.mean():.2e} kg/kg (change: {(q_out_np.c - q_in.c).mean():.2e})")
     print(f"  Rain:    {q_out_np.r.mean():.2e} kg/kg (change: {(q_out_np.r - q_in.r).mean():.2e})")
@@ -112,7 +108,9 @@ def test_graupel_basic():
     print(f"  Graupel: {q_out_np.g.mean():.2e} kg/kg (change: {(q_out_np.g - q_in.g).mean():.2e})")
 
     pflx_np = np.array(pflx)
-    print(f"\nPrecipitation flux: {pflx_np.mean():.2e} (range: {pflx_np.min():.2e} - {pflx_np.max():.2e})")
+    print(
+        f"\nPrecipitation flux: {pflx_np.mean():.2e} (range: {pflx_np.min():.2e} - {pflx_np.max():.2e})"
+    )
 
     # Numerical stability checks
     assert np.all(np.isfinite(t_out_np)), "NaN/Inf in temperature output"
@@ -135,13 +133,13 @@ def test_graupel_basic():
     print("\n✓ All numerical stability and physical constraint checks passed!")
 
 
-if __name__ == '__main__':
-    print("="*60)
+if __name__ == "__main__":
+    print("=" * 60)
     print("Complete Graupel JAX Implementation Test")
-    print("="*60)
+    print("=" * 60)
 
     test_graupel_basic()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Test completed successfully! ✓")
-    print("="*60)
+    print("=" * 60)

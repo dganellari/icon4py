@@ -43,6 +43,7 @@ def _calc_dz(z: np.ndarray) -> np.ndarray:
 
 class GraupelInput(NamedTuple):
     """Input data for graupel scheme."""
+
     ncells: int
     nlev: int
     dz: jnp.ndarray
@@ -75,12 +76,12 @@ class GraupelInput(NamedTuple):
 
             # Create Q structure
             q = Q(
-                v=jnp.array(load_var("hus")),   # specific humidity (vapor)
-                c=jnp.array(load_var("clw")),   # cloud liquid water
-                r=jnp.array(load_var("qr")),    # rain
-                s=jnp.array(load_var("qs")),    # snow
-                i=jnp.array(load_var("cli")),   # cloud ice
-                g=jnp.array(load_var("qg")),    # graupel
+                v=jnp.array(load_var("hus")),  # specific humidity (vapor)
+                c=jnp.array(load_var("clw")),  # cloud liquid water
+                r=jnp.array(load_var("qr")),  # rain
+                s=jnp.array(load_var("qs")),  # snow
+                i=jnp.array(load_var("cli")),  # cloud ice
+                g=jnp.array(load_var("qg")),  # graupel
             )
 
             return cls(
@@ -96,6 +97,7 @@ class GraupelInput(NamedTuple):
 
 class GraupelOutput(NamedTuple):
     """Output data from graupel scheme."""
+
     t: np.ndarray
     q: Q
     pflx: np.ndarray
@@ -146,7 +148,13 @@ def get_args():
     parser.add_argument("input_file", help="input NetCDF data file")
     parser.add_argument("itime", help="number of iterations", nargs="?", type=int, default=0)
     parser.add_argument("dt", help="timestep (seconds)", nargs="?", type=float, default=30.0)
-    parser.add_argument("qnc", help="cloud droplet number concentration (m^-3)", nargs="?", type=float, default=100.0)
+    parser.add_argument(
+        "qnc",
+        help="cloud droplet number concentration (m^-3)",
+        nargs="?",
+        type=float,
+        default=100.0,
+    )
 
     return parser.parse_args()
 
@@ -156,6 +164,7 @@ def main():
 
     # Set JAX backend
     import os
+
     os.environ["JAX_BACKEND"] = args.backend
     print(f"Using JAX backend: {args.backend}")
     print(f"JAX devices: {jax.devices()}")

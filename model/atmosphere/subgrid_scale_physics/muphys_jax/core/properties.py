@@ -11,6 +11,7 @@ Property functions for muphys microphysics.
 """
 
 import jax.numpy as jnp
+
 from .common import constants as const
 
 
@@ -80,7 +81,7 @@ def ice_sticking(t):
 
     return jnp.maximum(
         jnp.maximum(jnp.minimum(jnp.exp(A_FREEZ * (t - const.tmelt)), B_MAX_EXP), EFF_MIN),
-        EFF_FAC * (t - TCRIT)
+        EFF_FAC * (t - TCRIT),
     )
 
 
@@ -104,16 +105,17 @@ def deposition_auto_conversion(qi, m_ice, ice_dep):
     return jnp.where(
         qi > const.qmin,
         jnp.maximum(0.0, ice_dep) * B_DEP / (jnp.power((M0_S / m_ice), B_DEP) - XCRIT),
-        0.0
+        0.0,
     )
 
 
 def ice_deposition_nucleation(t, qc, qi, ni, dvsi, dt):
     """Vapor deposition for new ice nucleation."""
     return jnp.where(
-        (qi <= const.qmin) & (((t < const.tfrz_het2) & (dvsi > 0.0)) | ((t <= const.tfrz_het1) & (qc > const.qmin))),
+        (qi <= const.qmin)
+        & (((t < const.tfrz_het2) & (dvsi > 0.0)) | ((t <= const.tfrz_het1) & (qc > const.qmin))),
         jnp.minimum(const.m0_ice * ni, jnp.maximum(0.0, dvsi)) / dt,
-        0.0
+        0.0,
     )
 
 
@@ -135,15 +137,15 @@ def vel_scale_factor_snow(xrho, rho, t, qs):
 
 
 __all__ = [
-    'snow_number',
-    'snow_lambda',
-    'ice_number',
-    'ice_mass',
-    'ice_sticking',
-    'deposition_factor',
-    'deposition_auto_conversion',
-    'ice_deposition_nucleation',
-    'vel_scale_factor_default',
-    'vel_scale_factor_ice',
-    'vel_scale_factor_snow',
+    "deposition_auto_conversion",
+    "deposition_factor",
+    "ice_deposition_nucleation",
+    "ice_mass",
+    "ice_number",
+    "ice_sticking",
+    "snow_lambda",
+    "snow_number",
+    "vel_scale_factor_default",
+    "vel_scale_factor_ice",
+    "vel_scale_factor_snow",
 ]

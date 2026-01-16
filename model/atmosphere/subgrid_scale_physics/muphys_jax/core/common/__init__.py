@@ -8,7 +8,7 @@
 
 """Common utilities for JAX muphys implementation."""
 
-from . import constants
-from . import backend
+from . import backend, constants
 
-__all__ = ['constants', 'backend']
+
+__all__ = ["backend", "constants"]

@@ -11,23 +11,22 @@ Graupel microphysics implementation.
 Complete composition of phase transitions and precipitation.
 """
 
-import jax
 import jax.numpy as jnp
 from jax import lax
 
-# Import from core modules
-from ..core.definitions import Q, PrecipState, TempState
+from ..core import properties as props, thermo, transitions as trans
 from ..core.common import constants as const
 from ..core.common.backend import jit_compile
-from ..core import transitions as trans
-from ..core import properties as props
-from ..core import thermo
-from ..core.scans import temperature_scan_step, precip_scan_batched
+
+# Import from core modules
+from ..core.definitions import Q, TempState
+from ..core.scans import precip_scan_batched, temperature_scan_step
 
 
 # ============================================================================
 # Main Physics Functions
 # ============================================================================
+
 
 def q_t_update(t, p, rho, q, dt, qnc):
     """
@@ -39,7 +38,7 @@ def q_t_update(t, p, rho, q, dt, qnc):
         (jnp.maximum(q.c, jnp.maximum(q.g, jnp.maximum(q.i, jnp.maximum(q.r, q.s)))) > const.qmin)
         | ((t < const.tfrz_het2) & (q.v > thermo.qsat_ice_rho(t, rho))),
         True,
-        False
+        False,
     )
 
     is_sig_present = jnp.maximum(q.g, jnp.maximum(q.i, q.s)) > const.qmin
@@ -72,9 +71,7 @@ def q_t_update(t, p, rho, q, dt, qnc):
 
     eta = jnp.where(t_below_tmelt & is_sig_present, props.deposition_factor(t, qvsi), 0.0)
     sx2x_v_i = jnp.where(
-        t_below_tmelt & is_sig_present,
-        trans.vapor_x_ice(q.i, m_ice, eta, dvsi, rho, dt),
-        0.0
+        t_below_tmelt & is_sig_present, trans.vapor_x_ice(q.i, m_ice, eta, dvsi, rho, dt), 0.0
     )
     sx2x_i_v = jnp.where(t_below_tmelt & is_sig_present, -jnp.minimum(sx2x_v_i, 0.0), 0.0)
     sx2x_v_i = jnp.where(t_below_tmelt & is_sig_present, jnp.maximum(sx2x_v_i, 0.0), sx2x_i_v)
@@ -82,25 +79,24 @@ def q_t_update(t, p, rho, q, dt, qnc):
     ice_dep = jnp.where(t_below_tmelt & is_sig_present, jnp.minimum(sx2x_v_i, dvsi / dt), 0.0)
     sx2x_i_s = jnp.where(
         t_below_tmelt & is_sig_present,
-        props.deposition_auto_conversion(q.i, m_ice, ice_dep) + trans.ice_to_snow(q.i, n_snow, l_snow, x_ice),
-        0.0
+        props.deposition_auto_conversion(q.i, m_ice, ice_dep)
+        + trans.ice_to_snow(q.i, n_snow, l_snow, x_ice),
+        0.0,
     )
     sx2x_i_g = jnp.where(
-        t_below_tmelt & is_sig_present,
-        trans.ice_to_graupel(rho, q.r, q.g, q.i, x_ice),
-        0.0
+        t_below_tmelt & is_sig_present, trans.ice_to_graupel(rho, q.r, q.g, q.i, x_ice), 0.0
     )
-    sx2x_s_g = jnp.where(t_below_tmelt & is_sig_present, trans.snow_to_graupel(t, rho, q.c, q.s), 0.0)
+    sx2x_s_g = jnp.where(
+        t_below_tmelt & is_sig_present, trans.snow_to_graupel(t, rho, q.c, q.s), 0.0
+    )
     sx2x_r_g = jnp.where(
         t_below_tmelt & is_sig_present,
         trans.rain_to_graupel(t, rho, q.c, q.r, q.i, q.s, m_ice, dvsw, dt),
-        0.0
+        0.0,
     )
 
     sx2x_v_i = jnp.where(
-        t_below_tmelt,
-        sx2x_v_i + props.ice_deposition_nucleation(t, q.c, q.i, n_ice, dvsi, dt),
-        0.0
+        t_below_tmelt, sx2x_v_i + props.ice_deposition_nucleation(t, q.c, q.i, n_ice, dvsi, dt), 0.0
     )
     sx2x_c_r = jnp.where(t_at_least_tmelt, sx2x_c_r + sx2x_c_s + sx2x_c_g, sx2x_c_r)
     sx2x_c_s = jnp.where(t_at_least_tmelt, 0.0, sx2x_c_s)
@@ -113,12 +109,14 @@ def q_t_update(t, p, rho, q, dt, qnc):
     sx2x_v_s = jnp.where(
         is_sig_present,
         trans.vapor_x_snow(t, p, rho, q.s, n_snow, l_snow, eta, ice_dep, dvsw, dvsi, dvsw0, dt),
-        0.0
+        0.0,
     )
     sx2x_s_v = jnp.where(is_sig_present, -jnp.minimum(sx2x_v_s, 0.0), 0.0)
     sx2x_v_s = jnp.where(is_sig_present, jnp.maximum(sx2x_v_s, 0.0), 0.0)
 
-    sx2x_v_g = jnp.where(is_sig_present, trans.vapor_x_graupel(t, p, rho, q.g, dvsw, dvsi, dvsw0, dt), 0.0)
+    sx2x_v_g = jnp.where(
+        is_sig_present, trans.vapor_x_graupel(t, p, rho, q.g, dvsw, dvsi, dvsw0, dt), 0.0
+    )
     sx2x_g_v = jnp.where(is_sig_present, -jnp.minimum(sx2x_v_g, 0.0), 0.0)
     sx2x_v_g = jnp.where(is_sig_present, jnp.maximum(sx2x_v_g, 0.0), 0.0)
 
@@ -209,11 +207,14 @@ def q_t_update(t, p, rho, q, dt, qnc):
 
     t = jnp.where(
         mask,
-        t + dt * (
+        t
+        + dt
+        * (
             (dqdt_c + dqdt_r) * (const.lvc - (const.clw - const.cvv) * t)
             + (dqdt_i + dqdt_s + dqdt_g) * (const.lsc - (const.ci - const.cvv) * t)
-        ) / cv,
-        t
+        )
+        / cv,
+        t,
     )
 
     return Q(v=qv, c=qc, r=qr, s=qs, i=qi, g=qg), t
@@ -224,13 +225,23 @@ def temperature_update_scan(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho,
     ncells, nlev = t.shape
 
     init_state = TempState(
-        t=jnp.zeros(ncells),
-        eflx=jnp.zeros(ncells),
-        activated=jnp.zeros(ncells, dtype=bool)
+        t=jnp.zeros(ncells), eflx=jnp.zeros(ncells), activated=jnp.zeros(ncells, dtype=bool)
     )
 
-    inputs = (t.T, t_kp1.T, ei_old.T, pr.T, pflx_tot.T, qv.T, qliq.T, qice.T, rho.T, dz.T,
-              jnp.full((nlev, ncells), dt), mask.T)
+    inputs = (
+        t.T,
+        t_kp1.T,
+        ei_old.T,
+        pr.T,
+        pflx_tot.T,
+        qv.T,
+        qliq.T,
+        qice.T,
+        rho.T,
+        dz.T,
+        jnp.full((nlev, ncells), dt),
+        mask.T,
+    )
 
     final_state, outputs = lax.scan(temperature_scan_step, init_state, inputs)
 
@@ -261,10 +272,10 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     # Fall speed parameters (from GT4Py idx namespace)
     # Order: rain, snow, ice, graupel
     params_list = [
-        (14.58, 0.111, 1.0e-12),                    # rain
-        (57.80, 0.16666666666666666, 1.0e-12),      # snow
-        (1.25, 0.160, 1.0e-12),                     # ice
-        (12.24, 0.217, 1.0e-08),                    # graupel
+        (14.58, 0.111, 1.0e-12),  # rain
+        (57.80, 0.16666666666666666, 1.0e-12),  # snow
+        (1.25, 0.160, 1.0e-12),  # ice
+        (12.24, 0.217, 1.0e-08),  # graupel
     ]
 
     # Run batched precipitation scans (all 4 species in parallel via vmap)
@@ -321,12 +332,22 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc):
         last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt
     )
 
-    return t_final, Q(v=q_updated.v, c=q_updated.c, r=qr, s=qs, i=qi, g=qg), pflx, pr, ps, pi, pg, pre
+    return (
+        t_final,
+        Q(v=q_updated.v, c=q_updated.c, r=qr, s=qs, i=qi, g=qg),
+        pflx,
+        pr,
+        ps,
+        pi,
+        pg,
+        pre,
+    )
 
 
 # ============================================================================
 # JIT-compiled entry point (backend-switchable)
 # ============================================================================
+
 
 @jit_compile
 def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None):
@@ -352,4 +373,4 @@ def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None):
     return graupel(last_level, dz, te, p, rho, q_in, dt, qnc)
 
 
-__all__ = ['q_t_update', 'precipitation_effects', 'graupel', 'graupel_run']
+__all__ = ["graupel", "graupel_run", "precipitation_effects", "q_t_update"]

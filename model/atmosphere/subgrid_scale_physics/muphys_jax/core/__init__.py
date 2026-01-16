@@ -8,8 +8,7 @@
 
 """Core physics functions for JAX muphys implementation."""
 
-from . import common
-from . import transitions
-from . import scans
+from . import common, scans, transitions
 
-__all__ = ['common', 'transitions', 'scans']
+
+__all__ = ["common", "scans", "transitions"]

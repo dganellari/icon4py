@@ -75,7 +75,6 @@ def main():
     print(f"Grid size: {inp.ncells} cells × {inp.nlev} levels")
 
     # Get input statistics
-    import numpy as np
     t_np = inp.t.asnumpy()
     print(f"Temperature range: {t_np.min():.1f} - {t_np.max():.1f} K")
     print(f"Timestep: {float(args.dt)} s")

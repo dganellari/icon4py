@@ -12,7 +12,8 @@ Backend configuration for JAX muphys implementation.
 
 import jax
 
+
 # Use JAX JIT compilation
 jit_compile = jax.jit
 
-__all__ = ['jit_compile']
+__all__ = ["jit_compile"]
