@@ -11,8 +11,8 @@ Scan operators for vertical physics in muphys microphysics.
 
 Optimized for GPU execution with:
 - lax.pow for better kernel fusion
-- lax.select for branchless conditionals
-- Batched precipitation scans via vmap for parallel execution
+- lax.select for branchless conditionals which maps directly to XLA Select primitive (low level)
+- Batched precipitation scans via vmap for parallel execution (increase data parallelism)
 """
 
 import jax
@@ -24,34 +24,26 @@ from .definitions import TempState
 
 
 def precip_scan_step_fast(carry, inputs):
-    """
-    Optimized precipitation scan step using tuple carry.
-
-    Carry: (q_update, flx, rho_prev, vc_prev, activated) - 5 arrays
-    Inputs: (prefactor, exponent, offset, zeta, vc, q, rho, mask)
-    """
+    """Precipitation scan step using plain tuple carry for performance."""
     q_prev, flx_prev, rho_prev, vc_prev, activated_prev = carry
     prefactor, exponent, offset, zeta, vc, q, rho, mask = inputs
 
     # Update activation mask
     activated = activated_prev | mask
 
-    # Calculate precipitation flux with terminal velocity
     rho_x = q * rho
     flx_eff = (rho_x / zeta) + 2.0 * flx_prev
 
-    # Inlined fall speed - use lax.pow for better fusion
+    # Inlined fall speed - use lax.pow for better fusion: this can fuse into one kernel with lax pow
     fall_speed = prefactor * lax.pow(rho_x + offset, exponent)
     flx_partial = lax.min(rho_x * vc * fall_speed, flx_eff)
 
-    # Density-weighted specific mass from previous level
     rhox_prev = (q_prev + q) * 0.5 * rho_prev
 
-    # Terminal velocity - branchless with lax.select
+    # Terminal velocity - branchless with lax.select instead of jnp.where to avoid possible temp buffers
     vt_active = vc_prev * prefactor * lax.pow(rhox_prev + offset, exponent)
     vt = lax.select(activated_prev, vt_active, jnp.zeros_like(q))
 
-    # Compute activated values
     q_activated = (zeta * (flx_eff - flx_partial)) / ((1.0 + zeta * vt) * rho)
     flx_activated = (q_activated * rho * vt + flx_partial) * 0.5
 
@@ -66,20 +58,7 @@ def precip_scan_step_fast(carry, inputs):
 
 
 def _single_species_scan(params, zeta, rho, q, vc, mask):
-    """
-    Single species precipitation scan for use with vmap.
-
-    Args:
-        params: (prefactor, exponent, offset) - scalars
-        zeta: dt/(2*dz) - shape (ncells, nlev)
-        rho: density - shape (ncells, nlev)
-        q: specific mass - shape (ncells, nlev)
-        vc: velocity correction - shape (ncells, nlev)
-        mask: activation mask - shape (ncells, nlev)
-
-    Returns:
-        (q_update, flx) - each shape (ncells, nlev)
-    """
+    """Single species precipitation scan for use with vmap."""
     prefactor, exponent, offset = params
     ncells, nlev = q.shape
 
@@ -105,22 +84,7 @@ def _single_species_scan(params, zeta, rho, q, vc, mask):
 
 
 def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
-    """
-    Batch 4 precipitation scans together for better GPU utilization.
-
-    Uses jax.vmap to run all 4 species (rain, snow, ice, graupel) in parallel.
-
-    Args:
-        params_list: List of 4 (prefactor, exponent, offset) tuples
-        zeta: Common zeta array - shape (ncells, nlev)
-        rho: Common rho array - shape (ncells, nlev)
-        q_list: List of 4 q arrays [qr, qs, qi, qg]
-        vc_list: List of 4 vc arrays
-        mask_list: List of 4 mask arrays
-
-    Returns:
-        List of 4 (q_update, flx) tuples
-    """
+    """Batch 4 precipitation scans via vmap for parallel execution."""
     # Stack inputs for vectorization
     params_stacked = jnp.array(params_list)  # (4, 3)
     q_stacked = jnp.stack(q_list, axis=0)  # (4, ncells, nlev)
@@ -140,19 +104,13 @@ def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
 
 def temperature_scan_step(previous_level, inputs):
     """
-    Single step of temperature update scan operator.
+    JAX equivalent of GT4Py _temperature_update scan_operator.
 
-    Args:
-        previous_level: TempState from the level above (or initial state)
-        inputs: Tuple of (t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask)
-
-    Returns:
-        current_level: TempState for this level
-        current_level: TempState (output to accumulate)
+    Computes both branches and uses lax.select (branchless) instead of if/else.
+    Returns (carry, output) tuple for lax.scan.
     """
     t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask = inputs
 
-    # Activation mask (cumulative OR from top to bottom)
     current_level_activated = previous_level.activated | mask
 
     # Energy flux from precipitation
@@ -162,16 +120,15 @@ def temperature_scan_step(previous_level, inputs):
         + pflx_tot * (const.ci * t - cvd_t_kp1 - const.lsc)
     )
 
-    # Internal energy update
     e_int = ei_old + previous_level.eflx - eflx_new
 
-    # Calculate temperature from internal energy
+    # Inlined T_from_internal_energy_scalar
     qtot = qliq + qice + qv
     rho_dz = rho * dz
     cv = (const.cvd * (1.0 - qtot) + const.cvv * qv + const.clw * qliq + const.ci * qice) * rho_dz
     t_new = (e_int + rho_dz * (qliq * const.lvc + qice * const.lsc)) / cv
 
-    # Branchless selection
+    # Branchless selection (lax.select instead of if/else)
     eflx = lax.select(current_level_activated, eflx_new, previous_level.eflx)
     t_out = lax.select(current_level_activated, t_new, t)
 

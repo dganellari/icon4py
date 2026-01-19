@@ -6,46 +6,31 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""
-Physical constants for muphys microphysics.
-"""
+"""Physical constants for muphys microphysics."""
 
-# Microphysics constants (g_ct)
-rho_00 = 1.225  # reference air density
-q1 = 8.0e-6
-qmin = 1.0e-15  # threshold for computation
-ams = 0.069  # Formfactor in the mass-size relation of snow particles
-bms = 2.0  # Exponent in the mass-size relation of snow particles
-v0s = 25.0  # prefactor in snow fall speed
-v1s = 0.5  # Exponent in the terminal velocity for snow
-m0_ice = 1.0e-12  # initial crystal mass for cloud ice nucleation
-ci = 2108.0  # specific heat of ice
-tx = 3339.5
-tfrz_het1 = 267.15  # temperature for het. freezing of cloud water with supersat
-tfrz_het2 = 248.15  # temperature for het. freezing of cloud water
-tfrz_hom = 236.15  # temperature for hom. freezing of cloud water
-lvc = 3135383.2031928  # invariant part of vaporization enthalpy
-lsc = 2899657.201  # invariant part of sublimation enthalpy
+from icon4py.model.atmosphere.subgrid_scale_physics.muphys.core.common.frozen import g_ct, t_d
 
-# Thermodynamic constants (t_d)
-rd = 287.04  # [J/K/kg] gas constant for dry air
-cpd = 1004.64  # [J/K/kg] specific heat at constant pressure
-cvd = 717.60  # [J/K/kg] specific heat at constant volume
-con_m = 1.50e-5  # [m^2/s] kinematic viscosity of dry air
-con_h = 2.20e-5  # [m^2/s] scalar conductivity of dry air
-con0_h = 2.40e-2  # [J/m/s/K] thermal conductivity of dry air
-eta0d = 1.717e-5  # [N*s/m2] dyn viscosity of dry air at tmelt
-rv = 461.51  # [J/K/kg] gas constant for water vapor
-cpv = 1869.46  # [J/K/kg] specific heat at constant pressure
-cvv = 1407.95  # [J/K/kg] specific heat at constant volume
-dv0 = 2.22e-5  # [m^2/s] diff coeff of H2O vapor in dry air at tmelt
-rhoh2o = 1000.0  # [kg/m3] density of liquid water
-rhoice = 916.7  # [kg/m3] density of pure ice
-cv_i = 2000.0
+# Thermodynamic constants (from t_d)
+rd = t_d.rd
+rv = t_d.rv
+cvd = t_d.cvd
+cvv = t_d.cvv
+clw = t_d.clw
+tmelt = t_d.tmelt
+als = t_d.als
 
-# Phase changes
-alv = 2.5008e6  # [J/kg] latent heat for vaporisation
-als = 2.8345e6  # [J/kg] latent heat for sublimation
-alf = 333700.0  # [J/kg] latent heat for fusion
-tmelt = 273.15  # [K] melting temperature of ice/snow
-clw = 4192.6641119999995  # specific heat capacity of liquid water
+# Microphysics constants (from g_ct)
+ci = g_ct.ci
+qmin = g_ct.qmin
+rho_00 = g_ct.rho_00
+ams = g_ct.ams
+bms = g_ct.bms
+v0s = g_ct.v0s
+v1s = g_ct.v1s
+m0_ice = g_ct.m0_ice
+tx = g_ct.tx
+tfrz_het1 = g_ct.tfrz_het1
+tfrz_het2 = g_ct.tfrz_het2
+tfrz_hom = g_ct.tfrz_hom
+lvc = g_ct.lvc
+lsc = g_ct.lsc

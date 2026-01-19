@@ -43,7 +43,6 @@ def q_t_update(t, p, rho, q, dt, qnc):
 
     is_sig_present = jnp.maximum(q.g, jnp.maximum(q.i, q.s)) > const.qmin
 
-    # Saturation deficits
     dvsw = q.v - thermo.qsat_rho(t, rho)
     qvsi = thermo.qsat_ice_rho(t, rho)
     dvsi = q.v - qvsi
@@ -52,7 +51,7 @@ def q_t_update(t, p, rho, q, dt, qnc):
     n_snow = props.snow_number(t, rho, q.s)
     l_snow = props.snow_lambda(rho, q.s, n_snow)
 
-    # === Phase transitions (14 total) ===
+    # Define conversion 'matrix'
     sx2x_c_r = trans.cloud_to_rain(t, q.c, q.r, qnc)
     sx2x_r_v = trans.rain_to_vapor(t, rho, q.c, q.r, dvsw, dt)
     sx2x_c_i = trans.cloud_x_ice(t, q.c, q.i, dt)
@@ -105,7 +104,6 @@ def q_t_update(t, p, rho, q, dt, qnc):
     eta = jnp.where(t_at_least_tmelt, 0.0, eta)
 
     dvsw0 = jnp.where(is_sig_present, q.v - thermo.qsat_rho_tmelt(rho), 0.0)
-    # vapor exchange with snow
     sx2x_v_s = jnp.where(
         is_sig_present,
         trans.vapor_x_snow(t, p, rho, q.s, n_snow, l_snow, eta, ice_dep, dvsw, dvsi, dvsw0, dt),
@@ -123,7 +121,7 @@ def q_t_update(t, p, rho, q, dt, qnc):
     sx2x_s_r = jnp.where(is_sig_present, trans.snow_to_rain(t, p, rho, dvsw0, q.s), 0.0)
     sx2x_g_r = jnp.where(is_sig_present, trans.graupel_to_rain(t, p, rho, dvsw0, q.g), 0.0)
 
-    # === Sink calculation and saturation limiting ===
+    # Sink calculation 
     sink_v = sx2x_v_s + sx2x_v_i + sx2x_v_g
     sink_c = sx2x_c_r + sx2x_c_s + sx2x_c_i + sx2x_c_g
     sink_r = sx2x_r_v + sx2x_r_g
@@ -131,7 +129,6 @@ def q_t_update(t, p, rho, q, dt, qnc):
     sink_i = jnp.where(is_sig_present, sx2x_i_v + sx2x_i_c + sx2x_i_s + sx2x_i_g, 0.0)
     sink_g = jnp.where(is_sig_present, sx2x_g_v + sx2x_g_r, 0.0)
 
-    # Saturation limiters for each species
     stot = q.v / dt
     sink_v_saturated = (sink_v > stot) & (q.v > const.qmin)
     sx2x_v_s = jnp.where(sink_v_saturated, sx2x_v_s * stot / sink_v, sx2x_v_s)
@@ -174,7 +171,7 @@ def q_t_update(t, p, rho, q, dt, qnc):
     sx2x_g_r = jnp.where(sink_g_saturated, sx2x_g_r * stot / sink_g, sx2x_g_r)
     sink_g = jnp.where(sink_g_saturated, sx2x_g_v + sx2x_g_r, sink_g)
 
-    # === Update water species ===
+    # water content updates:
     dqdt_v = sx2x_r_v + sx2x_s_v + sx2x_i_v + sx2x_g_v - sink_v
     qv = jnp.where(mask, jnp.maximum(0.0, q.v + dqdt_v * dt), q.v)
 
@@ -193,7 +190,6 @@ def q_t_update(t, p, rho, q, dt, qnc):
     dqdt_g = sx2x_v_g + sx2x_c_g + sx2x_r_g + sx2x_s_g + sx2x_i_g - sink_g
     qg = jnp.where(mask, jnp.maximum(0.0, q.g + dqdt_g * dt), q.g)
 
-    # === Update temperature via latent heat ===
     qice = qs + qi + qg
     qliq = qc + qr
     qtot = qv + qice + qliq
@@ -255,7 +251,7 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
 
     Optimized to batch all 4 precipitation scans via vmap for better GPU utilization.
     """
-    # Store initial state for energy calculation
+    # Store initial state for endergy calculation
     qliq = q_in.c + q_in.r
     qice = q_in.s + q_in.i + q_in.g
     ei_old = thermo.internal_energy(t, q_in.v, qliq, qice, rho, dz)
@@ -345,7 +341,7 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc):
 
 
 # ============================================================================
-# JIT-compiled entry point (backend-switchable)
+# JIT-compiled entry point (backend-switchable) TODO(dganellari):
 # ============================================================================
 
 
@@ -353,19 +349,6 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc):
 def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None):
     """
     JIT-compiled graupel driver (backend-switchable via environment variable).
-
-    Args:
-        dz: Layer thickness [m] - shape (ncells, nlev)
-        te: Temperature [K] - shape (ncells, nlev)
-        p: Pressure [Pa] - shape (ncells, nlev)
-        rho: Density [kg/m3] - shape (ncells, nlev)
-        q_in: Q NamedTuple with 6 water species - each shape (ncells, nlev)
-        dt: Time step [s] - scalar
-        qnc: Cloud number concentration [1/m3] - scalar
-        last_level: Last vertical level index (defaults to nlev-1)
-
-    Returns:
-        Tuple of (t_out, q_out, pflx, pr, ps, pi, pg, pre)
     """
     if last_level is None:
         last_level = te.shape[1] - 1
