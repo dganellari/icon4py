@@ -155,6 +155,42 @@ def get_args():
         type=float,
         default=100.0,
     )
+    parser.add_argument(
+        "--fused",
+        help="use fused scans (90 kernel launches instead of 180)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--tiled",
+        help="use tiled scans (process multiple levels per iteration)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--tile-size",
+        help="number of levels per tiled scan iteration",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--no-layout-opt",
+        help="disable memory layout optimization",
+        action="store_true",
+        default=False,  # Enable layout opt by default
+    )
+    parser.add_argument(
+        "--unrolled",
+        help="use unrolled loop (SINGLE KERNEL, target DaCe performance)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--pallas",
+        help="use Pallas GPU kernel (requires jax[cuda12_pallas])",
+        action="store_true",
+        default=False,
+    )
 
     return parser.parse_args()
 
@@ -180,8 +216,21 @@ def main():
 
     # Warmup compilation
     print("\nWarming up (JIT compilation)...")
+    if args.pallas:
+        print("Mode: PALLAS (custom GPU kernel - target DaCe perf)")
+    elif args.unrolled:
+        print("Mode: UNROLLED (static unroll)")
+    elif args.tiled:
+        print(f"Mode: TILED (tile_size={args.tile_size}, {90//args.tile_size} iterations)")
+    elif args.fused:
+        print("Mode: FUSED SCANS (90 kernels)")
+    else:
+        print("Mode: BASELINE (180 kernels)")
+    print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
     t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc
+        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc,
+        use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
+        optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas
     )
     # Block until compilation completes
     t_out.block_until_ready()
@@ -196,7 +245,9 @@ def main():
             start_time = time.time()
 
         t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc
+            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc,
+            use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
+            optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas
         )
 
     # Block until all computations complete
