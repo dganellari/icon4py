@@ -229,14 +229,16 @@ def precip_scan_tiled(params_list, zeta, rho, q_list, vc_list, mask_list, tile_s
 # JIT-compiled version with buffer donation
 # ============================================================================
 
-@jax.jit
-def precip_scan_donated(params_list, zeta, rho, q_list, vc_list, mask_list):
-    """Precipitation scan with JIT and potential buffer reuse.
+def precip_scan_tiled_donated(params_list, zeta, rho, q_list, vc_list, mask_list, tile_size=4):
+    """Tiled precipitation scan with optimized buffer handling.
 
-    Note: True buffer donation requires donate_argnums at the caller level.
-    This wrapper enables XLA to better optimize buffer allocation.
+    This version processes multiple levels per scan iteration (tile_size),
+    reducing D2D memory copies by factor of tile_size.
+
+    Buffer donation happens at the caller (graupel_run) level where
+    donate_argnums can be specified on the JIT decorator.
     """
-    return precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list)
+    return precip_scan_tiled(params_list, zeta, rho, q_list, vc_list, mask_list, tile_size=tile_size)
 
 
 def _precip_column_static_unroll(params, zeta, rho, q, vc, mask, nlev=90):

@@ -33,6 +33,22 @@ except ImportError:
     PALLAS_AVAILABLE = False
     precip_scan_pallas = None
 
+# Triton import (optional)
+try:
+    from ..core.scans_triton import precip_scan_triton, TRITON_AVAILABLE, TRITON_IMPORT_ERROR
+except ImportError as e:
+    TRITON_AVAILABLE = False
+    TRITON_IMPORT_ERROR = str(e)
+    precip_scan_triton = None
+
+# MLIR import (optional)
+try:
+    from muphys_mlir import precip_scan_mlir, MLIR_AVAILABLE, MLIR_IMPORT_ERROR
+except ImportError as e:
+    MLIR_AVAILABLE = False
+    MLIR_IMPORT_ERROR = str(e)
+    precip_scan_mlir = None
+
 
 # ============================================================================
 # Main Physics Functions
@@ -268,7 +284,7 @@ def temperature_update_scan(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho,
     )
 
 
-def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt, fused=False, tiled=False, tile_size=4, optimize_layout=True, unrolled=False, pallas=False):
+def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt, fused=False, tiled=False, tile_size=4, optimize_layout=True, unrolled=False, pallas=False, triton=False, mlir=False):
     """
     Apply precipitation sedimentation and temperature effects.
     From graupel.py:366-424.
@@ -314,6 +330,16 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
 
     if optimize_layout:
         # === Keep in GPU-optimal layout: (nlev, ncells) throughout ===
+        # Fallback if Triton requested but not available
+        if triton and not TRITON_AVAILABLE:
+            triton = False
+            unrolled = True  # Fallback to unrolled scan
+
+        # Fallback if MLIR requested but not available
+        if mlir and not MLIR_AVAILABLE:
+            mlir = False
+            unrolled = True  # Fallback to unrolled scan
+
         zeta_T = jnp.swapaxes(zeta, 0, 1)  # (nlev, ncells)
         rho_T = jnp.swapaxes(rho, 0, 1)   # (nlev, ncells)
         q_list_T = [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
@@ -324,7 +350,29 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
                        jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)]
 
         # Run batched precipitation scans with vertical-major data
-        if pallas:
+        if mlir:
+            # MLIR: GPU kernel via MLIR dialects - target DaCe performance
+            if not MLIR_AVAILABLE:
+                raise RuntimeError(f"MLIR not available: {MLIR_IMPORT_ERROR}. Install with: pip install mlir-python-bindings")
+            # Convert JAX arrays to numpy for MLIR kernel
+            import numpy as np
+            results = precip_scan_mlir(
+                params_list,
+                np.array(zeta_T), np.array(rho_T),
+                [np.array(q) for q in q_list_T],
+                [np.array(vc) for vc in vc_list_T],
+                [np.array(m) for m in mask_list_T]
+            )
+            # Convert results back to JAX arrays
+            results = [(jnp.array(q), jnp.array(flx)) for q, flx in results]
+        elif triton:
+            # TRITON: Custom CUDA kernel - target DaCe performance
+            if not TRITON_AVAILABLE:
+                raise RuntimeError(f"Triton not available: {TRITON_IMPORT_ERROR}. Install with: pip install triton torch")
+            results = precip_scan_triton(
+                params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
+            )
+        elif pallas:
             # PALLAS: Custom GPU kernel with carry in registers
             if not PALLAS_AVAILABLE:
                 raise RuntimeError("Pallas not available. Install with: pip install jax[cuda12_pallas]")
@@ -440,201 +488,6 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
         )
         t_new = result_t.t
         eflx = result_t.eflx
-
-    return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
-    """
-    Apply precipitation sedimentation and temperature effects.
-    From graupel.py:366-424.
-
-    Args:
-        fused: If True, use fused precipitation+temperature scan (90 kernels).
-               If False, use separate scans (180 kernels).
-        tiled: If True, use tiled scan to process multiple levels per iteration.
-        tile_size: Number of levels to process per tiled scan iteration.
-
-    Note: All inputs are (ncells, nlev). Internally we use (nlev, ncells) for scans
-          to avoid repeated transposes in the scan loop.
-    """
-    if fused:
-        return precipitation_effects_fused(
-            last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt
-        )
-
-    _, nlev = t.shape
-
-    # Store initial state for energy calculation
-    qliq = q_in.c + q_in.r
-    qice = q_in.s + q_in.i + q_in.g
-    ei_old = thermo.internal_energy(t, q_in.v, qliq, qice, rho, dz)
-
-    zeta = dt / (2.0 * dz)
-    xrho = jnp.sqrt(const.rho_00 / rho)
-
-    # Velocity scale factors
-    vc_r = props.vel_scale_factor_default(xrho)
-    vc_s = props.vel_scale_factor_snow(xrho, rho, t, q_in.s)
-    vc_i = props.vel_scale_factor_ice(xrho)
-    vc_g = props.vel_scale_factor_default(xrho)
-
-    # Fall speed parameters (from GT4Py idx namespace)
-    params_list = [
-        (14.58, 0.111, 1.0e-12),  # rain
-        (57.80, 0.16666666666666666, 1.0e-12),  # snow
-        (1.25, 0.160, 1.0e-12),  # ice
-        (12.24, 0.217, 1.0e-08),  # graupel
-    ]
-
-    # === TRANSPOSE ONCE at API boundary: (ncells, nlev) -> (nlev, ncells) ===
-    zeta_T = jnp.swapaxes(zeta, 0, 1)
-    rho_T = jnp.swapaxes(rho, 0, 1)
-
-    # Run batched precipitation scans with vertical-major data
-    if tiled:
-        from ..core.scans import precip_scan_batched_tiled
-        results = precip_scan_batched_tiled(
-            params_list,
-            zeta_T,  # (nlev, ncells)
-            rho_T,   # (nlev, ncells)
-            [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-             jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)],  # (nlev, ncells) each
-            [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-             jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)],
-            [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-             jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)],
-            tile_size=tile_size
-        )
-    else:
-        results = precip_scan_batched(
-            params_list,
-            zeta_T,  # (nlev, ncells)
-            rho_T,   # (nlev, ncells)
-            [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-             jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)],  # (nlev, ncells) each
-            [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-             jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)],
-            [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-             jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)],
-        )
-
-    # Unpack results (still in nlev, ncells format)
-    (qr_T, pr_T), (qs_T, ps_T), (qi_T, pi_T), (qg_T, pg_T) = results
-
-    # === TRANSPOSE BACK: (nlev, ncells) -> (ncells, nlev) ===
-    qr = jnp.swapaxes(qr_T, 0, 1)
-    qs = jnp.swapaxes(qs_T, 0, 1)
-    qi = jnp.swapaxes(qi_T, 0, 1)
-    qg = jnp.swapaxes(qg_T, 0, 1)
-    pr = jnp.swapaxes(pr_T, 0, 1)
-    ps = jnp.swapaxes(ps_T, 0, 1)
-    pi = jnp.swapaxes(pi_T, 0, 1)
-    pg = jnp.swapaxes(pg_T, 0, 1)
-
-    # Update for temperature scan
-    qliq = q_in.c + qr
-    qice = qs + qi + qg
-    pflx_tot = ps + pi + pg
-
-    # Shift temperature for next level
-    t_kp1 = jnp.concatenate([t[:, 1:], t[:, -1:]], axis=1)
-    t_kp1 = jnp.where(jnp.arange(nlev) < last_lev, t_kp1, t)
-
-    kmin_rsig = kmin_r | kmin_s | kmin_i | kmin_g
-
-    # Temperature update scan
-    result_t = temperature_update_scan(
-        t, t_kp1, ei_old, pr, pflx_tot, q_in.v, qliq, qice, rho, dz, dt, kmin_rsig
-    )
-    t_new = result_t.t
-    eflx = result_t.eflx
-
-    return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
-    """
-    Apply precipitation sedimentation and temperature effects.
-    From graupel.py:366-424.
-
-    Args:
-        fused: If True, use fused scan (90 kernel launches).
-               If False, use separate scans (180 kernel launches).
-
-    Note: All inputs are (ncells, nlev). Internally we use (nlev, ncells) for scans
-          to avoid repeated transposes in the scan loop.
-    """
-    if fused:
-        return precipitation_effects_fused(
-            last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt
-        )
-
-    _, nlev = t.shape
-
-    # Store initial state for energy calculation
-    qliq = q_in.c + q_in.r
-    qice = q_in.s + q_in.i + q_in.g
-    ei_old = thermo.internal_energy(t, q_in.v, qliq, qice, rho, dz)
-
-    zeta = dt / (2.0 * dz)
-    xrho = jnp.sqrt(const.rho_00 / rho)
-
-    # Velocity scale factors
-    vc_r = props.vel_scale_factor_default(xrho)
-    vc_s = props.vel_scale_factor_snow(xrho, rho, t, q_in.s)
-    vc_i = props.vel_scale_factor_ice(xrho)
-    vc_g = props.vel_scale_factor_default(xrho)
-
-    # Fall speed parameters (from GT4Py idx namespace)
-    params_list = [
-        (14.58, 0.111, 1.0e-12),  # rain
-        (57.80, 0.16666666666666666, 1.0e-12),  # snow
-        (1.25, 0.160, 1.0e-12),  # ice
-        (12.24, 0.217, 1.0e-08),  # graupel
-    ]
-
-    # === TRANSPOSE ONCE at API boundary: (ncells, nlev) -> (nlev, ncells) ===
-    zeta_T = jnp.swapaxes(zeta, 0, 1)
-    rho_T = jnp.swapaxes(rho, 0, 1)
-
-    # Run batched precipitation scans with vertical-major data
-    results = precip_scan_batched(
-        params_list,
-        zeta_T,  # (nlev, ncells)
-        rho_T,   # (nlev, ncells)
-        [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-         jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)],  # (nlev, ncells) each
-        [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-         jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)],
-        [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-         jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)],
-    )
-
-    # Unpack results (still in nlev, ncells format)
-    (qr_T, pr_T), (qs_T, ps_T), (qi_T, pi_T), (qg_T, pg_T) = results
-
-    # === TRANSPOSE BACK: (nlev, ncells) -> (ncells, nlev) ===
-    qr = jnp.swapaxes(qr_T, 0, 1)
-    qs = jnp.swapaxes(qs_T, 0, 1)
-    qi = jnp.swapaxes(qi_T, 0, 1)
-    qg = jnp.swapaxes(qg_T, 0, 1)
-    pr = jnp.swapaxes(pr_T, 0, 1)
-    ps = jnp.swapaxes(ps_T, 0, 1)
-    pi = jnp.swapaxes(pi_T, 0, 1)
-    pg = jnp.swapaxes(pg_T, 0, 1)
-
-    # Update for temperature scan
-    qliq = q_in.c + qr
-    qice = qs + qi + qg
-    pflx_tot = ps + pi + pg
-
-    # Shift temperature for next level
-    t_kp1 = jnp.concatenate([t[:, 1:], t[:, -1:]], axis=1)
-    t_kp1 = jnp.where(jnp.arange(nlev) < last_lev, t_kp1, t)
-
-    kmin_rsig = kmin_r | kmin_s | kmin_i | kmin_g
-
-    # Temperature update scan
-    result_t = temperature_update_scan(
-        t, t_kp1, ei_old, pr, pflx_tot, q_in.v, qliq, qice, rho, dz, dt, kmin_rsig
-    )
-    t_new = result_t.t
-    eflx = result_t.eflx
 
     return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
 
@@ -802,7 +655,7 @@ def precipitation_effects_fused(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, 
     return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
 
 
-def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_tiled_scans=False, tile_size=4, optimize_layout=True, use_unrolled=False, use_pallas=False):
+def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_tiled_scans=False, tile_size=4, optimize_layout=True, use_unrolled=False, use_pallas=False, use_triton=False, use_mlir=False):
     """
     Top-level graupel microphysics function.
     From graupel.py:427-456.
@@ -814,6 +667,8 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_t
         optimize_layout: If True, minimize transposes for better GPU memory layout.
         use_unrolled: If True, use unrolled loop (single kernel, no lax.scan).
         use_pallas: If True, use Pallas GPU kernel (carry in registers).
+        use_triton: If True, use Triton CUDA kernel (target DaCe performance).
+        use_mlir: If True, use MLIR GPU kernel (target DaCe performance).
     """
     # Compute minimum levels for each species
     kmin_r = q.r > const.qmin
@@ -828,75 +683,8 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_t
     qr, qs, qi, qg, t_final, pflx, pr, ps, pi, pg, pre = precipitation_effects(
         last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt,
         fused=use_fused_scans, tiled=use_tiled_scans, tile_size=tile_size,
-        optimize_layout=optimize_layout, unrolled=use_unrolled, pallas=use_pallas
-    )
-
-    return (
-        t_final,
-        Q(v=q_updated.v, c=q_updated.c, r=qr, s=qs, i=qi, g=qg),
-        pflx,
-        pr,
-        ps,
-        pi,
-        pg,
-        pre,
-    )
-    """
-    Top-level graupel microphysics function.
-    From graupel.py:427-456.
-    
-    Args:
-        use_fused_scans: If True, use fused precipitation+temperature scan (90 kernels).
-                        If False, use separate scans (180 kernels, baseline).
-        use_tiled_scans: If True, use tiled scans to process multiple levels per iteration.
-        tile_size: Number of levels per tiled scan iteration.
-    """
-    # Compute minimum levels for each species
-    kmin_r = q.r > const.qmin
-    kmin_i = q.i > const.qmin
-    kmin_s = q.s > const.qmin
-    kmin_g = q.g > const.qmin
-
-    # Phase transitions
-    q_updated, t_updated = q_t_update(te, p, rho, q, dt, qnc)
-
-    # Precipitation effects
-    qr, qs, qi, qg, t_final, pflx, pr, ps, pi, pg, pre = precipitation_effects(
-        last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt,
-        fused=use_fused_scans, tiled=use_tiled_scans, tile_size=tile_size
-    )
-
-    return (
-        t_final,
-        Q(v=q_updated.v, c=q_updated.c, r=qr, s=qs, i=qi, g=qg),
-        pflx,
-        pr,
-        ps,
-        pi,
-        pg,
-        pre,
-    )
-    """
-    Top-level graupel microphysics function.
-    From graupel.py:427-456.
-    
-    Args:
-        use_fused_scans: If True, use fused precipitation+temperature scan (90 kernels).
-                        If False, use separate scans (180 kernels, baseline).
-    """
-    # Compute minimum levels for each species
-    kmin_r = q.r > const.qmin
-    kmin_i = q.i > const.qmin
-    kmin_s = q.s > const.qmin
-    kmin_g = q.g > const.qmin
-
-    # Phase transitions
-    q_updated, t_updated = q_t_update(te, p, rho, q, dt, qnc)
-
-    # Precipitation effects
-    qr, qs, qi, qg, t_final, pflx, pr, ps, pi, pg, pre = precipitation_effects(
-        last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt,
-        fused=use_fused_scans
+        optimize_layout=optimize_layout, unrolled=use_unrolled, pallas=use_pallas,
+        triton=use_triton, mlir=use_mlir
     )
 
     return (
@@ -912,12 +700,12 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_t
 
 
 # ============================================================================
-# JIT-compiled entry point (backend-switchable) TODO(dganellari):
+# JIT-compiled entry points
 # ============================================================================
 
 
-@partial(jax.jit, static_argnames=['use_fused_scans', 'use_tiled_scans', 'tile_size', 'optimize_layout', 'use_unrolled', 'use_pallas'])
-def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_fused_scans=False, use_tiled_scans=False, tile_size=4, optimize_layout=True, use_unrolled=False, use_pallas=False):
+@partial(jax.jit, static_argnames=['use_fused_scans', 'use_tiled_scans', 'tile_size', 'optimize_layout', 'use_unrolled', 'use_pallas', 'use_triton', 'use_mlir'])
+def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_fused_scans=False, use_tiled_scans=False, tile_size=4, optimize_layout=True, use_unrolled=False, use_pallas=False, use_triton=False, use_mlir=False):
     """
     JIT-compiled graupel driver.
 
@@ -927,7 +715,9 @@ def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_fused_scans=
         tile_size: Number of levels per tiled scan iteration.
         optimize_layout: If True, minimize transposes for better GPU memory layout.
         use_unrolled: If True, use static unrolled loop.
-        use_pallas: If True, use Pallas GPU kernel (target DaCe perf).
+        use_pallas: If True, use Pallas GPU kernel.
+        use_triton: If True, use Triton CUDA kernel (target DaCe performance).
+        use_mlir: If True, use MLIR GPU kernel (target DaCe performance).
     """
     if last_level is None:
         last_level = te.shape[1] - 1
@@ -935,25 +725,8 @@ def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_fused_scans=
     return graupel(last_level, dz, te, p, rho, q_in, dt, qnc,
                    use_fused_scans=use_fused_scans, use_tiled_scans=use_tiled_scans,
                    tile_size=tile_size, optimize_layout=optimize_layout,
-                   use_unrolled=use_unrolled, use_pallas=use_pallas)
-    """
-    JIT-compiled graupel driver (backend-switchable via environment variable).
-
-    Args:
-        use_fused_scans: If True, use fused precipitation+temperature scan (90 kernels).
-                        If False, use separate scans (180 kernels, baseline).
-                        MUST be static (known at compile time) for JIT compilation.
-        use_tiled_scans: If True, use tiled scans to process multiple levels per iteration.
-        tile_size: Number of levels per tiled scan iteration.
-                        MUST be static (known at compile time) for JIT compilation.
-
-    Note: Buffer donation (donate_argnums) is used to reduce D2D memory copies by allowing
-          XLA to reuse input buffer memory for outputs where possible.
-    """
-    if last_level is None:
-        last_level = te.shape[1] - 1
-
-    return graupel(last_level, dz, te, p, rho, q_in, dt, qnc, use_fused_scans=use_fused_scans, use_tiled_scans=use_tiled_scans, tile_size=tile_size)
+                   use_unrolled=use_unrolled, use_pallas=use_pallas,
+                   use_triton=use_triton, use_mlir=use_mlir)
 
 
 __all__ = ["graupel", "graupel_run", "precipitation_effects", "q_t_update"]

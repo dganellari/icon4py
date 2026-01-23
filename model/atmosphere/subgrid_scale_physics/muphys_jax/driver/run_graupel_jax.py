@@ -28,6 +28,15 @@ import numpy as np
 from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
 
+# --- CUDA context warmup for Triton/JAX interop ---
+try:
+    import torch
+    if torch.cuda.is_available():
+        _ = torch.zeros(1, device='cuda')
+        torch.cuda.synchronize()
+except Exception:
+    pass
+
 
 def _calc_dz(z: np.ndarray) -> np.ndarray:
     """Calculate layer thickness from geometric height (same as GT4Py version)."""
@@ -191,7 +200,18 @@ def get_args():
         action="store_true",
         default=False,
     )
-
+    parser.add_argument(
+        "--triton",
+        help="use Triton CUDA kernel (requires triton, jax-triton) - TARGET DACE PERF",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--mlir",
+        help="use MLIR GPU kernel (requires mlir-python-bindings) - TARGET DACE PERF",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
@@ -216,8 +236,12 @@ def main():
 
     # Warmup compilation
     print("\nWarming up (JIT compilation)...")
-    if args.pallas:
-        print("Mode: PALLAS (custom GPU kernel - target DaCe perf)")
+    if args.mlir:
+        print("Mode: MLIR (GPU kernel via MLIR dialects - TARGET DACE PERF)")
+    elif args.triton:
+        print("Mode: TRITON (custom CUDA kernel - TARGET DACE PERF)")
+    elif args.pallas:
+        print("Mode: PALLAS (vmap + fori_loop)")
     elif args.unrolled:
         print("Mode: UNROLLED (static unroll)")
     elif args.tiled:
@@ -227,10 +251,16 @@ def main():
     else:
         print("Mode: BASELINE (180 kernels)")
     print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
-    t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc,
+
+    # Common kwargs for all runs
+    run_kwargs = dict(
         use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
-        optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas
+        optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas,
+        use_triton=args.triton, use_mlir=args.mlir
+    )
+
+    t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
+        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
     )
     # Block until compilation completes
     t_out.block_until_ready()
@@ -245,9 +275,7 @@ def main():
             start_time = time.time()
 
         t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc,
-            use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
-            optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas
+            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
         )
 
     # Block until all computations complete
