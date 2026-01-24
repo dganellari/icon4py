@@ -14,9 +14,9 @@ from typing import Final, TypeVar
 
 import gt4py.next as gtx
 from gt4py.next import allocators as gtx_allocators
-from typing_extensions import assert_never
 
 from icon4py.model.common import constants, dimension as dims
+from icon4py.model.common.decomposition import definitions as decomposition
 from icon4py.model.common.grid import base, horizontal as h_grid
 from icon4py.model.common.utils import data_allocation as data_alloc
 
@@ -54,23 +54,16 @@ class GridShape:
     ) -> None:
         if geometry_type is None and subdivision is None:
             raise ValueError("Either geometry_type or subdivision must be provided")
-
-        if geometry_type is None:
-            geometry_type = base.GeometryType.ICOSAHEDRON
-
         match geometry_type:
             case base.GeometryType.ICOSAHEDRON:
                 if subdivision is None:
                     raise ValueError("Subdivision must be provided for icosahedron geometry type")
-
                 if subdivision.root < 1 or subdivision.level < 0:
                     raise ValueError(
                         f"For icosahedron geometry type, root must be >= 1 and level must be >= 0, got {subdivision.root=} and {subdivision.level=}"
                     )
             case base.GeometryType.TORUS:
                 subdivision = None
-            case _:
-                assert_never(geometry_type)
 
         self.geometry_type = geometry_type
         self.subdivision = subdivision
@@ -105,13 +98,16 @@ class GlobalGridParams:
         cell_areas: data_alloc.NDArray | None = None,
         mean_dual_cell_area: float | None = None,
         dual_cell_areas: data_alloc.NDArray | None = None,
+        mean_reduction: Callable[
+            [data_alloc.NDArray, ModuleType], data_alloc.ScalarT
+        ] = decomposition.single_node_reductions.mean,
         **kwargs,
     ) -> _T:
         def init_mean(value: float | None, data: data_alloc.NDArray | None) -> float | None:
             if value is not None:
                 return value
             if data is not None:
-                return array_ns.mean(data).item()
+                return mean_reduction(data, array_ns=array_ns)
             return None
 
         mean_edge_length = init_mean(mean_edge_length, edge_lengths)
@@ -137,8 +133,6 @@ class GlobalGridParams:
                         object.__setattr__(self, "radius", constants.EARTH_RADIUS)
                 case base.GeometryType.TORUS:
                     object.__setattr__(self, "radius", None)
-                case _:
-                    ...
 
         if self.global_num_cells is None and self.geometry_type is base.GeometryType.ICOSAHEDRON:
             object.__setattr__(
