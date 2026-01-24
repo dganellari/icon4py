@@ -96,6 +96,56 @@ def _single_species_scan(params, zeta, rho, q, vc, mask):
     # Return in same format (nlev, ncells) - no transpose
     return q_out, flx_out
 
+def _single_species_scan_with_transpose(params, zeta, rho, q, vc, mask):
+    """Single species precipitation scan for use with vmap (handles transpose).
+
+    This version matches the cleanup commit (6d5f25078) behavior:
+    - Accepts (ncells, nlev) format
+    - Transposes to (nlev, ncells) for scan
+    - Transposes back to (ncells, nlev) for output
+    """
+    prefactor, exponent, offset = params
+    ncells, nlev = q.shape
+
+    # Broadcast parameters
+    prefactor_arr = jnp.broadcast_to(prefactor, (nlev, ncells))
+    exponent_arr = jnp.broadcast_to(exponent, (nlev, ncells))
+    offset_arr = jnp.broadcast_to(offset, (nlev, ncells))
+
+    init_carry = (
+        jnp.zeros(ncells, dtype=q.dtype),
+        jnp.zeros(ncells, dtype=q.dtype),
+        jnp.zeros(ncells, dtype=q.dtype),
+        jnp.zeros(ncells, dtype=bool),
+    )
+
+    # Transpose inputs to (nlev, ncells)
+    inputs = (prefactor_arr, exponent_arr, offset_arr, zeta.T, vc.T, q.T, rho.T, mask.T)
+
+    final_carry, outputs = lax.scan(precip_scan_step_fast, init_carry, inputs)
+    q_out, flx_out = outputs
+
+    # Transpose outputs back to (ncells, nlev)
+    return q_out.T, flx_out.T
+
+
+def precip_scan_vmap(params_list, zeta, rho, q_list, vc_list, mask_list):
+    """Batch 4 precipitation scans via vmap for parallel execution."""
+    # Stack inputs for vectorization
+    params_stacked = jnp.array(params_list)  # (4, 3)
+    q_stacked = jnp.stack(q_list, axis=0)  # (4, ncells, nlev)
+    vc_stacked = jnp.stack(vc_list, axis=0)  # (4, ncells, nlev)
+    mask_stacked = jnp.stack(mask_list, axis=0)  # (4, ncells, nlev)
+
+    # vmap over the 4 species (axis 0)
+    batched_scan = jax.vmap(
+        lambda p, q, vc, m: _single_species_scan_with_transpose(p, zeta, rho, q, vc, m), in_axes=(0, 0, 0, 0)
+    )
+
+    q_updates, flxs = batched_scan(params_stacked, q_stacked, vc_stacked, mask_stacked)
+
+    # Unstack results
+    return [(q_updates[i], flxs[i]) for i in range(4)]
 
 def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
     """Process 4 precipitation scans sequentially (no vmap).

@@ -28,6 +28,7 @@ import numpy as np
 from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
 from muphys_jax.implementations.graupel_allinone_fused import graupel_allinone_fused_run
+from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline_run
 
 # --- CUDA context warmup for Triton/JAX interop ---
 try:
@@ -219,6 +220,12 @@ def get_args():
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--baseline",
+        help="use baseline implementation (vmap-batched, 90 kernels)",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
@@ -243,7 +250,9 @@ def main():
 
     # Warmup compilation
     print("\nWarming up (JIT compilation)...")
-    if args.mlir:
+    if args.baseline:
+        print("Mode: BASELINE (vmap-batched, 90 kernels)")
+    elif args.mlir:
         print("Mode: MLIR (GPU kernel via MLIR dialects - TARGET DACE PERF)")
     elif args.triton:
         print("Mode: TRITON (custom CUDA kernel - TARGET DACE PERF)")
@@ -258,20 +267,23 @@ def main():
     elif args.fused:
         print("Mode: FUSED SCANS (90 kernels)")
     else:
-        print("Mode: BASELINE (180 kernels)")
+        print("Mode: DEFAULT (180 kernels)")
     print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
 
-    run_kwargs = dict(
-        use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
-        optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas,
-        use_triton=args.triton, use_mlir=args.mlir
-    )
-
     # Choose which implementation to use
-    if args.allinone_fused:
+    if args.baseline:
+        run_func = graupel_baseline_run
+        run_kwargs = {}  # Baseline doesn't accept any optimization flags
+    elif args.allinone_fused:
         run_func = graupel_allinone_fused_run
+        run_kwargs = {}  # All-in-one fused doesn't accept optimization flags
     else:
         run_func = graupel_run
+        run_kwargs = dict(
+            use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
+            optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas,
+            use_triton=args.triton, use_mlir=args.mlir
+        )
 
     t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
         inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
