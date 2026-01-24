@@ -27,6 +27,7 @@ import numpy as np
 
 from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
+from muphys_jax.implementations.graupel_allinone_fused import graupel_allinone_fused_run
 
 # --- CUDA context warmup for Triton/JAX interop ---
 try:
@@ -171,6 +172,12 @@ def get_args():
         default=False,
     )
     parser.add_argument(
+        "--allinone-fused",
+        help="use all-in-one fused scan (single JAX scan, experimental)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--tiled",
         help="use tiled scans (process multiple levels per iteration)",
         action="store_true",
@@ -246,23 +253,29 @@ def main():
         print("Mode: UNROLLED (static unroll)")
     elif args.tiled:
         print(f"Mode: TILED (tile_size={args.tile_size}, {90//args.tile_size} iterations)")
+    elif args.allinone_fused:
+        print("Mode: ALL-IN-ONE FUSED SCAN (single JAX scan, experimental)")
     elif args.fused:
         print("Mode: FUSED SCANS (90 kernels)")
     else:
         print("Mode: BASELINE (180 kernels)")
     print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
 
-    # Common kwargs for all runs
     run_kwargs = dict(
         use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
         optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas,
         use_triton=args.triton, use_mlir=args.mlir
     )
 
-    t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
+    # Choose which implementation to use
+    if args.allinone_fused:
+        run_func = graupel_allinone_fused_run
+    else:
+        run_func = graupel_run
+
+    t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
         inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
     )
-    # Block until compilation completes
     t_out.block_until_ready()
     print("Compilation complete!")
 
@@ -271,14 +284,12 @@ def main():
     num_iters = int(args.itime)
 
     for iteration in range(num_iters + 1):
-        if iteration == 1:  # Start timing after first warmup iteration
+        if iteration == 1:
             start_time = time.time()
-
-        t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
+        t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
             inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
         )
 
-    # Block until all computations complete
     t_out.block_until_ready()
     end_time = time.time()
 
@@ -287,7 +298,6 @@ def main():
         print(f"\nFor {num_iters} iterations it took {elapsed_time:.4f} seconds!")
         print(f"Time per iteration: {elapsed_time / num_iters:.4f} seconds")
 
-    # Convert outputs to numpy
     print("\nConverting outputs to numpy arrays...")
     out = GraupelOutput(
         t=np.array(t_out),

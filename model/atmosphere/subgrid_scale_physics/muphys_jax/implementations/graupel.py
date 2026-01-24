@@ -23,7 +23,7 @@ from ..core.common import constants as const
 from ..core.common.backend import jit_compile
 
 # Import from core modules
-from ..core.definitions import Q, TempState
+from ..core.definitions import Q, TempState, PrecipState, PrecipState
 from ..core.scans import precip_scan_batched, precip_scan_unrolled, precip_scan_tiled, temperature_scan_step
 
 # Pallas import (optional)
