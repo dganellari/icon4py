@@ -82,7 +82,11 @@ def cpu_allocator() -> gtx_typing.FieldBufferAllocationUtil:
 
 
 @pytest.fixture(
-    params=[definitions.Experiments.MCH_CH_R04B09, definitions.Experiments.EXCLAIM_APE],
+    params=[
+        definitions.Experiments.MCH_CH_R04B09,
+        definitions.Experiments.EXCLAIM_APE,
+        definitions.Experiments.GAUSS3D,
+    ],
     ids=lambda r: r.name,
 )
 def experiment(request: pytest.FixtureRequest) -> definitions.Experiment:
@@ -139,6 +143,10 @@ def download_ser_data(
     if "not datatest" in request.config.getoption("-k", ""):
         return
 
+    with_mpi = request.config.getoption("with_mpi", False)
+    if with_mpi and experiment == definitions.Experiments.GAUSS3D:
+        # TODO(msimberg): Fix? Need serialized data.
+        pytest.skip("GAUSS3D experiment does not support MPI tests")
     _download_ser_data(processor_props.comm_size, ranked_data_path, experiment)
 
 
