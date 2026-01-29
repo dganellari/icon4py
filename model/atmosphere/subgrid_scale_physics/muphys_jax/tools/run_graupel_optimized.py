@@ -35,6 +35,9 @@ import pathlib
 import time
 
 import jax
+# Enable x64 before any JAX operations
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import netCDF4
 import numpy as np
@@ -129,13 +132,15 @@ def compile_hlo_text(hlo_text: str, platform: str = "cuda"):
     Returns (executable, client).
     """
     import jaxlib._jax as jax_cpp
-    from jax.lib import xla_bridge
 
-    # Get GPU client
+    # Get GPU client using newer API
+    backend_name = "gpu" if platform.lower() == "cuda" else "cpu"
     try:
-        client = jax.extend.backend.get_backend("gpu" if platform.lower() == "cuda" else "cpu")
-    except AttributeError:
-        client = xla_bridge.get_backend("gpu" if platform.lower() == "cuda" else "cpu")
+        client = jax.extend.backend.get_backend(backend_name)
+    except (AttributeError, ModuleNotFoundError):
+        # Fallback for older JAX versions
+        from jax.lib import xla_bridge
+        client = xla_bridge.get_backend(backend_name)
 
     devices = client.local_devices()[:1]
     device_list = jax_cpp.DeviceList(tuple(devices))

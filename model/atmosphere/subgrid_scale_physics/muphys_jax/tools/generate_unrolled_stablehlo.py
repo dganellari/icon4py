@@ -202,20 +202,48 @@ def generate_unrolled_stablehlo(nlev: int = 90, ncells: int = 20480) -> str:
     return '\n'.join(lines)
 
 
+def get_dims_from_netcdf(input_file: str) -> tuple:
+    """Extract ncells and nlev from a NetCDF input file."""
+    import netCDF4
+    ds = netCDF4.Dataset(input_file, 'r')
+    try:
+        ncells = len(ds.dimensions["cell"])
+    except KeyError:
+        ncells = len(ds.dimensions["ncells"])
+    nlev = len(ds.dimensions["height"])
+    ds.close()
+    return ncells, nlev
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate fully unrolled StableHLO")
-    parser.add_argument("-o", "--output", default="shlo/precip_effect_x64_unrolled.stablehlo")
-    parser.add_argument("--nlev", type=int, default=90)
-    parser.add_argument("--ncells", type=int, default=20480)
+    parser.add_argument("-o", "--output", help="Output file (default: auto-generated based on dims)")
+    parser.add_argument("--input", "-i", help="NetCDF input file to read dimensions from")
+    parser.add_argument("--nlev", type=int, default=90, help="Number of levels (ignored if --input provided)")
+    parser.add_argument("--ncells", type=int, default=20480, help="Number of cells (ignored if --input provided)")
     args = parser.parse_args()
 
-    print(f"Generating unrolled StableHLO with {args.nlev} levels...")
-    stablehlo_text = generate_unrolled_stablehlo(args.nlev, args.ncells)
+    # Get dimensions from input file or use provided values
+    if args.input:
+        ncells, nlev = get_dims_from_netcdf(args.input)
+        print(f"Read dimensions from {args.input}: {ncells} cells × {nlev} levels")
+    else:
+        ncells, nlev = args.ncells, args.nlev
+        print(f"Using provided dimensions: {ncells} cells × {nlev} levels")
 
-    with open(args.output, 'w') as f:
+    # Auto-generate output filename if not provided
+    if args.output:
+        output_file = args.output
+    else:
+        output_file = f"shlo/precip_effect_x64_unrolled_{ncells}x{nlev}.stablehlo"
+
+    print(f"Generating unrolled StableHLO...")
+    stablehlo_text = generate_unrolled_stablehlo(nlev, ncells)
+
+    with open(output_file, 'w') as f:
         f.write(stablehlo_text)
 
-    print(f"Written to: {args.output}")
+    print(f"Written to: {output_file}")
     print(f"File size: {len(stablehlo_text) / 1024:.1f} KB")
 
     # Check for while loops

@@ -127,3 +127,46 @@ def test_graupel_jax(experiment: MuphysGraupelExperiment) -> None:
     np.testing.assert_allclose(ref["qs"], np.array(q_out.s), atol=atol, rtol=rtol)
     np.testing.assert_allclose(ref["qg"], np.array(q_out.g), atol=atol, rtol=rtol)
     np.testing.assert_allclose(ref["t"], np.array(t_out), atol=atol, rtol=rtol)
+
+
+@pytest.mark.datatest
+@pytest.mark.parametrize(
+    "experiment",
+    [
+        Experiments.MINI,
+        Experiments.TINY,
+        Experiments.R2B05,
+    ],
+    ids=lambda exp: exp.name,
+)
+@pytest.mark.parametrize(
+    "use_unrolled",
+    [False, True],
+    ids=["baseline", "unrolled"],
+)
+def test_graupel_jax_optimized(experiment: MuphysGraupelExperiment, use_unrolled: bool) -> None:
+    """Test JAX graupel with different optimization modes against reference data."""
+    # Load input
+    inp = GraupelInput.load(experiment.input_file)
+
+    # Run JAX graupel with optimization flags
+    t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
+        inp.dz, inp.t, inp.p, inp.rho, inp.q, experiment.dt, experiment.qnc,
+        use_unrolled=use_unrolled,
+    )
+
+    # Load reference
+    ref = load_reference(experiment.reference_file)
+
+    # Set tolerances (same as GT4Py test_graupel_only.py)
+    rtol = 1e-14 if experiment.dtype == np.float64 else 1e-7
+    atol = 1e-16 if experiment.dtype == np.float64 else 1e-8
+
+    # Compare outputs
+    np.testing.assert_allclose(ref["qv"], np.array(q_out.v), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(ref["qc"], np.array(q_out.c), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(ref["qi"], np.array(q_out.i), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(ref["qr"], np.array(q_out.r), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(ref["qs"], np.array(q_out.s), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(ref["qg"], np.array(q_out.g), atol=atol, rtol=rtol)
+    np.testing.assert_allclose(ref["t"], np.array(t_out), atol=atol, rtol=rtol)

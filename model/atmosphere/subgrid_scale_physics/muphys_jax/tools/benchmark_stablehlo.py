@@ -5,7 +5,8 @@ Benchmark StableHLO execution time (compilation vs execution separated).
 Uses JAX's deserialize_and_execute to run compiled StableHLO.
 
 Usage:
-    python benchmark_stablehlo.py shlo/precip_effect_x64_optimered.stablehlo --num-runs 10
+    python benchmark_stablehlo.py shlo/precip_effect.stablehlo --input data.nc --num-runs 10
+    python benchmark_stablehlo.py shlo/unrolled.stablehlo --compare shlo/baseline.stablehlo --input data.nc
 """
 
 import argparse
@@ -14,6 +15,7 @@ import time
 import sys
 
 import numpy as np
+import netCDF4
 import jax
 import jax.numpy as jnp
 from jax.lib import xla_bridge
@@ -45,27 +47,58 @@ def compile_stablehlo(stablehlo_text: str, client):
     return loaded
 
 
-def create_test_inputs(ncells: int = 20480, nlev: int = 90):
-    """Create test inputs matching the precipitation_effects signature."""
-    np.random.seed(42)
+def load_inputs_from_netcdf(input_file: str):
+    """Load real inputs from NetCDF file."""
+    print(f"Loading inputs from: {input_file}")
+    ds = netCDF4.Dataset(input_file, 'r')
 
-    kmin_r = np.random.rand(ncells, nlev) > 0.5
-    kmin_i = np.random.rand(ncells, nlev) > 0.5
-    kmin_s = np.random.rand(ncells, nlev) > 0.5
-    kmin_g = np.random.rand(ncells, nlev) > 0.5
+    try:
+        ncells = len(ds.dimensions["cell"])
+    except KeyError:
+        ncells = len(ds.dimensions["ncells"])
+    nlev = len(ds.dimensions["height"])
 
-    qv = np.random.rand(ncells, nlev).astype(np.float64) * 0.01
-    qc = np.random.rand(ncells, nlev).astype(np.float64) * 1e-5
-    qr = np.random.rand(ncells, nlev).astype(np.float64) * 1e-6
-    qs = np.random.rand(ncells, nlev).astype(np.float64) * 1e-6
-    qi = np.random.rand(ncells, nlev).astype(np.float64) * 1e-7
-    qg = np.random.rand(ncells, nlev).astype(np.float64) * 1e-7
+    print(f"  Grid: {ncells} cells × {nlev} levels")
 
-    t = np.random.rand(ncells, nlev).astype(np.float64) * 50 + 230
-    rho = np.random.rand(ncells, nlev).astype(np.float64) * 0.5 + 0.5
-    dz = np.random.rand(ncells, nlev).astype(np.float64) * 100 + 50
+    # Calculate dz from z
+    def _calc_dz(z: np.ndarray) -> np.ndarray:
+        ksize = z.shape[0]
+        dz = np.zeros(z.shape, np.float64)
+        zh = 1.5 * z[ksize - 1, :] - 0.5 * z[ksize - 2, :]
+        for k in range(ksize - 1, -1, -1):
+            zh_new = 2.0 * z[k, :] - zh
+            dz[k, :] = -zh + zh_new
+            zh = zh_new
+        return dz
 
-    return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz]
+    dz = np.transpose(_calc_dz(ds.variables["zg"][:]))
+
+    def load_var(varname: str) -> np.ndarray:
+        var = ds.variables[varname]
+        if var.dimensions[0] == "time":
+            var = var[0, :, :]
+        return np.transpose(np.array(var, dtype=np.float64))
+
+    # Load variables
+    qv = load_var("hus")
+    qc = load_var("clw")
+    qr = load_var("qr")
+    qs = load_var("qs")
+    qi = load_var("cli")
+    qg = load_var("qg")
+    t = load_var("ta")
+    rho = load_var("rho")
+
+    # Compute kmin masks (same logic as graupel)
+    qmin = 1e-8
+    kmin_r = qr > qmin
+    kmin_i = qi > qmin
+    kmin_s = qs > qmin
+    kmin_g = qg > qmin
+
+    ds.close()
+
+    return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
 
 
 def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
@@ -101,6 +134,7 @@ def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark StableHLO execution")
     parser.add_argument("stablehlo_file", help="Input StableHLO file")
+    parser.add_argument("--input", "-i", required=True, help="NetCDF input file (required)")
     parser.add_argument("--compare", nargs="+", help="Additional files to compare")
     parser.add_argument("--num-warmup", type=int, default=3, help="Warmup runs")
     parser.add_argument("--num-runs", type=int, default=10, help="Benchmark runs")
@@ -115,7 +149,8 @@ def main():
     print()
 
     client = xla_bridge.get_backend("gpu")
-    inputs = create_test_inputs()
+    inputs, ncells, nlev = load_inputs_from_netcdf(args.input)
+    print()
 
     all_files = [args.stablehlo_file]
     if args.compare:
