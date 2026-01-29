@@ -29,6 +29,7 @@ from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
 from muphys_jax.implementations.graupel_allinone_fused import graupel_allinone_fused_run
 from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline_run
+from muphys_jax.implementations.generated_precip import graupel_unrolled_run as graupel_generated_run
 
 # --- CUDA context warmup for Triton/JAX interop ---
 try:
@@ -226,6 +227,12 @@ def get_args():
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--generated",
+        help="use generated/unrolled precipitation (Python for-loop unrolled at trace time)",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
@@ -250,7 +257,9 @@ def main():
 
     # Warmup compilation
     print("\nWarming up (JIT compilation)...")
-    if args.baseline:
+    if args.generated:
+        print("Mode: GENERATED (Python for-loop unrolled precipitation)")
+    elif args.baseline:
         print("Mode: BASELINE (vmap-batched, 90 kernels)")
     elif args.mlir:
         print("Mode: MLIR (GPU kernel via MLIR dialects - TARGET DACE PERF)")
@@ -271,7 +280,10 @@ def main():
     print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
 
     # Choose which implementation to use
-    if args.baseline:
+    if args.generated:
+        run_func = graupel_generated_run
+        run_kwargs = {}  # Generated doesn't accept any optimization flags
+    elif args.baseline:
         run_func = graupel_baseline_run
         run_kwargs = {}  # Baseline doesn't accept any optimization flags
     elif args.allinone_fused:

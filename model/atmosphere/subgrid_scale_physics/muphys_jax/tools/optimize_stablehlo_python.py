@@ -136,7 +136,7 @@ def main():
 
     if args.output_file is None:
         base = os.path.splitext(args.input_file)[0]
-        args.output_file = f"{base}_optimized.mlir"
+        args.output_file = f"{base}_optimized.stablehlo"
 
     print("=" * 80)
     print("StableHLO Optimization via JAX Python API")
