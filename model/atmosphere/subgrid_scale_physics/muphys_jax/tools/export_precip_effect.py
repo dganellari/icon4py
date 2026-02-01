@@ -26,6 +26,9 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 
+# Enable x64 precision for float64 support
+jax.config.update("jax_enable_x64", True)
+
 
 def load_precip_inputs(input_file: str = None, timestep: int = 0):
     """Load or create inputs for precipitation_effects."""
@@ -55,7 +58,9 @@ def load_precip_inputs(input_file: str = None, timestep: int = 0):
                 zh = zh_new
             return dz
 
-        dz_calc = _calc_dz(ds.variables["zg"])
+        # Ensure float64 BEFORE dz calculation (like standalone test)
+        zg = np.asarray(ds.variables["zg"]).astype(np.float64)
+        dz_calc = _calc_dz(zg)
         dz = jnp.array(np.transpose(dz_calc), dtype=jnp.float64)
 
         def load_var(varname: str) -> jnp.ndarray:

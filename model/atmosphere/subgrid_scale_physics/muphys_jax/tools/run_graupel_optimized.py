@@ -70,7 +70,9 @@ def load_inputs(input_file: str, timestep: int = 0):
             zh = zh_new
         return dz
 
-    dz_calc = _calc_dz(ds.variables["zg"])
+    # Ensure float64 BEFORE dz calculation (like standalone test)
+    zg = np.asarray(ds.variables["zg"]).astype(np.float64)
+    dz_calc = _calc_dz(zg)
     dz = jnp.array(np.transpose(dz_calc), dtype=jnp.float64)
 
     def load_var(varname: str) -> jnp.ndarray:

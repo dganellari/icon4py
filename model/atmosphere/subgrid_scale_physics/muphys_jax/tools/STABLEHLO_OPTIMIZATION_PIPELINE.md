@@ -26,12 +26,13 @@ Lower the baseline precipitation effects function to StableHLO:
 ```bash
 cd model/atmosphere/subgrid_scale_physics/muphys_jax
 
-python tools/export_stablehlo.py \
+python tools/export_precip_effect.py \
     --input /path/to/data.nc \
-    --output shlo/precip_effect_x64_lowered.stablehlo
+    --output-dir shlo
 ```
 
 This generates the baseline IR with `lax.scan` compiled to a while loop.
+Output: `shlo/precip_effect_x64_lowered.stablehlo`
 
 ### Step 2: Generate Unrolled StableHLO
 
@@ -97,7 +98,8 @@ pytest muphys_jax/tests/test_graupel_only.py -v
 ```
 muphys_jax/
 ├── tools/
-│   ├── export_stablehlo.py          # Step 1: Lower to baseline StableHLO
+│   ├── export_precip_effect.py      # Step 1: Lower to baseline StableHLO (USED IN PIPELINE)
+│   ├── export_stablehlo.py          # Alternative: Full graupel export (not used in pipeline)
 │   ├── generate_unrolled_stablehlo.py  # Step 2: Generate unrolled version
 │   ├── benchmark_stablehlo.py       # Step 3: Compare execution times
 │   ├── run_graupel_optimized.py     # Step 4: Full graupel benchmark
@@ -122,10 +124,19 @@ python tools/generate_unrolled_stablehlo.py --input /path/to/different_grid.nc
 
 ### Data Types
 
-The pipeline uses `float64` precision. The scripts enable x64 mode automatically:
+The pipeline uses `float64` precision. **All pipeline scripts automatically enable x64 mode at import time**:
 ```python
 jax.config.update("jax_enable_x64", True)
 ```
+
+This ensures:
+- `export_precip_effect.py` exports StableHLO with f64 tensors
+- `generate_unrolled_stablehlo.py` generates hardcoded f64 types
+- `benchmark_stablehlo.py` compiles and executes with float64
+- `run_graupel_optimized.py` runs the full graupel with float64
+- All tests use float64 precision
+
+You can also set the environment variable `JAX_ENABLE_X64=1` before running any script, but it's not required since the scripts enable it internally.
 
 ### Input Format
 

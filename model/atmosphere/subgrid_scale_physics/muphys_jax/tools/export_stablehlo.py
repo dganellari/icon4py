@@ -20,6 +20,9 @@ from jax import lax
 import netCDF4
 import numpy as np
 
+# Enable x64 precision for float64 support
+jax.config.update("jax_enable_x64", True)
+
 
 def export_simple_scan():
     """Export simple scan without transpose."""

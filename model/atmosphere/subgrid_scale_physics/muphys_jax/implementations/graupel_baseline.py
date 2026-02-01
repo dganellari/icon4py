@@ -251,7 +251,7 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
 
     Optimized to batch all 4 precipitation scans via vmap for better GPU utilization.
     """
-    # Store initial state for endergy calculation
+    # Store initial state for energy calculation
     qliq = q_in.c + q_in.r
     qice = q_in.s + q_in.i + q_in.g
     ei_old = thermo.internal_energy(t, q_in.v, qliq, qice, rho, dz)
@@ -287,7 +287,7 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     # Unpack results: rain, snow, ice, graupel
     (qr, pr), (qs, ps), (qi, pi), (qg, pg) = results
 
-    # Update for temperature scan
+    # Update for temperature scan (using post-precipitation q values)
     qliq = q_in.c + qr
     qice = qs + qi + qg
     pflx_tot = ps + pi + pg

@@ -44,13 +44,19 @@ import pathlib
 
 import jax
 import jax.numpy as jnp
-from jax import core as jax_core
+from jax import core as jax_core  # ShapedArray is always here
 from jax import lax
 from jax.interpreters import mlir
 from jax.interpreters import batching
 from jax._src.interpreters import ad
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
+
+# Primitive may be in jax.extend.core (JAX 0.5+) or jax.core (older)
+try:
+    from jax.extend.core import Primitive
+except (ImportError, AttributeError):
+    from jax.core import Primitive
 
 from .definitions import Q
 
@@ -90,7 +96,7 @@ def is_optimized_enabled() -> bool:
 # ============================================================================
 
 # Define the primitive
-optimized_precip_p = jax_core.Primitive("optimized_precipitation_effects")
+optimized_precip_p = Primitive("optimized_precipitation_effects")
 optimized_precip_p.multiple_results = True
 
 
@@ -188,13 +194,13 @@ def _precip_effect_lowering(ctx, *args, last_lev, dt):
     """
     MLIR lowering rule for the primitive.
 
-    If optimized HLO is available, inject it via custom_call.
+    If optimized HLO is available, parse and inline it.
     Otherwise, fall back to the default JAX lowering.
     """
     if is_optimized_enabled():
         hlo_module = _load_hlo_module()
         if hlo_module is not None:
-            return _custom_call_lowering(ctx, *args, last_lev=last_lev, dt=dt)
+            return _stablehlo_injection_lowering(ctx, *args, last_lev=last_lev, dt=dt)
         else:
             print("HLO module not loaded, falling back to JAX")
             return _fallback_lowering(ctx, *args, last_lev=last_lev, dt=dt)
@@ -234,63 +240,76 @@ def _fallback_lowering(ctx, *args, last_lev, dt):
 
 
 def _custom_call_lowering(ctx, *args, last_lev, dt):  # noqa: ARG001
-    """
-    Lowering using XLA custom_call to invoke pre-compiled HLO.
+    """DEPRECATED: Use _stablehlo_injection_lowering instead."""
+    return _stablehlo_injection_lowering(ctx, *args, last_lev=last_lev, dt=dt)
 
-    Uses stablehlo.custom_call with call_target_name pointing to the
-    serialized HLO module.
 
-    Note: last_lev and dt are baked into the optimized HLO module at export time,
-    so they're not used here but kept for signature compatibility.
+# Counter for unique function names
+_MERGE_COUNTER = 0
+
+
+def _stablehlo_injection_lowering(ctx, *args, last_lev, dt):  # noqa: ARG001
     """
-    global _CACHED_HLO_MODULE
+    Lowering that inlines optimized StableHLO using merge_mlir_modules.
+
+    This approach:
+    1. Parses the StableHLO text into an MLIR module
+    2. Merges it into the current module using mlir.merge_mlir_modules
+    3. Emits a func.call to the merged function
+
+    Note: last_lev and dt are baked into the optimized HLO module at export time.
+    """
+    global _CACHED_HLO_MODULE, _MERGE_COUNTER
+
+    # Get the HLO module content
+    hlo_text = _CACHED_HLO_MODULE
+    if isinstance(hlo_text, bytes):
+        hlo_text = hlo_text.decode('utf-8')
 
     # Get output types from abstract eval
     avals_out = ctx.avals_out
     result_types = [mlir.aval_to_ir_type(aval) for aval in avals_out]
 
-    # The serialized HLO module
-    hlo_module = _CACHED_HLO_MODULE
+    # Get the current MLIR module
+    dst_module = ctx.module_context.module
 
-    if isinstance(hlo_module, str):
-        # Text format HLO - encode as bytes
-        hlo_bytes = hlo_module.encode('utf-8')
-    else:
-        hlo_bytes = hlo_module
+    try:
+        # Parse the optimized StableHLO into a new module
+        # Must be done within the same MLIR context
+        src_module = ir.Module.parse(hlo_text)
 
-    # Create the custom call
-    # call_target_name is a unique identifier; backend_config holds the HLO
-    call_target_name = "optimized_precipitation_effects"
+        # Generate unique name for the merged function
+        _MERGE_COUNTER += 1
+        desired_name = f"_injected_precip_effect_{_MERGE_COUNTER}"
 
-    # Build operand types for the custom call
-    operands = list(args)
+        # Merge src_module into dst_module
+        # This renames the "main" function and makes it private
+        actual_name = mlir.merge_mlir_modules(
+            dst_module,
+            desired_name,
+            src_module,
+        )
 
-    # Create result type - tuple of all outputs
-    if len(result_types) == 1:
-        result_type = result_types[0]
-    else:
-        result_type = ir.TupleType.get_tuple(result_types)
+        # Build the call to the merged function
+        # Get the function type from result_types
+        from jax._src.lib.mlir.dialects import func as func_dialect
 
-    # Use hlo.CustomCallOp to create the custom call
-    # The backend_config contains the serialized HLO
-    custom_call = hlo.CustomCallOp(
-        [result_type],
-        operands,
-        call_target_name=ir.StringAttr.get(call_target_name),
-        backend_config=ir.StringAttr.get(hlo_bytes.decode('latin-1') if isinstance(hlo_bytes, bytes) else hlo_bytes),
-        api_version=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), 1),
-        called_computations=ir.ArrayAttr.get([]),
-        has_side_effect=ir.BoolAttr.get(False),
-    )
+        # Create the call operation
+        call_op = func_dialect.CallOp(
+            result_types,
+            ir.FlatSymbolRefAttr.get(actual_name),
+            list(args),
+        )
 
-    # Extract results from tuple if needed
-    if len(result_types) > 1:
-        results = []
-        for i in range(len(result_types)):
-            results.append(hlo.GetTupleElementOp(custom_call.result, i).result)
-        return results
-    else:
-        return [custom_call.result]
+        # Return the results
+        return list(call_op.results)
+
+    except Exception as e:
+        print(f"WARNING: Failed to inject StableHLO: {e}")
+        import traceback
+        traceback.print_exc()
+        print("Falling back to JAX tracing")
+        return _fallback_lowering(ctx, *args, last_lev=last_lev, dt=dt)
 
 
 # Register the lowering rule
