@@ -6,31 +6,62 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Physical constants for muphys microphysics."""
+"""
+Physical constants for muphys_jax microphysics.
 
-from icon4py.model.atmosphere.subgrid_scale_physics.muphys.core.common.frozen import g_ct, t_d
+This module is self-contained and does not depend on the GT4Py muphys implementation.
+All values are defined directly here to ensure muphys_jax is fully independent.
+"""
 
+# =============================================================================
 # Thermodynamic constants (from t_d)
-rd = t_d.rd
-rv = t_d.rv
-cvd = t_d.cvd
-cvv = t_d.cvv
-clw = t_d.clw
-tmelt = t_d.tmelt
-als = t_d.als
+# =============================================================================
 
+# Dry air
+rd = 287.04          # [J/K/kg] gas constant
+cpd = 1004.64        # [J/K/kg] specific heat at constant pressure
+cvd = 717.60         # [J/K/kg] specific heat at constant volume => cpd - rd
+
+# Water vapor
+rv = 461.51          # [J/K/kg] gas constant for water vapor
+cpv = 1869.46        # [J/K/kg] specific heat at constant pressure
+cvv = 1407.95        # [J/K/kg] specific heat at constant volume => cpv - rv
+
+# Liquid water
+clw = 4192.6641119999995  # [J/K/kg] specific heat capacity of liquid water
+
+# Phase changes
+tmelt = 273.15       # [K] melting temperature of ice/snow
+alv = 2.5008e6       # [J/kg] latent heat for vaporisation
+als = 2.8345e6       # [J/kg] latent heat for sublimation
+alf = 333700.0       # [J/kg] latent heat for fusion => als - alv
+
+# =============================================================================
 # Microphysics constants (from g_ct)
-ci = g_ct.ci
-qmin = g_ct.qmin
-rho_00 = g_ct.rho_00
-ams = g_ct.ams
-bms = g_ct.bms
-v0s = g_ct.v0s
-v1s = g_ct.v1s
-m0_ice = g_ct.m0_ice
-tx = g_ct.tx
-tfrz_het1 = g_ct.tfrz_het1
-tfrz_het2 = g_ct.tfrz_het2
-tfrz_hom = g_ct.tfrz_hom
-lvc = g_ct.lvc
-lsc = g_ct.lsc
+# =============================================================================
+
+# Reference values
+rho_00 = 1.225       # [kg/m3] reference air density
+
+# Thresholds
+qmin = 1.0e-15       # threshold for computation
+
+# Ice properties
+ci = 2108.0          # [J/K/kg] specific heat of ice
+m0_ice = 1.0e-12     # [kg] initial crystal mass for cloud ice nucleation
+
+# Snow parameters (mass-size and fall speed relations)
+ams = 0.069          # Formfactor in the mass-size relation of snow particles
+bms = 2.0            # Exponent in the mass-size relation of snow particles
+v0s = 25.0           # prefactor in snow fall speed
+v1s = 0.5            # Exponent in the terminal velocity for snow
+
+# Temperature thresholds
+tx = 3339.5
+tfrz_het1 = 267.15   # [K] temperature for het. freezing of cloud water with supersat => TMELT - 6.0
+tfrz_het2 = 248.15   # [K] temperature for het. freezing of cloud water => TMELT - 25.0
+tfrz_hom = 236.15    # [K] temperature for hom. freezing of cloud water => TMELT - 37.0
+
+# Invariant parts of enthalpy
+lvc = 3135383.2031928  # invariant part of vaporization enthalpy => alv - (cpv - clw) * tmelt
+lsc = 2899657.201      # invariant part of sublimation enthalpy => als - (cpv - ci) * tmelt

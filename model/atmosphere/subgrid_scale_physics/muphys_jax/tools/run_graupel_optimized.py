@@ -39,66 +39,19 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-import netCDF4
 import numpy as np
+
+# Add parent to path for imports
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.parent.parent))
+
+from muphys_jax.utils.data_loading import load_graupel_inputs
 
 
 def load_inputs(input_file: str, timestep: int = 0):
-    """Load graupel inputs from netCDF."""
-    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.parent.parent))
-    from muphys_jax.core.definitions import Q
-
+    """Load graupel inputs from netCDF (wrapper for compatibility)."""
     print(f"Loading inputs from: {input_file}")
-    ds = netCDF4.Dataset(input_file, 'r')
-
-    try:
-        ncells = len(ds.dimensions["cell"])
-    except KeyError:
-        ncells = len(ds.dimensions["ncells"])
-    nlev = len(ds.dimensions["height"])
-
+    dz, t, p, rho, q, dt, qnc, ncells, nlev = load_graupel_inputs(input_file, timestep)
     print(f"  Grid: {ncells} cells × {nlev} levels")
-
-    # Calculate dz
-    def _calc_dz(z: np.ndarray) -> np.ndarray:
-        ksize = z.shape[0]
-        dz = np.zeros(z.shape, np.float64)
-        zh = 1.5 * z[ksize - 1, :] - 0.5 * z[ksize - 2, :]
-        for k in range(ksize - 1, -1, -1):
-            zh_new = 2.0 * z[k, :] - zh
-            dz[k, :] = -zh + zh_new
-            zh = zh_new
-        return dz
-
-    # Ensure float64 BEFORE dz calculation (like standalone test)
-    zg = np.asarray(ds.variables["zg"]).astype(np.float64)
-    dz_calc = _calc_dz(zg)
-    dz = jnp.array(np.transpose(dz_calc), dtype=jnp.float64)
-
-    def load_var(varname: str) -> jnp.ndarray:
-        var = ds.variables[varname]
-        if var.dimensions[0] == "time":
-            var = var[timestep, :, :]
-        return jnp.array(np.transpose(var), dtype=jnp.float64)
-
-    q = Q(
-        v=load_var("hus"),
-        c=load_var("clw"),
-        r=load_var("qr"),
-        s=load_var("qs"),
-        i=load_var("cli"),
-        g=load_var("qg"),
-    )
-
-    t = load_var("ta")
-    p = load_var("pfull")
-    rho = load_var("rho")
-
-    ds.close()
-
-    dt = 30.0
-    qnc = 100.0
-
     return dz, t, p, rho, q, dt, qnc, ncells, nlev
 
 

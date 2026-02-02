@@ -24,7 +24,6 @@ from typing import Final
 # Configure JAX before any JAX imports
 os.environ.setdefault('JAX_ENABLE_X64', '1')
 
-import netCDF4
 import numpy as np
 import pytest
 
@@ -32,6 +31,8 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "tools"))
 from export_precip_effect import export_precip_effect_hlo
 from run_graupel_optimized import run_graupel
+
+from muphys_jax.utils.data_loading import load_graupel_reference
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,20 +56,6 @@ class MuphysGraupelExperiment:
 
     def __str__(self):
         return self.name
-
-
-def load_reference(filename: pathlib.Path) -> dict:
-    """Load reference output from NetCDF file."""
-    with netCDF4.Dataset(filename, mode="r") as nc:
-        return {
-            "t": np.array(nc.variables["ta"][:], dtype=np.float64).T,
-            "qv": np.array(nc.variables["hus"][:], dtype=np.float64).T,
-            "qc": np.array(nc.variables["clw"][:], dtype=np.float64).T,
-            "qi": np.array(nc.variables["cli"][:], dtype=np.float64).T,
-            "qr": np.array(nc.variables["qr"][:], dtype=np.float64).T,
-            "qs": np.array(nc.variables["qs"][:], dtype=np.float64).T,
-            "qg": np.array(nc.variables["qg"][:], dtype=np.float64).T,
-        }
 
 
 GRAUPEL_EXPERIMENTS: Final = [
@@ -111,8 +98,8 @@ def test_graupel_hlo_injection(experiment: MuphysGraupelExperiment):
         # Unpack result
         t_out, q_out, pflx, pr, ps, pi, pg, pre = result
 
-        # Load reference
-        ref = load_reference(experiment.reference_file)
+        # Load reference using shared utility
+        ref = load_graupel_reference(experiment.reference_file)
 
         # Compare (same tolerance as standalone test)
         rtol = 1e-14
