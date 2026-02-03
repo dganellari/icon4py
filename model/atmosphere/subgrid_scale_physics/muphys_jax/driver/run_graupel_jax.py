@@ -13,9 +13,43 @@ Uses the same NetCDF input files and produces comparable output.
 
 Usage:
     python run_graupel_jax.py -o output.nc -b xla input.nc 10 30.0 100.0
+    
+For IREE backend:
+    python run_graupel_jax.py -o output.nc -b iree input.nc 10 30.0 100.0
+    
+NOTE: Backend must be set BEFORE importing JAX. Use -b flag, not JAX_BACKEND env var.
 """
 
 import argparse
+import os
+import sys
+
+# Parse backend argument BEFORE importing JAX
+# This is critical because JAX backend is set at import time
+def _get_backend_early():
+    """Parse just the backend argument before importing JAX."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "-b" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("-b="):
+            return arg[3:]
+        if arg.startswith("--backend="):
+            return arg[10:]
+    # Check next arg after --backend  
+    for i, arg in enumerate(sys.argv):
+        if arg == "--backend" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return "xla"  # default
+
+_backend = _get_backend_early()
+if _backend == "iree":
+    # Must set before JAX import
+    os.environ["JAX_PLATFORMS"] = "iree_cuda"
+    # Configure consteval to use local-sync CPU backend
+    # This only affects compile-time constant folding, runtime uses CUDA
+    os.environ["IREE_PJRT_CONSTEVAL_BACKENDS"] = "local-sync"
+    print(f"Setting JAX_PLATFORMS=iree_cuda, consteval=local-sync (before JAX import)")
+
 import pathlib
 import time
 from typing import NamedTuple
@@ -29,6 +63,8 @@ from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
 from muphys_jax.implementations.graupel_allinone_fused import graupel_allinone_fused_run
 from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline_run
+from muphys_jax.implementations.graupel_baseline import graupel_run_split as graupel_split_run
+from muphys_jax.implementations.graupel_iree import graupel_run_iree
 from muphys_jax.implementations.generated_precip import graupel_unrolled_run as graupel_generated_run
 
 # --- CUDA context warmup for Triton/JAX interop ---
@@ -228,8 +264,20 @@ def get_args():
         default=False,
     )
     parser.add_argument(
+        "--split",
+        help="use split JIT implementation (IREE-compatible, 3 separate JIT boundaries)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--generated",
         help="use generated/unrolled precipitation (Python for-loop unrolled at trace time)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--iree-optimized",
+        help="use IREE-optimized implementation (fori_loop scans, sequential species)",
         action="store_true",
         default=False,
     )
@@ -239,10 +287,7 @@ def get_args():
 def main():
     args = get_args()
 
-    # Set JAX backend
-    import os
-
-    os.environ["JAX_BACKEND"] = args.backend
+    # Backend was already set before JAX import (see top of file)
     print(f"Using JAX backend: {args.backend}")
     print(f"JAX devices: {jax.devices()}")
     print(f"JAX default backend: {jax.default_backend()}")
@@ -257,8 +302,12 @@ def main():
 
     # Warmup compilation
     print("\nWarming up (JIT compilation)...")
-    if args.generated:
+    if args.iree_optimized:
+        print("Mode: IREE-OPTIMIZED (fori_loop scans, sequential species)")
+    elif args.generated:
         print("Mode: GENERATED (Python for-loop unrolled precipitation)")
+    elif args.split:
+        print("Mode: SPLIT JIT (IREE-compatible, 3 separate JIT boundaries)")
     elif args.baseline:
         print("Mode: BASELINE (vmap-batched, 90 kernels)")
     elif args.mlir:
@@ -280,11 +329,27 @@ def main():
     print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
 
     # Choose which implementation to use
-    if args.generated:
+    # Auto-detect IREE and use split JIT for baseline
+    use_iree = args.backend == "iree" or os.environ.get("JAX_PLATFORMS", "").startswith("iree")
+    
+    if args.iree_optimized:
+        run_func = graupel_run_iree
+        run_kwargs = {}  # IREE-optimized doesn't accept any optimization flags
+        print("Using IREE-optimized implementation with fori_loop scans")
+    elif args.generated:
         run_func = graupel_generated_run
         run_kwargs = {}  # Generated doesn't accept any optimization flags
+    elif args.split:
+        run_func = graupel_split_run
+        run_kwargs = {}  # Split doesn't accept any optimization flags
+        print("Mode: SPLIT JIT (IREE-compatible, 3 separate JIT boundaries)")
     elif args.baseline:
-        run_func = graupel_baseline_run
+        if use_iree:
+            # IREE requires split JIT due to memory allocation limits
+            print("Note: IREE detected, using split JIT version for compatibility")
+            run_func = graupel_split_run
+        else:
+            run_func = graupel_baseline_run
         run_kwargs = {}  # Baseline doesn't accept any optimization flags
     elif args.allinone_fused:
         run_func = graupel_allinone_fused_run

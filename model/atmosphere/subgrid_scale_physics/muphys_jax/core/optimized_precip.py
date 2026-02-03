@@ -69,19 +69,24 @@ _OPTIMIZED_HLO_PATH: Optional[str] = None
 _USE_OPTIMIZED: bool = False
 _CACHED_EXECUTABLE = None
 _CACHED_HLO_MODULE: Optional[bytes] = None  # Raw serialized HLO bytes
+_TRANSPOSED_LAYOUT: bool = False  # If True, HLO expects (nlev, ncells) layout
 
 
-def configure_optimized_precip(hlo_path: Optional[str] = None, use_optimized: bool = False):
+def configure_optimized_precip(hlo_path: Optional[str] = None, use_optimized: bool = False,
+                                transposed: bool = False):
     """
     Configure the optimized precipitation_effects.
 
     Args:
         hlo_path: Path to optimized HLO file (serialized executable or .hlo text)
         use_optimized: Whether to use optimized version
+        transposed: If True, the HLO expects transposed (nlev, ncells) layout.
+                   Inputs will be transposed before calling and outputs transposed back.
     """
-    global _OPTIMIZED_HLO_PATH, _USE_OPTIMIZED, _CACHED_EXECUTABLE, _CACHED_HLO_MODULE
+    global _OPTIMIZED_HLO_PATH, _USE_OPTIMIZED, _CACHED_EXECUTABLE, _CACHED_HLO_MODULE, _TRANSPOSED_LAYOUT
     _OPTIMIZED_HLO_PATH = hlo_path
     _USE_OPTIMIZED = use_optimized
+    _TRANSPOSED_LAYOUT = transposed
     _CACHED_EXECUTABLE = None  # Clear cache when config changes
     _CACHED_HLO_MODULE = None
 
@@ -95,9 +100,14 @@ def is_optimized_enabled() -> bool:
 # Custom Primitive Definition
 # ============================================================================
 
-# Define the primitive
+# Define the primitive for original (ncells, nlev) layout
 optimized_precip_p = Primitive("optimized_precipitation_effects")
 optimized_precip_p.multiple_results = True
+
+# Define a separate primitive for transposed (nlev, ncells) layout
+# This allows proper shape tracking through JAX's tracing
+optimized_precip_transposed_p = Primitive("optimized_precipitation_effects_transposed")
+optimized_precip_transposed_p.multiple_results = True
 
 
 def _precip_effect_abstract_eval(
@@ -106,15 +116,41 @@ def _precip_effect_abstract_eval(
     t, rho, dz,
     *, last_lev, dt
 ):
-    """Abstract evaluation - defines output shapes/types."""
+    """Abstract evaluation for original (ncells, nlev) layout."""
     # All outputs have shape (ncells, nlev) and dtype float64
-    # except for masks which are bool
     ncells, nlev = q_v.shape
 
     f64_shape = jax_core.ShapedArray((ncells, nlev), jnp.float64)
 
     # precipitation_effects returns 11 outputs:
     # qr, qs, qi, qg, t_new, pflx_tot, pr, ps, pi, pg, eflx
+    return (
+        f64_shape,  # qr
+        f64_shape,  # qs
+        f64_shape,  # qi
+        f64_shape,  # qg
+        f64_shape,  # t_new
+        f64_shape,  # pflx_tot
+        f64_shape,  # pr
+        f64_shape,  # ps
+        f64_shape,  # pi
+        f64_shape,  # pg
+        f64_shape,  # eflx
+    )
+
+
+def _precip_effect_transposed_abstract_eval(
+    kmin_r, kmin_i, kmin_s, kmin_g,
+    q_v, q_c, q_r, q_s, q_i, q_g,
+    t, rho, dz,
+    *, last_lev, dt
+):
+    """Abstract evaluation for transposed (nlev, ncells) layout."""
+    # Inputs are (nlev, ncells), outputs are also (nlev, ncells)
+    nlev, ncells = q_v.shape
+
+    f64_shape = jax_core.ShapedArray((nlev, ncells), jnp.float64)
+
     return (
         f64_shape,  # qr
         f64_shape,  # qs
@@ -147,9 +183,48 @@ def _precip_effect_impl(
     return original_precip(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt)
 
 
-# Register abstract eval and implementation
+def _precip_effect_transposed_impl(
+    kmin_r, kmin_i, kmin_s, kmin_g,
+    q_v, q_c, q_r, q_s, q_i, q_g,
+    t, rho, dz,
+    *, last_lev, dt
+):
+    """
+    Concrete implementation for transposed layout - called in eager mode or as fallback.
+
+    Transposes inputs, calls original, transposes outputs back.
+    """
+    from ..implementations.graupel_baseline import precipitation_effects as original_precip
+
+    # Transpose inputs from (nlev, ncells) to (ncells, nlev)
+    kmin_r_t = jnp.transpose(kmin_r)
+    kmin_i_t = jnp.transpose(kmin_i)
+    kmin_s_t = jnp.transpose(kmin_s)
+    kmin_g_t = jnp.transpose(kmin_g)
+    q_v_t = jnp.transpose(q_v)
+    q_c_t = jnp.transpose(q_c)
+    q_r_t = jnp.transpose(q_r)
+    q_s_t = jnp.transpose(q_s)
+    q_i_t = jnp.transpose(q_i)
+    q_g_t = jnp.transpose(q_g)
+    t_t = jnp.transpose(t)
+    rho_t = jnp.transpose(rho)
+    dz_t = jnp.transpose(dz)
+
+    q_in = Q(v=q_v_t, c=q_c_t, r=q_r_t, s=q_s_t, i=q_i_t, g=q_g_t)
+    results = original_precip(last_lev, kmin_r_t, kmin_i_t, kmin_s_t, kmin_g_t, q_in, t_t, rho_t, dz_t, dt)
+
+    # Transpose outputs from (ncells, nlev) back to (nlev, ncells)
+    return tuple(jnp.transpose(r) for r in results)
+
+
+# Register abstract eval and implementation for original layout
 optimized_precip_p.def_abstract_eval(_precip_effect_abstract_eval)
 optimized_precip_p.def_impl(_precip_effect_impl)
+
+# Register abstract eval and implementation for transposed layout
+optimized_precip_transposed_p.def_abstract_eval(_precip_effect_transposed_abstract_eval)
+optimized_precip_transposed_p.def_impl(_precip_effect_transposed_impl)
 
 
 # ============================================================================
@@ -266,9 +341,14 @@ def _stablehlo_injection_lowering(ctx, *args, last_lev, dt):  # noqa: ARG001
     if isinstance(hlo_text, bytes):
         hlo_text = hlo_text.decode('utf-8')
 
-    # Get output types from abstract eval
+    # Get output types from abstract eval (in original ncells×nlev layout)
     avals_out = ctx.avals_out
-    result_types = [mlir.aval_to_ir_type(aval) for aval in avals_out]
+    avals_in = ctx.avals_in
+
+    # Debug: print shapes
+    print(f"[HLO INJECTION DEBUG] Input avals: {[str(a) for a in avals_in]}")
+    print(f"[HLO INJECTION DEBUG] Output avals: {[str(a) for a in avals_out]}")
+    print(f"[HLO INJECTION DEBUG] Arg MLIR types: {[str(arg.type) for arg in args]}")
 
     # Get the current MLIR module
     dst_module = ctx.module_context.module
@@ -276,7 +356,9 @@ def _stablehlo_injection_lowering(ctx, *args, last_lev, dt):  # noqa: ARG001
     try:
         # Parse the optimized StableHLO into a new module
         # Must be done within the same MLIR context
+        print(f"[HLO INJECTION DEBUG] Parsing StableHLO ({len(hlo_text)} chars)...")
         src_module = ir.Module.parse(hlo_text)
+        print(f"[HLO INJECTION DEBUG] Parsed successfully")
 
         # Generate unique name for the merged function
         _MERGE_COUNTER += 1
@@ -284,36 +366,91 @@ def _stablehlo_injection_lowering(ctx, *args, last_lev, dt):  # noqa: ARG001
 
         # Merge src_module into dst_module
         # This renames the "main" function and makes it private
+        print(f"[HLO INJECTION DEBUG] Merging as '{desired_name}'...")
         actual_name = mlir.merge_mlir_modules(
             dst_module,
             desired_name,
             src_module,
         )
+        print(f"[HLO INJECTION DEBUG] Merged successfully as '{actual_name}'")
 
         # Build the call to the merged function
-        # Get the function type from result_types
         from jax._src.lib.mlir.dialects import func as func_dialect
 
-        # Create the call operation
+        # Generate result types from abstract eval
+        result_types = [mlir.aval_to_ir_type(aval) for aval in avals_out]
+        print(f"[HLO INJECTION DEBUG] Result types: {[str(t) for t in result_types]}")
+
+        # Create the call
         call_op = func_dialect.CallOp(
             result_types,
             ir.FlatSymbolRefAttr.get(actual_name),
             list(args),
         )
-
-        # Return the results
+        print(f"[HLO INJECTION DEBUG] Created call successfully!")
         return list(call_op.results)
 
     except Exception as e:
-        print(f"WARNING: Failed to inject StableHLO: {e}")
+        print(f"[HLO INJECTION ERROR] Failed to inject StableHLO: {e}")
         import traceback
         traceback.print_exc()
-        print("Falling back to JAX tracing")
+        print("[HLO INJECTION ERROR] Falling back to JAX tracing")
         return _fallback_lowering(ctx, *args, last_lev=last_lev, dt=dt)
 
 
-# Register the lowering rule
+def _fallback_lowering_transposed(ctx, *args, last_lev, dt):
+    """
+    Fallback lowering for transposed primitive: inline the JAX implementation with transposes.
+    """
+    from ..implementations.graupel_baseline import precipitation_effects as original_precip
+
+    def transposed_wrapper(kmin_r, kmin_i, kmin_s, kmin_g, q_v, q_c, q_r, q_s, q_i, q_g, t, rho, dz):
+        # Transpose inputs from (nlev, ncells) to (ncells, nlev)
+        kmin_r_t = jnp.transpose(kmin_r)
+        kmin_i_t = jnp.transpose(kmin_i)
+        kmin_s_t = jnp.transpose(kmin_s)
+        kmin_g_t = jnp.transpose(kmin_g)
+        q_v_t = jnp.transpose(q_v)
+        q_c_t = jnp.transpose(q_c)
+        q_r_t = jnp.transpose(q_r)
+        q_s_t = jnp.transpose(q_s)
+        q_i_t = jnp.transpose(q_i)
+        q_g_t = jnp.transpose(q_g)
+        t_t = jnp.transpose(t)
+        rho_t = jnp.transpose(rho)
+        dz_t = jnp.transpose(dz)
+
+        q_in = Q(v=q_v_t, c=q_c_t, r=q_r_t, s=q_s_t, i=q_i_t, g=q_g_t)
+        results = original_precip(last_lev, kmin_r_t, kmin_i_t, kmin_s_t, kmin_g_t, q_in, t_t, rho_t, dz_t, dt)
+
+        # Transpose outputs from (ncells, nlev) back to (nlev, ncells)
+        return tuple(jnp.transpose(r) for r in results)
+
+    lowering_fn = mlir.lower_fun(transposed_wrapper, multiple_results=True)
+    return lowering_fn(ctx, *args)
+
+
+def _precip_effect_transposed_lowering(ctx, *args, last_lev, dt):
+    """
+    MLIR lowering rule for the transposed primitive.
+
+    If optimized HLO is available (transposed layout), inject it.
+    Otherwise, fall back to the default JAX lowering with transposes.
+    """
+    if is_optimized_enabled():
+        hlo_module = _load_hlo_module()
+        if hlo_module is not None:
+            return _stablehlo_injection_lowering(ctx, *args, last_lev=last_lev, dt=dt)
+        else:
+            print("HLO module not loaded, falling back to JAX (transposed)")
+            return _fallback_lowering_transposed(ctx, *args, last_lev=last_lev, dt=dt)
+    else:
+        return _fallback_lowering_transposed(ctx, *args, last_lev=last_lev, dt=dt)
+
+
+# Register the lowering rules
 mlir.register_lowering(optimized_precip_p, _precip_effect_lowering)
+mlir.register_lowering(optimized_precip_transposed_p, _precip_effect_transposed_lowering)
 
 
 # ============================================================================
@@ -353,6 +490,22 @@ def _precip_effect_batch(batched_args, batch_dims, *, last_lev, dt):
 batching.primitive_batchers[optimized_precip_p] = _precip_effect_batch
 
 
+def _precip_effect_transposed_batch(batched_args, batch_dims, *, last_lev, dt):
+    """Batching rule for vmap (transposed primitive)."""
+    if all(bd is None for bd in batch_dims):
+        return optimized_precip_transposed_p.bind(*batched_args, last_lev=last_lev, dt=dt), (None,) * 11
+
+    def unbatched_call(*args):
+        return optimized_precip_transposed_p.bind(*args, last_lev=last_lev, dt=dt)
+
+    batched_fn = jax.vmap(unbatched_call, in_axes=batch_dims, out_axes=(0,) * 11)
+    results = batched_fn(*batched_args)
+    return results, (0,) * 11
+
+
+batching.primitive_batchers[optimized_precip_transposed_p] = _precip_effect_transposed_batch
+
+
 # ============================================================================
 # Public API
 # ============================================================================
@@ -374,6 +527,14 @@ def precipitation_effects_optimized(
 
     Uses optimized HLO if configured, otherwise falls back to JAX implementation.
 
+    When _TRANSPOSED_LAYOUT is True:
+    - Transposes inputs from (ncells, nlev) to (nlev, ncells)
+    - Calls the transposed primitive (which expects nlev×ncells layout)
+    - Transposes outputs back from (nlev, ncells) to (ncells, nlev)
+
+    This allows injecting HLO with transposed layout for better GPU memory coalescing,
+    while maintaining the original API interface.
+
     Args:
         last_lev: Last vertical level index
         kmin_r, kmin_i, kmin_s, kmin_g: Species activation masks
@@ -386,13 +547,42 @@ def precipitation_effects_optimized(
     Returns:
         Tuple of (qr, qs, qi, qg, t_new, pflx_tot, pr, ps, pi, pg, eflx)
     """
-    return optimized_precip_p.bind(
-        kmin_r, kmin_i, kmin_s, kmin_g,
-        q_in.v, q_in.c, q_in.r, q_in.s, q_in.i, q_in.g,
-        t, rho, dz,
-        last_lev=last_lev,
-        dt=dt
-    )
+    if _TRANSPOSED_LAYOUT:
+        # Transpose all inputs from (ncells, nlev) to (nlev, ncells)
+        kmin_r_t = jnp.transpose(kmin_r)
+        kmin_i_t = jnp.transpose(kmin_i)
+        kmin_s_t = jnp.transpose(kmin_s)
+        kmin_g_t = jnp.transpose(kmin_g)
+        q_v_t = jnp.transpose(q_in.v)
+        q_c_t = jnp.transpose(q_in.c)
+        q_r_t = jnp.transpose(q_in.r)
+        q_s_t = jnp.transpose(q_in.s)
+        q_i_t = jnp.transpose(q_in.i)
+        q_g_t = jnp.transpose(q_in.g)
+        t_t = jnp.transpose(t)
+        rho_t = jnp.transpose(rho)
+        dz_t = jnp.transpose(dz)
+
+        # Call transposed primitive (expects nlev×ncells, returns nlev×ncells)
+        results = optimized_precip_transposed_p.bind(
+            kmin_r_t, kmin_i_t, kmin_s_t, kmin_g_t,
+            q_v_t, q_c_t, q_r_t, q_s_t, q_i_t, q_g_t,
+            t_t, rho_t, dz_t,
+            last_lev=last_lev,
+            dt=dt
+        )
+
+        # Transpose outputs back from (nlev, ncells) to (ncells, nlev)
+        return tuple(jnp.transpose(r) for r in results)
+    else:
+        # Original layout - no transposes needed
+        return optimized_precip_p.bind(
+            kmin_r, kmin_i, kmin_s, kmin_g,
+            q_in.v, q_in.c, q_in.r, q_in.s, q_in.i, q_in.g,
+            t, rho, dz,
+            last_lev=last_lev,
+            dt=dt
+        )
 
 
 # ============================================================================
@@ -406,13 +596,16 @@ def auto_configure():
     Set these environment variables:
         MUPHYS_OPTIMIZED_HLO=/path/to/optimized.serialized
         MUPHYS_USE_OPTIMIZED=1
+        MUPHYS_TRANSPOSED=1  (if HLO expects nlev×ncells layout)
     """
     hlo_path = os.environ.get("MUPHYS_OPTIMIZED_HLO")
     use_optimized = os.environ.get("MUPHYS_USE_OPTIMIZED", "0") == "1"
+    transposed = os.environ.get("MUPHYS_TRANSPOSED", "0") == "1"
 
     if hlo_path and use_optimized:
-        configure_optimized_precip(hlo_path=hlo_path, use_optimized=True)
-        print(f"Auto-configured optimized precipitation_effects from: {hlo_path}")
+        configure_optimized_precip(hlo_path=hlo_path, use_optimized=True, transposed=transposed)
+        layout = "transposed (nlev×ncells)" if transposed else "original (ncells×nlev)"
+        print(f"Auto-configured optimized precipitation_effects from: {hlo_path} [{layout}]")
 
 
 # Auto-configure on import

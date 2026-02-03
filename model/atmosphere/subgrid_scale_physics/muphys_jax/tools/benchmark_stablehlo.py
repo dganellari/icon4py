@@ -5,8 +5,17 @@ Benchmark StableHLO execution time (compilation vs execution separated).
 Uses JAX's deserialize_and_execute to run compiled StableHLO.
 
 Usage:
+    # With NetCDF input (original ncells×nlev layout)
     python benchmark_stablehlo.py shlo/precip_effect.stablehlo --input data.nc --num-runs 10
-    python benchmark_stablehlo.py shlo/unrolled.stablehlo --compare shlo/baseline.stablehlo --input data.nc
+
+    # With synthetic data (specify dimensions directly)
+    python benchmark_stablehlo.py shlo/precip_effect.stablehlo --ncells 327680 --nlev 90 --num-runs 10
+
+    # For transposed layout (nlev×ncells)
+    python benchmark_stablehlo.py shlo/transposed.stablehlo --ncells 327680 --nlev 90 --transposed
+
+    # Compare multiple files
+    python benchmark_stablehlo.py shlo/baseline.stablehlo --compare shlo/optimized.stablehlo --ncells 327680 --nlev 90
 """
 
 import argparse
@@ -101,6 +110,56 @@ def load_inputs_from_netcdf(input_file: str):
     return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
 
 
+def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False):
+    """Generate synthetic inputs for benchmarking without NetCDF file.
+
+    Args:
+        ncells: Number of horizontal cells
+        nlev: Number of vertical levels
+        transposed: If True, generate tensors as nlev×ncells (transposed layout)
+                   If False, generate tensors as ncells×nlev (original layout)
+    """
+    print(f"Generating synthetic inputs: {ncells} cells × {nlev} levels")
+    if transposed:
+        print(f"  Layout: tensor<{nlev}×{ncells}> (transposed - nlev×ncells)")
+        shape = (nlev, ncells)
+    else:
+        print(f"  Layout: tensor<{ncells}×{nlev}> (original - ncells×nlev)")
+        shape = (ncells, nlev)
+
+    # Generate realistic-ish values
+    rng = np.random.default_rng(42)
+
+    # Boolean masks - activation at ~level 10
+    kmin_r = np.zeros(shape, dtype=bool)
+    kmin_i = np.zeros(shape, dtype=bool)
+    kmin_s = np.zeros(shape, dtype=bool)
+    kmin_g = np.zeros(shape, dtype=bool)
+    if transposed:
+        kmin_r[10, :] = True
+        kmin_i[12, :] = True
+        kmin_s[8, :] = True
+        kmin_g[15, :] = True
+    else:
+        kmin_r[:, 10] = True
+        kmin_i[:, 12] = True
+        kmin_s[:, 8] = True
+        kmin_g[:, 15] = True
+
+    # Physical quantities
+    qv = np.ones(shape, dtype=np.float64) * 1e-3  # specific humidity
+    qc = np.ones(shape, dtype=np.float64) * 1e-5  # cloud water
+    qr = np.ones(shape, dtype=np.float64) * 1e-6  # rain
+    qs = np.ones(shape, dtype=np.float64) * 1e-6  # snow
+    qi = np.ones(shape, dtype=np.float64) * 1e-6  # ice
+    qg = np.ones(shape, dtype=np.float64) * 1e-6  # graupel
+    t = np.ones(shape, dtype=np.float64) * 273.0  # temperature
+    rho = np.ones(shape, dtype=np.float64) * 1.0  # density
+    dz = np.ones(shape, dtype=np.float64) * 100.0  # layer thickness
+
+    return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
+
+
 def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
     """Benchmark execution time (excluding compilation)."""
     device = client.local_devices()[0]
@@ -111,34 +170,57 @@ def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
     except:
         device_inputs = jax_inputs
 
-    # Warmup
-    print(f"  Warmup ({num_warmup} runs)...")
-    for _ in range(num_warmup):
+    # Warmup - do more warmup runs to stabilize GPU clocks
+    actual_warmup = max(num_warmup, 10)  # At least 10 warmup runs
+    print(f"  Warmup ({actual_warmup} runs to stabilize GPU clocks)...")
+    for _ in range(actual_warmup):
         results = executable.execute(device_inputs)
         jax.block_until_ready(results)
 
     # Benchmark
     print(f"  Benchmarking ({num_runs} runs)...")
     times = []
+    total_start = time.perf_counter()
     for i in range(num_runs):
         start = time.perf_counter()
         results = executable.execute(device_inputs)
         jax.block_until_ready(results)
         elapsed = (time.perf_counter() - start) * 1000
         times.append(elapsed)
-        print(f"    Run {i+1}: {elapsed:.2f} ms")
+        # Print first 10 runs as they happen
+        if i < 10:
+            print(f"    Run {i+1}: {elapsed:.2f} ms")
+    total_elapsed = time.perf_counter() - total_start
 
-    return np.array(times)
+    times_arr = np.array(times)
+    median_time = np.median(times_arr)
+    outliers = times_arr > (median_time * 1.5)
+    num_outliers = np.sum(outliers)
+
+    print(f"  Min: {np.min(times_arr):.2f} ms, Max: {np.max(times_arr):.2f} ms, Median: {median_time:.2f} ms, Mean: {np.mean(times_arr):.2f} ms")
+    print(f"  Total time for {num_runs} runs: {total_elapsed:.3f} s")
+    if num_outliers > 0:
+        print(f"  ⚠ {num_outliers}/{num_runs} runs were outliers (>1.5x median) - GPU throttling detected")
+
+    return times_arr
 
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark StableHLO execution")
     parser.add_argument("stablehlo_file", help="Input StableHLO file")
-    parser.add_argument("--input", "-i", required=True, help="NetCDF input file (required)")
+    parser.add_argument("--input", "-i", help="NetCDF input file (optional if --ncells/--nlev provided)")
+    parser.add_argument("--ncells", type=int, help="Number of cells (for synthetic data)")
+    parser.add_argument("--nlev", type=int, help="Number of levels (for synthetic data)")
+    parser.add_argument("--transposed", action="store_true",
+                       help="Use transposed layout (nlev×ncells) for synthetic data")
     parser.add_argument("--compare", nargs="+", help="Additional files to compare")
     parser.add_argument("--num-warmup", type=int, default=3, help="Warmup runs")
     parser.add_argument("--num-runs", type=int, default=10, help="Benchmark runs")
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.input is None and (args.ncells is None or args.nlev is None):
+        parser.error("Either --input or both --ncells and --nlev are required")
 
     print("=" * 70)
     print("StableHLO Execution Benchmark")
@@ -149,7 +231,15 @@ def main():
     print()
 
     client = xla_bridge.get_backend("gpu")
-    inputs, ncells, nlev = load_inputs_from_netcdf(args.input)
+
+    # Load inputs from NetCDF or generate synthetic
+    if args.input:
+        inputs, ncells, nlev = load_inputs_from_netcdf(args.input)
+        if args.transposed:
+            print("  Transposing inputs to nlev×ncells layout...")
+            inputs = [np.transpose(inp) for inp in inputs]
+    else:
+        inputs, ncells, nlev = generate_synthetic_inputs(args.ncells, args.nlev, args.transposed)
     print()
 
     all_files = [args.stablehlo_file]
@@ -182,9 +272,6 @@ def main():
                 'std': np.std(times),
                 'min': np.min(times),
             }
-
-            print(f"\n  Execution: {np.mean(times):.2f} ± {np.std(times):.2f} ms")
-            print(f"  Min: {np.min(times):.2f} ms")
             print()
 
         except Exception as e:
