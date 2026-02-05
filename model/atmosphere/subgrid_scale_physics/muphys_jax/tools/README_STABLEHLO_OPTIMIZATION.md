@@ -167,59 +167,59 @@ python tools/transform_stablehlo.py stablehlo_scan_baseline.mlir stablehlo_unrol
 
 ## Workflow
 
-### Step 1: Export Baseline
+
+## New Combined StableHLO Workflow
+
+### Step 1: Generate q_t_update StableHLO
 ```bash
-cd model/atmosphere/subgrid_scale_physics/muphys_jax
-python tools/export_graupel_stablehlo.py
+python generate_qt_update_stablehlo.py -o stablehlo/qt_update.stablehlo
 ```
 
-**Expected output:**
-- `stablehlo_graupel_full.mlir` (~500KB)
-- Analysis showing ~180 while loops (90 scans × 2 fused/unfused)
-
-### Step 2: Transform
+### Step 2: Generate precip StableHLO (already exists, or regenerate)
 ```bash
-python tools/transform_stablehlo.py stablehlo_graupel_full.mlir stablehlo_graupel_optimized.mlir
+python generate_unrolled_transposed.py -o stablehlo/precip_transposed.stablehlo
 ```
 
-**Transformations applied:**
-1. Unroll all while loops
-2. Static slicing
-3. SSA carry state
-4. Delayed output construction
-
-### Step 3: MLIR Optimization Passes
+### Step 3: Combine them
 ```bash
-mlir-opt stablehlo_graupel_optimized.mlir \
-  --canonicalize \
-  --cse \
-  --symbol-dce \
-  -o stablehlo_graupel_opt.mlir
+python generate_combined_graupel.py \
+    --qt-update stablehlo/qt_update.stablehlo \
+    --precip stablehlo/precip_transposed.stablehlo \
+    -o stablehlo/graupel_combined.stablehlo
 ```
 
-### Step 4: Lower to GPU
+### Step 4: Test with combined HLO
 ```bash
-mlir-opt stablehlo_graupel_opt.mlir \
-  --convert-stablehlo-to-linalg \
-  --linalg-fuse-elementwise-ops \
-  --convert-linalg-to-gpu \
-  --gpu-kernel-outlining \
-  -o stablehlo_graupel_gpu.mlir
+python test_graupel_native_transposed.py \
+    --input /path/to/graupel_input.nc \
+    --graupel-hlo stablehlo/graupel_combined.stablehlo \
+    --num-runs 60
 ```
 
-### Step 5: Compile and Benchmark
+### Or test precip-only HLO (existing path, still works)
 ```bash
-# Compile to executable
-mlir-opt stablehlo_graupel_gpu.mlir \
-  --convert-gpu-to-nvvm \
-  --gpu-to-llvm \
-  -o stablehlo_graupel_nvvm.mlir
-
-# Compare performance
-python -m muphys_jax.driver.run_graupel_jax input.nc 100 30.0 100.0  # Baseline
-# Run compiled MLIR version
-# Target: <17ms (DaCe-like performance)
+python test_graupel_native_transposed.py \
+    --input /path/to/graupel_input.nc \
+    --optimized-hlo stablehlo/precip_transposed.stablehlo \
+    --num-runs 60
 ```
+
+### Benchmark combined graupel vs precip-only
+```bash
+python benchmark_stablehlo.py \
+    stablehlo/graupel_combined.stablehlo \
+    --compare stablehlo/precip_transposed.stablehlo \
+    --input /path/to/input.nc --transposed --num-runs 100
+```
+
+### Or just the combined graupel alone
+```bash
+python benchmark_stablehlo.py \
+    stablehlo/graupel_combined.stablehlo \
+    --input /path/to/input.nc --transposed --num-runs 100
+```
+
+The benchmark auto-detects the input count from the @main signature in each StableHLO file. When comparing files with different signatures (14 inputs vs 13), it loads the right inputs for each file separately. This gives you clean, isolated XLA-only execution timings without any JAX dispatch overhead.
 
 ## Expected Performance Impact
 

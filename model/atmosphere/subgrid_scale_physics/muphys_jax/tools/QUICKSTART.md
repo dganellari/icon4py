@@ -5,59 +5,46 @@ Transform JAX graupel to eliminate 92.1% D2D memory copy overhead and achieve Da
 
 ## Quick Run
 
-### Option 1: Automated Pipeline
-```bash
-cd model/atmosphere/subgrid_scale_physics/muphys_jax
-chmod +x tools/run_stablehlo_pipeline.sh
-./tools/run_stablehlo_pipeline.sh
-```
 
-This will:
-1. Export StableHLO from JAX ✓
-2. Analyze loop structure ✓
-3. Transform IR ✓
-4. Apply optimizations (if mlir-opt available)
+# Step 1: Generate q_t_update StableHLO
+python generate_qt_update_stablehlo.py -o stablehlo/qt_update.stablehlo
 
-### Option 2: Manual Steps
+# Step 2: Generate precip StableHLO (already exists, or regenerate)
+python generate_unrolled_transposed.py -o stablehlo/precip_transposed.stablehlo
 
-#### Step 1: Export StableHLO IR
-```bash
-# Simple scan test
-python tools/export_stablehlo.py
+# Step 3: Combine them
+python generate_combined_graupel.py \
+  --qt-update stablehlo/qt_update.stablehlo \
+  --precip stablehlo/precip_transposed.stablehlo \
+  -o stablehlo/graupel_combined.stablehlo
 
-# Full graupel physics
-python tools/export_graupel_stablehlo.py
-```
+# Step 4: Test with combined HLO
+python test_graupel_native_transposed.py \
+  --input /path/to/graupel_input.nc \
+  --graupel-hlo stablehlo/graupel_combined.stablehlo \
+  --num-runs 60
 
-**Outputs:**
-- `stablehlo_scan_baseline.mlir` - Simple test (4-5 KB)
-- `stablehlo_graupel_full.mlir` - Full physics (500+ KB, 180 scans)
+# Or test precip-only HLO (existing path, still works)
+python test_graupel_native_transposed.py \
+  --input /path/to/graupel_input.nc \
+  --optimized-hlo stablehlo/precip_transposed.stablehlo \
+  --num-runs 60
 
-#### Step 2: Analyze Structure
-```bash
-python tools/transform_stablehlo_v2.py stablehlo_graupel_full.mlir analysis.mlir
-```
+Now you can benchmark the combined graupel directly:
 
-**What to look for:**
-- Number of `stablehlo.while` loops (expect ~180 for baseline graupel)
-- Number of `dynamic_slice` ops (D2D reads)
-- Number of `dynamic_update_slice` ops (D2D writes)
 
-#### Step 3: Transform (Simple Test First)
-```bash
-python tools/transform_stablehlo.py stablehlo_scan_baseline.mlir stablehlo_unrolled.mlir
-```
+# Benchmark combined graupel vs precip-only
+python benchmark_stablehlo.py \
+  stablehlo/graupel_combined.stablehlo \
+  --compare stablehlo/precip_transposed.stablehlo \
+  --input /path/to/input.nc --transposed --num-runs 100
 
-#### Step 4: Verify Transformation
-```bash
-# Check unrolled IR
-head -100 stablehlo_unrolled.mlir
+# Or just the combined graupel alone
+python benchmark_stablehlo.py \
+  stablehlo/graupel_combined.stablehlo \
+  --input /path/to/input.nc --transposed --num-runs 100
 
-# Should see:
-# - No "stablehlo.while" (all unrolled)
-# - "stablehlo.slice" instead of "dynamic_slice" (static indexing)
-# - SSA values for carry state
-```
+The benchmark auto-detects the input count from the @main signature in each StableHLO file. When comparing files with different signatures (14 inputs vs 13), it loads the right inputs for each file separately. This gives you clean, isolated XLA-only execution timings without any JAX dispatch overhead.
 
 ## Understanding the Output
 
