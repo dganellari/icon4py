@@ -118,6 +118,42 @@ def main():
     time_native, result_native = benchmark(graupel_fn, graupel_args, "Native-transposed",
                                             args.num_warmup, args.num_runs)
 
+    # Also measure WITH transposes included (end-to-end cost)
+    print()
+    print("Measuring WITH transposes (end-to-end)...")
+
+    def graupel_with_transposes(dz, t, p, rho, q, dt, qnc):
+        """Full end-to-end: transpose inputs -> compute -> transpose outputs back."""
+        dz_tr = jnp.transpose(dz)
+        t_tr = jnp.transpose(t)
+        p_tr = jnp.transpose(p)
+        rho_tr = jnp.transpose(rho)
+        qnc_tr = jnp.transpose(qnc)
+        q_tr = Q(
+            v=jnp.transpose(q.v), c=jnp.transpose(q.c),
+            r=jnp.transpose(q.r), s=jnp.transpose(q.s),
+            i=jnp.transpose(q.i), g=jnp.transpose(q.g),
+        )
+        t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run_native_transposed(
+            dz_tr, t_tr, p_tr, rho_tr, q_tr, dt, qnc_tr
+        )
+        # Transpose outputs back
+        return (
+            jnp.transpose(t_out),
+            Q(v=jnp.transpose(q_out.v), c=jnp.transpose(q_out.c),
+              r=jnp.transpose(q_out.r), s=jnp.transpose(q_out.s),
+              i=jnp.transpose(q_out.i), g=jnp.transpose(q_out.g)),
+            jnp.transpose(pflx), jnp.transpose(pr), jnp.transpose(ps),
+            jnp.transpose(pi), jnp.transpose(pg), jnp.transpose(pre),
+        )
+
+    graupel_e2e_fn = jax.jit(graupel_with_transposes)
+    graupel_e2e_args = (dz, t, p, rho, q, dt, qnc)
+    time_e2e, _ = benchmark(graupel_e2e_fn, graupel_e2e_args, "With-transposes (end-to-end)",
+                             args.num_warmup, args.num_runs)
+    transpose_overhead = time_e2e - time_native
+    print(f"  Transpose overhead: {transpose_overhead:.3f} ms")
+
     # Unpack results and transpose back for comparison
     t_out, q_out, pflx, pr, ps, pi, pg, pre = result_native
 
@@ -263,7 +299,8 @@ def main():
     print("=" * 70)
     print(f"Implementation: graupel_native_transposed (fused q_t_update)")
     print(f"Grid size:      {ncells} cells x {nlev} levels")
-    print(f"Timing:         {time_native:.2f} ms")
+    print(f"Timing (no transpose):   {time_native:.2f} ms")
+    print(f"Timing (with transpose): {time_e2e:.2f} ms  (overhead: {transpose_overhead:.2f} ms)")
     print()
     print("Validation:")
     print(f"  vs baseline:  {'✓ PASS' if baseline_match else '✗ FAIL'} (max diff: {max_diff_baseline:.2e})")

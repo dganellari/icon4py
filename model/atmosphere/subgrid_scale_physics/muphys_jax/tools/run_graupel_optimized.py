@@ -453,31 +453,15 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
 
     # Select implementation
     if mode == "baseline":
-        if optimized_hlo:
-            from muphys_jax.implementations.graupel_optimized import graupel_run
-            impl_name = "graupel_optimized"
-        else:
-            from muphys_jax.implementations.graupel_baseline import graupel_run
-            impl_name = "graupel_baseline"
-    elif mode == "allinone":
-        if optimized_hlo:
-            from muphys_jax.implementations.graupel_allinone_optimized import graupel_allinone_fused_run as graupel_run
-            impl_name = "graupel_allinone_optimized"
-        else:
-            from muphys_jax.implementations.graupel_allinone_fused import graupel_allinone_fused_run as graupel_run
-            impl_name = "graupel_allinone_fused"
-    elif mode == "transposed":
-        # Option 2: Keep data transposed throughout - transpose only at entry/exit
-        from muphys_jax.implementations.graupel_transposed import graupel_run_transposed as graupel_run
-        impl_name = "graupel_transposed"
+        from muphys_jax.implementations.graupel_baseline import graupel_run
+        impl_name = "graupel_baseline"
     elif mode == "native-transposed":
-        # Option 3: Data is pre-transposed, ZERO transposes during computation
         from muphys_jax.implementations.graupel_native_transposed import graupel_run_native_transposed
         impl_name = "graupel_native_transposed"
         # This mode requires special handling - return early with custom benchmark
         return run_graupel_native_transposed(input_file, num_warmup, num_runs, optimized_hlo)
     else:
-        raise ValueError(f"Unknown mode: {mode}")
+        raise ValueError(f"Unknown mode: {mode}. Valid: baseline, native-transposed")
 
     print(f"\nImplementation: {impl_name}")
     print(f"Grid: {ncells} cells × {nlev} levels")
@@ -740,14 +724,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Benchmark baseline (mode 1: no optimization)
+    # Native-transposed (default, best performance)
+    python run_graupel_optimized.py --input data.nc
+
+    # With combined graupel HLO injection
+    python run_graupel_optimized.py --input data.nc --mode native-transposed \\
+        --optimized-hlo stablehlo/graupel_combined.stablehlo
+
+    # Baseline (original ncells x nlev layout)
     python run_graupel_optimized.py --input data.nc --mode baseline
-
-    # MODE 2 (CURRENT): HLO injection with per-call transposes (~18.9ms isolated)
-    python run_graupel_optimized.py --input data.nc --optimized-hlo stablehlo/precip_transposed.stablehlo --transposed
-
-    # MODE 3 (OPTION 1): Transposed throughout - transpose only at entry/exit
-    python run_graupel_optimized.py --input data.nc --mode transposed --optimized-hlo stablehlo/precip_transposed.stablehlo --transposed
 
     # Direct HLO benchmark (most accurate, no JAX overhead)
     python run_graupel_optimized.py --input data.nc --hlo-direct shlo/precip_transposed.stablehlo --transposed
@@ -757,25 +742,16 @@ Examples:
         shlo/baseline.stablehlo shlo/optimized.stablehlo --transposed
 
 Implementation modes:
-    baseline          - Standard graupel with optional HLO injection for precipitation_effects
-                        When --transposed, transposes 24 arrays per precipitation_effects call
-    transposed        - Keep all data transposed throughout computation (OPTION 2)
-                        Transposes at entry/exit + q_t_update wraps baseline with transposes
-    native-transposed - OPTION 3: Data pre-transposed ONCE (not timed), then ZERO transposes
-                        Best performance - all computation in (nlev, ncells) layout
-    allinone          - All-in-one fused implementation
-
-Performance comparison (expected):
-    Option 1 (baseline + HLO injection): ~51ms (transposes eat gains)
-    Option 2 (transposed mode):          ~51ms (q_t_update still transposes)
-    Option 3 (native-transposed):        ~35-40ms (ZERO transposes, full speedup)
+    baseline          - Original graupel with (ncells, nlev) layout
+    native-transposed - Data pre-transposed ONCE, then ZERO transposes during computation
+                        Best performance - all computation in (nlev, ncells) layout (~32ms)
 """
     )
     parser.add_argument('--input', '-i', required=True, help='Input netCDF file')
     parser.add_argument('--optimized-hlo', type=str,
                        help='Path to optimized HLO file (.hlo or .serialized)')
-    parser.add_argument('--mode', '-m', choices=['baseline', 'allinone', 'transposed', 'native-transposed'],
-                       default='baseline', help='Implementation mode (baseline, transposed, native-transposed, allinone)')
+    parser.add_argument('--mode', '-m', choices=['baseline', 'native-transposed'],
+                       default='native-transposed', help='Implementation mode (baseline, native-transposed)')
     parser.add_argument('--compare', action='store_true',
                        help='Compare optimized vs baseline (full graupel)')
     parser.add_argument('--hlo-direct', type=str,

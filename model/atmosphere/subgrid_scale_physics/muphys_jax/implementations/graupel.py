@@ -23,31 +23,8 @@ from ..core.common import constants as const
 from ..core.common.backend import jit_compile
 
 # Import from core modules
-from ..core.definitions import Q, TempState, PrecipState, PrecipState
+from ..core.definitions import Q, TempState
 from ..core.scans import precip_scan_batched, precip_scan_unrolled, precip_scan_tiled, temperature_scan_step
-
-# Pallas import (optional)
-try:
-    from ..core.scans_pallas import precip_scan_pallas, PALLAS_AVAILABLE
-except ImportError:
-    PALLAS_AVAILABLE = False
-    precip_scan_pallas = None
-
-# Triton import (optional)
-try:
-    from ..core.scans_triton import precip_scan_triton, TRITON_AVAILABLE, TRITON_IMPORT_ERROR
-except ImportError as e:
-    TRITON_AVAILABLE = False
-    TRITON_IMPORT_ERROR = str(e)
-    precip_scan_triton = None
-
-# MLIR import (optional)
-try:
-    from muphys_mlir import precip_scan_mlir, MLIR_AVAILABLE, MLIR_IMPORT_ERROR
-except ImportError as e:
-    MLIR_AVAILABLE = False
-    MLIR_IMPORT_ERROR = str(e)
-    precip_scan_mlir = None
 
 
 # ============================================================================
@@ -284,26 +261,12 @@ def temperature_update_scan(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho,
     )
 
 
-def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt, fused=False, tiled=False, tile_size=4, optimize_layout=True, unrolled=False, pallas=False, triton=False, mlir=False):
+def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt, tiled=False, tile_size=4, unrolled=False):
     """
     Apply precipitation sedimentation and temperature effects.
-    From graupel.py:366-424.
 
-    Args:
-        fused: If True, use fused precipitation+temperature scan (90 kernels).
-               If False, use separate scans (180 kernels).
-        tiled: If True, use tiled scan to process multiple levels per iteration.
-        tile_size: Number of levels to process per tiled scan iteration.
-        optimize_layout: If True, keep arrays in GPU-optimal layout (nlev, ncells).
-
-    Note: All inputs are (ncells, nlev). Internally we use (nlev, ncells) for scans
-          to avoid repeated transposes in the scan loop when optimize_layout=True.
+    All inputs are (ncells, nlev). Internally uses (nlev, ncells) for scans.
     """
-    if fused:
-        return precipitation_effects_fused(
-            last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt
-        )
-
     ncells, nlev = t.shape
 
     # Store initial state for energy calculation
@@ -320,7 +283,7 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     vc_i = props.vel_scale_factor_ice(xrho)
     vc_g = props.vel_scale_factor_default(xrho)
 
-    # Fall speed parameters (from GT4Py idx namespace)
+    # Fall speed parameters
     params_list = [
         (14.58, 0.111, 1.0e-12),  # rain
         (57.80, 0.16666666666666666, 1.0e-12),  # snow
@@ -328,347 +291,62 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
         (12.24, 0.217, 1.0e-08),  # graupel
     ]
 
-    if optimize_layout:
-        # === Keep in GPU-optimal layout: (nlev, ncells) throughout ===
-        # Fallback if Triton requested but not available
-        if triton and not TRITON_AVAILABLE:
-            triton = False
-            unrolled = True  # Fallback to unrolled scan
+    # Transpose to GPU-optimal layout: (ncells, nlev) -> (nlev, ncells)
+    zeta_T = jnp.swapaxes(zeta, 0, 1)
+    rho_T = jnp.swapaxes(rho, 0, 1)
+    q_list_T = [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
+                jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)]
+    vc_list_T = [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
+                 jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)]
+    mask_list_T = [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
+                   jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)]
 
-        # Fallback if MLIR requested but not available
-        if mlir and not MLIR_AVAILABLE:
-            mlir = False
-            unrolled = True  # Fallback to unrolled scan
-
-        zeta_T = jnp.swapaxes(zeta, 0, 1)  # (nlev, ncells)
-        rho_T = jnp.swapaxes(rho, 0, 1)   # (nlev, ncells)
-        q_list_T = [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-                    jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)]
-        vc_list_T = [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-                     jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)]
-        mask_list_T = [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-                       jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)]
-
-        # Run batched precipitation scans with vertical-major data
-        if mlir:
-            # MLIR: GPU kernel via MLIR dialects - target DaCe performance
-            if not MLIR_AVAILABLE:
-                raise RuntimeError(f"MLIR not available: {MLIR_IMPORT_ERROR}. Install with: pip install mlir-python-bindings")
-            # Convert JAX arrays to numpy for MLIR kernel
-            import numpy as np
-            results = precip_scan_mlir(
-                params_list,
-                np.array(zeta_T), np.array(rho_T),
-                [np.array(q) for q in q_list_T],
-                [np.array(vc) for vc in vc_list_T],
-                [np.array(m) for m in mask_list_T]
-            )
-            # Convert results back to JAX arrays
-            results = [(jnp.array(q), jnp.array(flx)) for q, flx in results]
-        elif triton:
-            # TRITON: Custom CUDA kernel - target DaCe performance
-            if not TRITON_AVAILABLE:
-                raise RuntimeError(f"Triton not available: {TRITON_IMPORT_ERROR}. Install with: pip install triton torch")
-            results = precip_scan_triton(
-                params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
-            )
-        elif pallas:
-            # PALLAS: Custom GPU kernel with carry in registers
-            if not PALLAS_AVAILABLE:
-                raise RuntimeError("Pallas not available. Install with: pip install jax[cuda12_pallas]")
-            results = precip_scan_pallas(
-                params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
-            )
-        elif unrolled:
-            # UNROLLED: Single fused kernel (no lax.scan overhead)
-            results = precip_scan_unrolled(
-                params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
-            )
-        elif tiled:
-            # TILED: Reduce scan iterations by tile_size factor
-            results = precip_scan_tiled(
-                params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T, tile_size=tile_size
-            )
-        else:
-            results = precip_scan_batched(
-                params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
-            )
-
-        # Unpack results (in nlev, ncells format)
-        (qr_T, pr_T), (qs_T, ps_T), (qi_T, pi_T), (qg_T, pg_T) = results
-
-        # === TRANSPOSE BACK only at the end: (nlev, ncells) -> (ncells, nlev) ===
-        qr = jnp.swapaxes(qr_T, 0, 1)
-        qs = jnp.swapaxes(qs_T, 0, 1)
-        qi = jnp.swapaxes(qi_T, 0, 1)
-        qg = jnp.swapaxes(qg_T, 0, 1)
-        pr = jnp.swapaxes(pr_T, 0, 1)
-        ps = jnp.swapaxes(ps_T, 0, 1)
-        pi = jnp.swapaxes(pi_T, 0, 1)
-        pg = jnp.swapaxes(pg_T, 0, 1)
-
-        # Update for temperature scan - keep in (ncells, nlev) layout
-        qliq = q_in.c + qr
-        qice = qs + qi + qg
-        pflx_tot = ps + pi + pg
-
-        # Shift temperature for next level
-        t_kp1 = jnp.concatenate([t[:, 1:], t[:, -1:]], axis=1)
-        t_kp1 = jnp.where(jnp.arange(nlev) < last_lev, t_kp1, t)
-
-        kmin_rsig = kmin_r | kmin_s | kmin_i | kmin_g
-
-        # Temperature update scan
-        result_t = temperature_update_scan(
-            t, t_kp1, ei_old, pr, pflx_tot, q_in.v, qliq, qice, rho, dz, dt, kmin_rsig
+    # Run batched precipitation scans
+    if unrolled:
+        results = precip_scan_unrolled(
+            params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
         )
-        t_new = result_t.t
-        eflx = result_t.eflx
+    elif tiled:
+        results = precip_scan_tiled(
+            params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T, tile_size=tile_size
+        )
     else:
-        # Original layout (more transposes, suboptimal for GPU)
-        # === TRANSPOSE ONCE at API boundary: (ncells, nlev) -> (nlev, ncells) ===
-        zeta_T = jnp.swapaxes(zeta, 0, 1)
-        rho_T = jnp.swapaxes(rho, 0, 1)
-
-        # Run batched precipitation scans with vertical-major data
-        if tiled:
-            from ..core.scans import precip_scan_batched_tiled
-            results = precip_scan_batched_tiled(
-                params_list,
-                zeta_T,  # (nlev, ncells)
-                rho_T,   # (nlev, ncells)
-                [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-                 jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)],  # (nlev, ncells) each
-                [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-                 jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)],
-                [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-                 jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)],
-                tile_size=tile_size
-            )
-        else:
-            results = precip_scan_batched(
-                params_list,
-                zeta_T,  # (nlev, ncells)
-                rho_T,   # (nlev, ncells)
-                [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-                 jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)],  # (nlev, ncells) each
-                [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-                 jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)],
-                [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-                 jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)],
-            )
-
-        # Unpack results (still in nlev, ncells format)
-        (qr_T, pr_T), (qs_T, ps_T), (qi_T, pi_T), (qg_T, pg_T) = results
-
-        # === TRANSPOSE BACK: (nlev, ncells) -> (ncells, nlev) ===
-        qr = jnp.swapaxes(qr_T, 0, 1)
-        qs = jnp.swapaxes(qs_T, 0, 1)
-        qi = jnp.swapaxes(qi_T, 0, 1)
-        qg = jnp.swapaxes(qg_T, 0, 1)
-        pr = jnp.swapaxes(pr_T, 0, 1)
-        ps = jnp.swapaxes(ps_T, 0, 1)
-        pi = jnp.swapaxes(pi_T, 0, 1)
-        pg = jnp.swapaxes(pg_T, 0, 1)
-
-        # Update for temperature scan
-        qliq = q_in.c + qr
-        qice = qs + qi + qg
-        pflx_tot = ps + pi + pg
-
-        # Shift temperature for next level
-        t_kp1 = jnp.concatenate([t[:, 1:], t[:, -1:]], axis=1)
-        t_kp1 = jnp.where(jnp.arange(nlev) < last_lev, t_kp1, t)
-
-        kmin_rsig = kmin_r | kmin_s | kmin_i | kmin_g
-
-        # Temperature update scan
-        result_t = temperature_update_scan(
-            t, t_kp1, ei_old, pr, pflx_tot, q_in.v, qliq, qice, rho, dz, dt, kmin_rsig
+        results = precip_scan_batched(
+            params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
         )
-        t_new = result_t.t
-        eflx = result_t.eflx
 
-    return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
+    # Unpack and transpose back: (nlev, ncells) -> (ncells, nlev)
+    (qr_T, pr_T), (qs_T, ps_T), (qi_T, pi_T), (qg_T, pg_T) = results
+    qr = jnp.swapaxes(qr_T, 0, 1)
+    qs = jnp.swapaxes(qs_T, 0, 1)
+    qi = jnp.swapaxes(qi_T, 0, 1)
+    qg = jnp.swapaxes(qg_T, 0, 1)
+    pr = jnp.swapaxes(pr_T, 0, 1)
+    ps = jnp.swapaxes(ps_T, 0, 1)
+    pi = jnp.swapaxes(pi_T, 0, 1)
+    pg = jnp.swapaxes(pg_T, 0, 1)
 
-
-def precipitation_effects_fused(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
-    """
-    FUSED implementation: Single scan for precipitation + temperature.
-    
-    Reduces kernel launches from 180 (2×90) to 90.
-    Expected speedup: ~1.3-1.4x
-    """
-    from ..core.scans import precip_scan_step_fast, temperature_scan_step
-    
-    ncells, nlev = t.shape
-    
-    # Setup (same as unfused version)
-    qliq = q_in.c + q_in.r
-    qice = q_in.s + q_in.i + q_in.g
-    ei_old = thermo.internal_energy(t, q_in.v, qliq, qice, rho, dz)
-    
-    zeta = dt / (2.0 * dz)
-    xrho = jnp.sqrt(const.rho_00 / rho)
-    
-    vc_r = props.vel_scale_factor_default(xrho)
-    vc_s = props.vel_scale_factor_snow(xrho, rho, t, q_in.s)
-    vc_i = props.vel_scale_factor_ice(xrho)
-    vc_g = props.vel_scale_factor_default(xrho)
-    
-    params_list = [
-        (14.58, 0.111, 1.0e-12),
-        (57.80, 0.16666666666666666, 1.0e-12),
-        (1.25, 0.160, 1.0e-12),
-        (12.24, 0.217, 1.0e-08),
-    ]
-    
+    # Temperature update scan
+    qliq = q_in.c + qr
+    qice = qs + qi + qg
+    pflx_tot = ps + pi + pg
     t_kp1 = jnp.concatenate([t[:, 1:], t[:, -1:]], axis=1)
     t_kp1 = jnp.where(jnp.arange(nlev) < last_lev, t_kp1, t)
     kmin_rsig = kmin_r | kmin_s | kmin_i | kmin_g
-    
-    # Fused scan step
-    def fused_step(carry, inputs):
-        """Process one vertical level: do precipitation then temperature."""
-        # Unpack carry
-        precip_carries, temp_carry = carry
-        
-        # Unpack inputs
-        # precip_inputs_per_species: tuple of 4 species, each is a tuple of 8 arrays (ncells,)
-        # temp_inputs: tuple of 12 arrays (ncells,)
-        precip_inputs_per_species, temp_inputs = inputs
-        
-        # === STEP 1: Precipitation for all 4 species ===
-        new_precip_carries = []
-        q_outs = []
-        flx_outs = []
-        
-        for i in range(4):
-            carry_i = precip_carries[i]
-            # Each species' inputs: (prefactor, exponent, offset, zeta, vc, q, rho, mask)
-            inputs_i = precip_inputs_per_species[i]
-            new_carry_i, (q_out, flx_out) = precip_scan_step_fast(carry_i, inputs_i)
-            new_precip_carries.append(new_carry_i)
-            q_outs.append(q_out)
-            flx_outs.append(flx_out)
-        
-        qr, qs, qi, qg = q_outs
-        pr, ps, pi, pg = flx_outs
-        
-        # === STEP 2: Temperature using fresh precipitation results ===
-        # Unpack temp inputs (13 elements)
-        t_in, t_kp1_in, ei_old_in, _, _, qv_in, qc_in, qliq_in, qice_in, rho_in, dz_in, dt_in, mask_in = temp_inputs
-        
-        # Update with fresh precipitation results
-        qliq_updated = qc_in + qr  # qc + qr (use qc from inputs)
-        qice_updated = qs + qi + qg
-        pflx_tot_updated = ps + pi + pg
-        
-        updated_temp_inputs = (
-            t_in, t_kp1_in, ei_old_in, pr, pflx_tot_updated,
-            qv_in, qliq_updated, qice_updated, rho_in, dz_in, dt_in, mask_in
-        )
-        
-        new_temp_carry, temp_output = temperature_scan_step(temp_carry, updated_temp_inputs)
-        
-        # Return new carry and outputs
-        new_carry = (tuple(new_precip_carries), new_temp_carry)
-        outputs = (qr, qs, qi, qg, pr, ps, pi, pg, temp_output.t, temp_output.eflx)
-        
-        return new_carry, outputs
-    
-    # === TRANSPOSE ONCE at API boundary: (ncells, nlev) -> (nlev, ncells) ===
-    # Transpose shared arrays once, reuse for all 4 species
-    zeta_T = jnp.swapaxes(zeta, 0, 1)
-    rho_T = jnp.swapaxes(rho, 0, 1)
 
-    # Prepare per-species data
-    q_list = [q_in.r, q_in.s, q_in.i, q_in.g]
-    vc_list = [vc_r, vc_s, vc_i, vc_g]
-    mask_list = [kmin_r, kmin_s, kmin_i, kmin_g]
+    result_t = temperature_update_scan(
+        t, t_kp1, ei_old, pr, pflx_tot, q_in.v, qliq, qice, rho, dz, dt, kmin_rsig
+    )
+    t_new = result_t.t
+    eflx = result_t.eflx
 
-    # Build per-species precipitation inputs with shape (nlev, ncells)
-    # Each tuple element is: (prefactor, exponent, offset, zeta, vc, q, rho, mask)
-    precip_inputs_per_species = []
-    for i, params in enumerate(params_list):
-        prefactor, exponent, offset = params
-        # Broadcast scalars to (nlev, ncells) shape so scan can iterate over them
-        species_inputs = (
-            jnp.full((nlev, ncells), prefactor, dtype=t.dtype),
-            jnp.full((nlev, ncells), exponent, dtype=t.dtype),
-            jnp.full((nlev, ncells), offset, dtype=t.dtype),
-            zeta_T,  # Reuse transposed array
-            jnp.swapaxes(vc_list[i], 0, 1),  # (nlev, ncells)
-            jnp.swapaxes(q_list[i], 0, 1),  # (nlev, ncells)
-            rho_T,  # Reuse transposed array
-            jnp.swapaxes(mask_list[i], 0, 1),  # (nlev, ncells)
-        )
-        precip_inputs_per_species.append(species_inputs)
-    
-    # Temperature inputs with shape (nlev, ncells) - reuse rho_T
-    dz_T = jnp.swapaxes(dz, 0, 1)
-    temp_inputs_all = (
-        jnp.swapaxes(t, 0, 1), jnp.swapaxes(t_kp1, 0, 1), jnp.swapaxes(ei_old, 0, 1),
-        jnp.zeros((nlev, ncells), dtype=t.dtype),  # pr placeholder
-        jnp.zeros((nlev, ncells), dtype=t.dtype),  # pflx_tot placeholder
-        jnp.swapaxes(q_in.v, 0, 1), jnp.swapaxes(q_in.c, 0, 1),
-        jnp.swapaxes(qliq, 0, 1), jnp.swapaxes(qice, 0, 1),
-        rho_T,  # Reuse transposed array
-        dz_T,   # Reuse transposed array
-        jnp.full((nlev, ncells), dt, dtype=t.dtype),
-        jnp.swapaxes(kmin_rsig, 0, 1)
-    )
-    
-    # Combine inputs: tuple of (precip_inputs_per_species, temp_inputs_all)
-    fused_inputs = (tuple(precip_inputs_per_species), temp_inputs_all)
-    
-    # Initial carry - OPTIMIZED: Only 4 elements (removed rho and vc from carry)
-    init_precip_carries = tuple([
-        (jnp.zeros(ncells, dtype=t.dtype),  # q_prev
-         jnp.zeros(ncells, dtype=t.dtype),  # flx_prev
-         jnp.zeros(ncells, dtype=t.dtype),  # rhox_prev
-         jnp.zeros(ncells, dtype=bool))     # activated_prev
-        for _ in range(4)
-    ])
-    
-    init_temp_carry = TempState(
-        t=jnp.zeros(ncells, dtype=t.dtype),
-        eflx=jnp.zeros(ncells, dtype=t.dtype),
-        activated=jnp.zeros(ncells, dtype=bool)
-    )
-    
-    init_carry = (init_precip_carries, init_temp_carry)
-    
-    # Run fused scan!
-    final_carry, outputs = lax.scan(fused_step, init_carry, fused_inputs)
-    
-    # Unpack outputs
-    qr, qs, qi, qg, pr, ps, pi, pg, t_new, eflx = outputs
-    
-    # Transpose back - use swapaxes instead of .T
-    qr, qs, qi, qg = jnp.swapaxes(qr, 0, 1), jnp.swapaxes(qs, 0, 1), jnp.swapaxes(qi, 0, 1), jnp.swapaxes(qg, 0, 1)
-    pr, ps, pi, pg = jnp.swapaxes(pr, 0, 1), jnp.swapaxes(ps, 0, 1), jnp.swapaxes(pi, 0, 1), jnp.swapaxes(pg, 0, 1)
-    t_new, eflx = jnp.swapaxes(t_new, 0, 1), jnp.swapaxes(eflx, 0, 1)
-    
-    pflx_tot = ps + pi + pg
-    
     return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
 
 
-def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_tiled_scans=False, tile_size=4, optimize_layout=True, use_unrolled=False, use_pallas=False, use_triton=False, use_mlir=False):
+def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_tiled_scans=False, tile_size=4, use_unrolled=False):
     """
     Top-level graupel microphysics function.
-    From graupel.py:427-456.
-
-    Args:
-        use_fused_scans: If True, use fused precipitation+temperature scan (90 kernels).
-        use_tiled_scans: If True, use tiled scans (reduces iterations by tile_size).
-        tile_size: Number of levels per tiled scan iteration.
-        optimize_layout: If True, minimize transposes for better GPU memory layout.
-        use_unrolled: If True, use unrolled loop (single kernel, no lax.scan).
-        use_pallas: If True, use Pallas GPU kernel (carry in registers).
-        use_triton: If True, use Triton CUDA kernel (target DaCe performance).
-        use_mlir: If True, use MLIR GPU kernel (target DaCe performance).
+    Original (ncells, nlev) layout implementation.
     """
     # Compute minimum levels for each species
     kmin_r = q.r > const.qmin
@@ -682,9 +360,7 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_t
     # Precipitation effects
     qr, qs, qi, qg, t_final, pflx, pr, ps, pi, pg, pre = precipitation_effects(
         last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt,
-        fused=use_fused_scans, tiled=use_tiled_scans, tile_size=tile_size,
-        optimize_layout=optimize_layout, unrolled=use_unrolled, pallas=use_pallas,
-        triton=use_triton, mlir=use_mlir
+        tiled=use_tiled_scans, tile_size=tile_size, unrolled=use_unrolled
     )
 
     return (
@@ -704,29 +380,15 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_fused_scans=False, use_t
 # ============================================================================
 
 
-@partial(jax.jit, static_argnames=['use_fused_scans', 'use_tiled_scans', 'tile_size', 'optimize_layout', 'use_unrolled', 'use_pallas', 'use_triton', 'use_mlir'])
-def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_fused_scans=False, use_tiled_scans=False, tile_size=4, optimize_layout=True, use_unrolled=False, use_pallas=False, use_triton=False, use_mlir=False):
-    """
-    JIT-compiled graupel driver.
-
-    Args:
-        use_fused_scans: If True, use fused precipitation+temperature scan (90 kernels).
-        use_tiled_scans: If True, use tiled scans (reduces iterations by tile_size).
-        tile_size: Number of levels per tiled scan iteration.
-        optimize_layout: If True, minimize transposes for better GPU memory layout.
-        use_unrolled: If True, use static unrolled loop.
-        use_pallas: If True, use Pallas GPU kernel.
-        use_triton: If True, use Triton CUDA kernel (target DaCe performance).
-        use_mlir: If True, use MLIR GPU kernel (target DaCe performance).
-    """
+@partial(jax.jit, static_argnames=['use_tiled_scans', 'tile_size', 'use_unrolled'])
+def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_tiled_scans=False, tile_size=4, use_unrolled=False):
+    """JIT-compiled graupel driver (original ncells x nlev layout)."""
     if last_level is None:
         last_level = te.shape[1] - 1
 
     return graupel(last_level, dz, te, p, rho, q_in, dt, qnc,
-                   use_fused_scans=use_fused_scans, use_tiled_scans=use_tiled_scans,
-                   tile_size=tile_size, optimize_layout=optimize_layout,
-                   use_unrolled=use_unrolled, use_pallas=use_pallas,
-                   use_triton=use_triton, use_mlir=use_mlir)
+                   use_tiled_scans=use_tiled_scans, tile_size=tile_size,
+                   use_unrolled=use_unrolled)
 
 
 __all__ = ["graupel", "graupel_run", "precipitation_effects", "q_t_update"]
