@@ -248,6 +248,12 @@ from ..core.optimized_precip import (
     is_optimized_enabled,
 )
 
+# Import the full-graupel optimized primitive (q_t_update + precip combined)
+from ..core.optimized_graupel import (
+    optimized_graupel_p,
+    is_graupel_optimized_enabled,
+)
+
 
 def precipitation_effects_native_transposed(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
     """
@@ -353,6 +359,11 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     ALL outputs are in (nlev, ncells) layout.
 
     ZERO transposes during computation.
+
+    Three modes:
+    1. Full-graupel HLO injection (q_t_update + precip combined in single module)
+    2. Precip-only HLO injection (q_t_update via JAX, precip via injected HLO)
+    3. Pure JAX fallback (no HLO injection)
     """
     # Compute minimum levels for each species
     kmin_r = q.r > const.qmin
@@ -360,8 +371,29 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     kmin_s = q.s > const.qmin
     kmin_g = q.g > const.qmin
 
+    # Mode 1: Full-graupel HLO injection (best performance)
+    if is_graupel_optimized_enabled():
+        results = optimized_graupel_p.bind(
+            kmin_r, kmin_i, kmin_s, kmin_g,
+            te, p, rho, dz,
+            q.v, q.c, q.r, q.s, q.i, q.g,
+            dt=dt
+        )
+        # results: t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx
+        t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx = results
+        return (
+            t_final,
+            Q(v=qv, c=qc, r=qr, s=qs, i=qi, g=qg),
+            pflx,
+            pr,
+            ps,
+            pi,
+            pg,
+            eflx,
+        )
+
+    # Mode 2 & 3: q_t_update via JAX, then precip (with or without HLO injection)
     # Phase transitions - use fused implementation for better GPU kernel fusion
-    # (24.6ms -> 19.9ms, 1.24x speedup)
     q_updated, t_updated = q_t_update_fused(te, p, rho, q, dt, qnc)
 
     # Precipitation effects (native transposed - no transposes!)

@@ -56,8 +56,25 @@ def compile_stablehlo(stablehlo_text: str, client):
     return loaded
 
 
-def load_inputs_from_netcdf(input_file: str):
-    """Load real inputs from NetCDF file."""
+def detect_input_count(stablehlo_text: str) -> int:
+    """Detect number of inputs from StableHLO @main signature."""
+    import re
+    match = re.search(r'func\.func\s+public\s+@main\s*\(([^)]*)\)', stablehlo_text, re.DOTALL)
+    if not match:
+        return 13  # default to precip-only
+    args_str = match.group(1)
+    return len(re.findall(r'%arg\d+', args_str))
+
+
+def load_inputs_from_netcdf(input_file: str, num_inputs: int = 13):
+    """Load real inputs from NetCDF file.
+
+    Args:
+        input_file: Path to NetCDF file
+        num_inputs: Number of inputs expected by the StableHLO module.
+            13 = precip-only: [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz]
+            14 = combined graupel: [kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg]
+    """
     print(f"Loading inputs from: {input_file}")
     ds = netCDF4.Dataset(input_file, 'r')
 
@@ -96,6 +113,7 @@ def load_inputs_from_netcdf(input_file: str):
     qi = load_var("cli")
     qg = load_var("qg")
     t = load_var("ta")
+    p = load_var("pfull")
     rho = load_var("rho")
 
     # Compute kmin masks (same logic as graupel)
@@ -107,10 +125,17 @@ def load_inputs_from_netcdf(input_file: str):
 
     ds.close()
 
-    return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
+    if num_inputs == 14:
+        # Combined graupel: kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg
+        print(f"  Input layout: combined graupel (14 inputs)")
+        return [kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg], ncells, nlev
+    else:
+        # Precip-only: kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz
+        print(f"  Input layout: precip-only (13 inputs)")
+        return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
 
 
-def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False):
+def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False, num_inputs: int = 13):
     """Generate synthetic inputs for benchmarking without NetCDF file.
 
     Args:
@@ -118,6 +143,7 @@ def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False):
         nlev: Number of vertical levels
         transposed: If True, generate tensors as nlev×ncells (transposed layout)
                    If False, generate tensors as ncells×nlev (original layout)
+        num_inputs: 13 for precip-only, 14 for combined graupel
     """
     print(f"Generating synthetic inputs: {ncells} cells × {nlev} levels")
     if transposed:
@@ -126,9 +152,6 @@ def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False):
     else:
         print(f"  Layout: tensor<{ncells}×{nlev}> (original - ncells×nlev)")
         shape = (ncells, nlev)
-
-    # Generate realistic-ish values
-    rng = np.random.default_rng(42)
 
     # Boolean masks - activation at ~level 10
     kmin_r = np.zeros(shape, dtype=bool)
@@ -147,17 +170,23 @@ def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False):
         kmin_g[:, 15] = True
 
     # Physical quantities
-    qv = np.ones(shape, dtype=np.float64) * 1e-3  # specific humidity
-    qc = np.ones(shape, dtype=np.float64) * 1e-5  # cloud water
-    qr = np.ones(shape, dtype=np.float64) * 1e-6  # rain
-    qs = np.ones(shape, dtype=np.float64) * 1e-6  # snow
-    qi = np.ones(shape, dtype=np.float64) * 1e-6  # ice
-    qg = np.ones(shape, dtype=np.float64) * 1e-6  # graupel
-    t = np.ones(shape, dtype=np.float64) * 273.0  # temperature
-    rho = np.ones(shape, dtype=np.float64) * 1.0  # density
-    dz = np.ones(shape, dtype=np.float64) * 100.0  # layer thickness
+    qv = np.ones(shape, dtype=np.float64) * 1e-3
+    qc = np.ones(shape, dtype=np.float64) * 1e-5
+    qr = np.ones(shape, dtype=np.float64) * 1e-6
+    qs = np.ones(shape, dtype=np.float64) * 1e-6
+    qi = np.ones(shape, dtype=np.float64) * 1e-6
+    qg = np.ones(shape, dtype=np.float64) * 1e-6
+    t = np.ones(shape, dtype=np.float64) * 273.0
+    p = np.ones(shape, dtype=np.float64) * 80000.0
+    rho = np.ones(shape, dtype=np.float64) * 1.0
+    dz = np.ones(shape, dtype=np.float64) * 100.0
 
-    return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
+    if num_inputs == 14:
+        print(f"  Input layout: combined graupel (14 inputs)")
+        return [kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg], ncells, nlev
+    else:
+        print(f"  Input layout: precip-only (13 inputs)")
+        return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
 
 
 def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
@@ -232,16 +261,6 @@ def main():
 
     client = xla_bridge.get_backend("gpu")
 
-    # Load inputs from NetCDF or generate synthetic
-    if args.input:
-        inputs, ncells, nlev = load_inputs_from_netcdf(args.input)
-        if args.transposed:
-            print("  Transposing inputs to nlev×ncells layout...")
-            inputs = [np.transpose(inp) for inp in inputs]
-    else:
-        inputs, ncells, nlev = generate_synthetic_inputs(args.ncells, args.nlev, args.transposed)
-    print()
-
     all_files = [args.stablehlo_file]
     if args.compare:
         all_files.extend(args.compare)
@@ -256,6 +275,20 @@ def main():
         try:
             shlo_text = load_stablehlo(filepath)
             print(f"  Size: {len(shlo_text) / 1024:.1f} KB")
+
+            # Detect input count from the StableHLO signature
+            num_inputs = detect_input_count(shlo_text)
+            print(f"  Detected {num_inputs} inputs")
+
+            # Load inputs matching this file's signature
+            if args.input:
+                inputs, ncells, nlev = load_inputs_from_netcdf(args.input, num_inputs)
+                if args.transposed:
+                    print("  Transposing inputs to nlev×ncells layout...")
+                    inputs = [np.transpose(inp) for inp in inputs]
+            else:
+                inputs, ncells, nlev = generate_synthetic_inputs(
+                    args.ncells, args.nlev, args.transposed, num_inputs)
 
             print("  Compiling...")
             compile_start = time.perf_counter()

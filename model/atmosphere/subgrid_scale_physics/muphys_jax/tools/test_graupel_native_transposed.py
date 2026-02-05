@@ -54,6 +54,7 @@ def main():
     parser.add_argument("--input", "-i", required=True, help="Input NetCDF file")
     parser.add_argument("--reference", "-r", help="Reference NetCDF file (optional)")
     parser.add_argument("--optimized-hlo", help="Path to optimized HLO for precipitation_effects")
+    parser.add_argument("--graupel-hlo", help="Path to combined graupel HLO (q_t_update + precip)")
     parser.add_argument("--num-warmup", type=int, default=10, help="Number of warmup runs")
     parser.add_argument("--num-runs", type=int, default=50, help="Number of benchmark runs")
     args = parser.parse_args()
@@ -73,11 +74,16 @@ def main():
     print()
 
     # Configure HLO injection if provided
-    if args.optimized_hlo:
-        print(f"Configuring HLO injection: {args.optimized_hlo}")
+    if args.graupel_hlo:
+        print(f"Configuring FULL GRAUPEL HLO injection: {args.graupel_hlo}")
+        from muphys_jax.core.optimized_graupel import configure_optimized_graupel
+        configure_optimized_graupel(hlo_path=args.graupel_hlo, use_optimized=True)
+        print("  ✓ Full graupel HLO configured (q_t_update + precip combined)")
+    elif args.optimized_hlo:
+        print(f"Configuring precip-only HLO injection: {args.optimized_hlo}")
         from muphys_jax.core.optimized_precip import configure_optimized_precip
         configure_optimized_precip(hlo_path=args.optimized_hlo, use_optimized=True, transposed=True)
-        print("  ✓ Optimized HLO configured for transposed layout")
+        print("  ✓ Optimized HLO configured for transposed layout (precip only)")
     else:
         print("No HLO injection configured (using pure JAX scans)")
     print()
