@@ -12,7 +12,6 @@ import dataclasses
 import enum
 import pathlib
 
-import numpy as np
 import pytest
 
 from icon4py.model.testing import data_handling, definitions as testing_defs
@@ -37,7 +36,6 @@ class MuphysExperiment:
     name: str
     type: ExperimentType
     uri: str
-    dtype: np.dtype
     dt: float = 30.0
     qnc: float = 100.0
 
@@ -56,4 +54,6 @@ class MuphysExperiment:
 @pytest.fixture(autouse=True)
 def download_test_data(experiment: MuphysExperiment) -> None:
     """Downloads test data for an experiment (implicit fixture)."""
-    data_handling.download_test_data(_path_to_experiment_testdata(experiment), uri=experiment.uri)
+    data_handling.download_test_data(
+        _path_to_experiment_testdata(experiment), dst_subdir="", uri=experiment.uri
+    )

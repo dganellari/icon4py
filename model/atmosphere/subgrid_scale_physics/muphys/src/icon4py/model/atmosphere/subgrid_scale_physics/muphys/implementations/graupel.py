@@ -72,6 +72,7 @@ class IntegrationState(NamedTuple):
     g: PrecipStateQx
     t_state: TempState
     rho: ta.wpfloat
+    pflx_tot: ta.wpfloat
 
 
 @gtx.field_operator
@@ -90,7 +91,7 @@ def precip_qx_level_update(
     current_level_activated = previous_level_q.activated | mask
     rho_x = q * rho
     flx_eff = (rho_x / zeta) + 2.0 * previous_level_q.p
-    #   Inlined calculation using _fall_speed_scalar
+    # Inlined calculation using _fall_speed_scalar
     flx_partial = minimum(rho_x * vc * prefactor * power((rho_x + offset), exponent), flx_eff)
 
     rhox_prev = (previous_level_q.x + q) * 0.5 * previous_level_rho
@@ -131,17 +132,16 @@ def _temperature_update(
 ) -> TempState:
     current_level_activated = previous_level.activated | mask
     if current_level_activated:
-        eflx = dt * (
-            pr * (t_d.clw * t - t_d.cvd * t_kp1 - g_ct.lvc)
-            + (pflx_tot) * (g_ct.ci * t - t_d.cvd * t_kp1 - g_ct.lsc)
+        eflx = pr * (t_d.clw * t - t_d.cvd * t_kp1 - g_ct.lvc) + (pflx_tot) * (
+            g_ct.ci * t - t_d.cvd * t_kp1 - g_ct.lsc
         )
 
         e_int = (
             _internal_energy_scalar(
                 t=t, qv=q.v, qliq=q.c + q.r, qice=q.s + q.i + q.g, rho=rho, dz=dz
             )
-            + previous_level.eflx
-            - eflx
+            + dt * previous_level.eflx
+            - dt * eflx
         )
 
         #  Inlined calculation using T_from_internal_energy_scalar
@@ -167,6 +167,7 @@ def _temperature_update(
         g=PrecipStateQx(x=0.0, p=0.0, vc=0.0, activated=False),
         t_state=TempState(t=0.0, eflx=0.0, activated=False),
         rho=0.0,
+        pflx_tot=0.0,
     ),
 )
 def _precip_and_t(
@@ -239,32 +240,33 @@ def _precip_and_t(
         mask_g,
     )
 
-    pflx_tot = s_update.p + i_update.p + g_update.p
-
     qliq = q.c + r_update.x
     qice = s_update.x + i_update.x + g_update.x
     kmin_rsig = mask_r | mask_s | mask_i | mask_g
+
+    t_update = _temperature_update(
+        previous_level.t_state,
+        t=t,
+        t_kp1=t_kp1,
+        pr=r_update.p,
+        pflx_tot=s_update.p + i_update.p + g_update.p,
+        q=q,
+        qliq=qliq,
+        qice=qice,
+        rho=rho,
+        dz=dz,
+        dt=dt,
+        mask=kmin_rsig,
+    )
 
     return IntegrationState(
         r=r_update,
         s=s_update,
         i=i_update,
         g=g_update,
-        t_state=_temperature_update(
-            previous_level.t_state,
-            t=t,
-            t_kp1=t_kp1,
-            pr=r_update.p,
-            pflx_tot=pflx_tot,
-            q=q,
-            qliq=qliq,
-            qice=qice,
-            rho=rho,
-            dz=dz,
-            dt=dt,
-            mask=kmin_rsig,
-        ),
+        t_state=t_update,
         rho=rho,
+        pflx_tot=s_update.p + i_update.p + g_update.p + r_update.p,
     )
 
 
@@ -308,21 +310,26 @@ def sink_saturation(
 
 
 @gtx.field_operator
-def _q_t_update(
+def _q_t_update(  # noqa: PLR0915
     t: fa.CellKField[ta.wpfloat],
     p: fa.CellKField[ta.wpfloat],
     rho: fa.CellKField[ta.wpfloat],
     q: Q,
     dt: ta.wpfloat,
     qnc: ta.wpfloat,
+    enable_masking: bool,
 ) -> tuple[
     Q,
     fa.CellKField[ta.wpfloat],
 ]:
-    mask = (maximum(q.c, maximum(q.g, maximum(q.i, maximum(q.r, q.s)))) > g_ct.qmin) | (
-        (t < g_ct.tfrz_het2) & (q.v > _qsat_ice_rho(t, rho))
-    )
-    is_sig_present = maximum(q.g, maximum(q.i, q.s)) > g_ct.qmin
+    if enable_masking:
+        mask = (maximum(q.c, maximum(q.g, maximum(q.i, maximum(q.r, q.s)))) > g_ct.qmin) | (
+            (t < g_ct.tfrz_het2) & (q.v > _qsat_ice_rho(t, rho))
+        )
+        is_sig_present = maximum(q.g, maximum(q.i, q.s)) > g_ct.qmin
+    else:
+        mask = broadcast(True, (dims.CellDim, dims.KDim))
+        is_sig_present = broadcast(True, (dims.CellDim, dims.KDim))
 
     dvsw = q.v - _qsat_rho(t, rho)
     qvsi = _qsat_ice_rho(t, rho)
@@ -500,9 +507,9 @@ def _precipitation_effects(
     t = precip_state.t_state.t
     eflx = precip_state.t_state.eflx
 
-    pflx_tot = ps + pi + pg
+    pflx_tot = precip_state.pflx_tot
 
-    return qr, qs, qi, qg, t, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
+    return qr, qs, qi, qg, t, pflx_tot, pr, ps, pi, pg, eflx
 
 
 @gtx.field_operator
@@ -515,6 +522,7 @@ def graupel(
     q: Q,
     dt: ta.wpfloat,
     qnc: ta.wpfloat,
+    enable_masking: bool,
 ) -> tuple[
     fa.CellKField[ta.wpfloat],
     Q,
@@ -525,11 +533,12 @@ def graupel(
     fa.CellKField[ta.wpfloat],
     fa.CellKField[ta.wpfloat],
 ]:
+    # TODO(havogt): investigate why removing the where(...) breaks dace
     kmin_r = where(q.r > g_ct.qmin, True, False)
     kmin_i = where(q.i > g_ct.qmin, True, False)
     kmin_s = where(q.s > g_ct.qmin, True, False)
     kmin_g = where(q.g > g_ct.qmin, True, False)
-    q, t = _q_t_update(te, p, rho, q, dt, qnc)
+    q, t = _q_t_update(te, p, rho, q, dt, qnc, enable_masking=enable_masking)
     qr, qs, qi, qg, t, pflx, pr, ps, pi, pg, pre = _precipitation_effects(
         last_level, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt
     )
@@ -558,6 +567,7 @@ def graupel_run(
     horizontal_end: gtx.int32,
     vertical_start: gtx.int32,
     vertical_end: gtx.int32,
+    enable_masking: bool,
 ):
     graupel(
         last_level=vertical_end - 1,
@@ -568,6 +578,7 @@ def graupel_run(
         q=q_in,
         dt=dt,
         qnc=qnc,
+        enable_masking=enable_masking,
         out=(t_out, q_out, pflx, pr, ps, pi, pg, pre),
         domain={
             dims.CellDim: (horizontal_start, horizontal_end),

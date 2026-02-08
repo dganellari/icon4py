@@ -14,6 +14,7 @@ import pathlib
 import time
 
 from gt4py import next as gtx
+from gt4py.next import config as gtx_config, metrics as gtx_metrics
 
 from icon4py.model.atmosphere.subgrid_scale_physics.muphys.driver import common, utils
 from icon4py.model.atmosphere.subgrid_scale_physics.muphys.implementations import graupel
@@ -36,18 +37,31 @@ def get_args():
     parser.add_argument("itime", help="time-index", nargs="?", default=0)
     parser.add_argument("dt", help="timestep", nargs="?", default=30.0)
     parser.add_argument("qnc", help="Water number concentration", nargs="?", default=100.0)
+    parser.add_argument(
+        "-m",
+        "--masking",
+        dest="enable_masking",
+        choices=[True, False],
+        type=lambda x: (str(x).lower() == "true"),
+        default=True,
+        help="Enable compatibility with reference implementation.",
+    )
 
     return parser.parse_args()
 
 
 def setup_graupel(
-    inp: common.GraupelInput, dt: float, qnc: float, backend: model_backends.BackendLike
+    inp: common.GraupelInput,
+    dt: float,
+    qnc: float,
+    backend: model_backends.BackendLike,
+    enable_masking: bool = True,
 ):
     with utils.recursion_limit(10**4):  # TODO(havogt): make an option in gt4py?
         graupel_run_program = model_options.setup_program(
             backend=backend,
             program=graupel.graupel_run,
-            constant_args={"dt": dt, "qnc": qnc},
+            constant_args={"dt": dt, "qnc": qnc, "enable_masking": enable_masking},
             horizontal_sizes={
                 "horizontal_start": gtx.int32(0),
                 "horizontal_end": inp.ncells,
@@ -66,14 +80,38 @@ def main():
     args = get_args()
 
     backend = model_backends.BACKENDS[args.backend]
+    print(f"Using GT4Py backend: {args.backend}")
+
     allocator = model_backends.get_allocator(backend)
 
+    print(f"Loading input from: {args.input_file}")
     inp = common.GraupelInput.load(filename=pathlib.Path(args.input_file), allocator=allocator)
+    print(f"Grid size: {inp.ncells} cells × {inp.nlev} levels")
+
+    # Get input statistics
+    t_np = inp.t.asnumpy()
+    print(f"Temperature range: {t_np.min():.1f} - {t_np.max():.1f} K")
+    print(f"Timestep: {float(args.dt)} s")
+    print(f"Cloud droplet concentration: {float(args.qnc)} m^-3")
+
     out = common.GraupelOutput.allocate(
-        domain=gtx.domain({dims.CellDim: inp.ncells, dims.KDim: inp.nlev}), allocator=allocator
+        domain=gtx.domain({dims.CellDim: inp.ncells, dims.KDim: inp.nlev}),
+        allocator=allocator,
+        references={
+            "qv": inp.qv,
+            "qc": inp.qc,
+            "qi": inp.qi,
+            "qr": inp.qr,
+            "qs": inp.qs,
+            "qg": inp.qg,
+        },
     )
 
-    graupel_run_program = setup_graupel(inp, dt=args.dt, qnc=args.qnc, backend=backend)
+    print("\nWarming up (JIT compilation)...")
+    graupel_run_program = setup_graupel(
+        inp, dt=args.dt, qnc=args.qnc, backend=backend, enable_masking=args.enable_masking
+    )
+    print("Compilation complete!")
 
     start_time = None
     for _x in range(int(args.itime) + 1):
@@ -101,9 +139,24 @@ def main():
 
     if start_time is not None:
         elapsed_time = end_time - start_time
-        print("For", int(args.itime), "iterations it took", elapsed_time, "seconds!")
+        print(f"\nFor {int(args.itime)} iterations it took {elapsed_time:.4f} seconds!")
+        print(f"Time per iteration: {elapsed_time / int(args.itime):.4f} seconds")
+
+    # Output verification
+    print("\nOutput verification:")
+    t_out_np = out.t.asnumpy()
+    print(f"Temperature range: {t_out_np.min():.1f} - {t_out_np.max():.1f} K")
+    print(f"Temperature change: {(t_out_np - t_np).mean():.2e} K")
+    pflx_np = out.pflx.asnumpy()
+    print(f"Max precipitation flux: {pflx_np.max():.2e}")
+
+    print(f"\nWriting output to: {args.output_file}")
+    if gtx_config.COLLECT_METRICS_LEVEL > 0:
+        print(gtx_metrics.dumps())
+        gtx_metrics.dump_json("gt4py_metrics.json")
 
     out.write(args.output_file)
+    print("Done!")
 
 
 if __name__ == "__main__":
