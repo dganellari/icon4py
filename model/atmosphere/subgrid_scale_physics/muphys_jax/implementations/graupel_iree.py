@@ -7,16 +7,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-IREE-optimized graupel microphysics implementation.
+Graupel for the IREE backend.
 
-Key optimizations for IREE over baseline:
-1. Split JIT boundaries (2 stages) to avoid memory allocation limits
-2. Python-level unrolling of scans (IREE sees all 90 levels at compile time)
-3. vmap for species batching (sequential was slower)
-
-Usage:
-    from muphys_jax.implementations.graupel_iree import graupel_run_iree
-    t_out, q_out, pflx, pr, ps, pi, pg, eflx = graupel_run_iree(dz, t, p, rho, q, dt, qnc)
+Uses split JIT boundaries (2 stages) to stay within IREE's memory allocation limits,
+Python-level unrolled scans, and vmap for species batching.
 """
 
 import jax
@@ -27,7 +21,7 @@ from ..core.common import constants as const
 from ..core.definitions import Q, TempState
 from ..core import properties as props
 from ..core import thermo
-from ..core.scans_baseline import precip_scan_batched  # Keep vmap version - sequential was slower
+from ..core.scans import precip_scan_batched  # Keep vmap version - sequential was slower
 from .graupel_baseline import q_t_update
 
 

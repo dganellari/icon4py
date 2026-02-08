@@ -6,12 +6,7 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""
-Shared utilities for loading graupel input/reference data from NetCDF files.
-
-This module provides consistent data loading across tests and tools,
-ensuring float64 precision throughout.
-"""
+"""Load graupel input/reference data from NetCDF files."""
 
 from __future__ import annotations
 
@@ -71,7 +66,7 @@ def load_graupel_inputs(
     nlev = len(ds.dimensions["height"])
     
     # Calculate dz from geometric height
-    # IMPORTANT: Convert to float64 BEFORE calculation to avoid precision loss
+    # Must be float64 before dz calculation or we lose precision
     zg = np.asarray(ds.variables["zg"]).astype(np.float64)
     dz_calc = calc_dz(zg)
     dz_transposed = np.transpose(dz_calc)  # (height, ncells) -> (ncells, height)

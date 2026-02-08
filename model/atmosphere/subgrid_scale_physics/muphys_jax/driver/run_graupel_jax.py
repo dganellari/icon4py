@@ -13,10 +13,10 @@ Uses the same NetCDF input files and produces comparable output.
 
 Usage:
     python run_graupel_jax.py -o output.nc -b xla input.nc 10 30.0 100.0
-    
+
 For IREE backend:
     python run_graupel_jax.py -o output.nc -b iree input.nc 10 30.0 100.0
-    
+
 NOTE: Backend must be set BEFORE importing JAX. Use -b flag, not JAX_BACKEND env var.
 """
 
@@ -35,7 +35,7 @@ def _get_backend_early():
             return arg[3:]
         if arg.startswith("--backend="):
             return arg[10:]
-    # Check next arg after --backend  
+    # Check next arg after --backend
     for i, arg in enumerate(sys.argv):
         if arg == "--backend" and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
@@ -61,20 +61,9 @@ import numpy as np
 
 from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
-from muphys_jax.implementations.graupel_allinone_fused import graupel_allinone_fused_run
 from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline_run
 from muphys_jax.implementations.graupel_baseline import graupel_run_split as graupel_split_run
 from muphys_jax.implementations.graupel_iree import graupel_run_iree
-from muphys_jax.implementations.generated_precip import graupel_unrolled_run as graupel_generated_run
-
-# --- CUDA context warmup for Triton/JAX interop ---
-try:
-    import torch
-    if torch.cuda.is_available():
-        _ = torch.zeros(1, device='cuda')
-        torch.cuda.synchronize()
-except Exception:
-    pass
 
 
 def _calc_dz(z: np.ndarray) -> np.ndarray:
@@ -204,18 +193,6 @@ def get_args():
         default=100.0,
     )
     parser.add_argument(
-        "--fused",
-        help="use fused scans (90 kernel launches instead of 180)",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--allinone-fused",
-        help="use all-in-one fused scan (single JAX scan, experimental)",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
         "--tiled",
         help="use tiled scans (process multiple levels per iteration)",
         action="store_true",
@@ -228,50 +205,20 @@ def get_args():
         default=4,
     )
     parser.add_argument(
-        "--no-layout-opt",
-        help="disable memory layout optimization",
-        action="store_true",
-        default=False,  # Enable layout opt by default
-    )
-    parser.add_argument(
         "--unrolled",
-        help="use unrolled loop (SINGLE KERNEL, target DaCe performance)",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--pallas",
-        help="use Pallas GPU kernel (requires jax[cuda12_pallas])",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--triton",
-        help="use Triton CUDA kernel (requires triton, jax-triton) - TARGET DACE PERF",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--mlir",
-        help="use MLIR GPU kernel (requires mlir-python-bindings) - TARGET DACE PERF",
+        help="use unrolled loop (static unroll at trace time)",
         action="store_true",
         default=False,
     )
     parser.add_argument(
         "--baseline",
-        help="use baseline implementation (vmap-batched, 90 kernels)",
+        help="use baseline implementation (vmap-batched)",
         action="store_true",
         default=False,
     )
     parser.add_argument(
         "--split",
-        help="use split JIT implementation (IREE-compatible, 3 separate JIT boundaries)",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--generated",
-        help="use generated/unrolled precipitation (Python for-loop unrolled at trace time)",
+        help="use split JIT implementation (IREE-compatible, 2 separate JIT boundaries)",
         action="store_true",
         default=False,
     )
@@ -295,73 +242,45 @@ def main():
     # Load input data
     print(f"Loading input from: {args.input_file}")
     inp = GraupelInput.load(pathlib.Path(args.input_file))
-    print(f"Grid size: {inp.ncells} cells × {inp.nlev} levels")
+    print(f"Grid size: {inp.ncells} cells x {inp.nlev} levels")
     print(f"Temperature range: {np.array(inp.t).min():.1f} - {np.array(inp.t).max():.1f} K")
     print(f"Timestep: {args.dt} s")
     print(f"Cloud droplet concentration: {args.qnc} m^-3")
 
-    # Warmup compilation
-    print("\nWarming up (JIT compilation)...")
+    # Choose which implementation to use
+    use_iree = args.backend == "iree" or os.environ.get("JAX_PLATFORMS", "").startswith("iree")
+
     if args.iree_optimized:
         print("Mode: IREE-OPTIMIZED (fori_loop scans, sequential species)")
-    elif args.generated:
-        print("Mode: GENERATED (Python for-loop unrolled precipitation)")
-    elif args.split:
-        print("Mode: SPLIT JIT (IREE-compatible, 3 separate JIT boundaries)")
-    elif args.baseline:
-        print("Mode: BASELINE (vmap-batched, 90 kernels)")
-    elif args.mlir:
-        print("Mode: MLIR (GPU kernel via MLIR dialects - TARGET DACE PERF)")
-    elif args.triton:
-        print("Mode: TRITON (custom CUDA kernel - TARGET DACE PERF)")
-    elif args.pallas:
-        print("Mode: PALLAS (vmap + fori_loop)")
-    elif args.unrolled:
-        print("Mode: UNROLLED (static unroll)")
-    elif args.tiled:
-        print(f"Mode: TILED (tile_size={args.tile_size}, {90//args.tile_size} iterations)")
-    elif args.allinone_fused:
-        print("Mode: ALL-IN-ONE FUSED SCAN (single JAX scan, experimental)")
-    elif args.fused:
-        print("Mode: FUSED SCANS (90 kernels)")
-    else:
-        print("Mode: DEFAULT (180 kernels)")
-    print(f"Layout optimization: {'DISABLED' if args.no_layout_opt else 'ENABLED'}")
-
-    # Choose which implementation to use
-    # Auto-detect IREE and use split JIT for baseline
-    use_iree = args.backend == "iree" or os.environ.get("JAX_PLATFORMS", "").startswith("iree")
-    
-    if args.iree_optimized:
         run_func = graupel_run_iree
-        run_kwargs = {}  # IREE-optimized doesn't accept any optimization flags
-        print("Using IREE-optimized implementation with fori_loop scans")
-    elif args.generated:
-        run_func = graupel_generated_run
-        run_kwargs = {}  # Generated doesn't accept any optimization flags
+        run_kwargs = {}
     elif args.split:
+        print("Mode: SPLIT JIT (IREE-compatible, 2 separate JIT boundaries)")
         run_func = graupel_split_run
-        run_kwargs = {}  # Split doesn't accept any optimization flags
-        print("Mode: SPLIT JIT (IREE-compatible, 3 separate JIT boundaries)")
+        run_kwargs = {}
     elif args.baseline:
         if use_iree:
-            # IREE requires split JIT due to memory allocation limits
             print("Note: IREE detected, using split JIT version for compatibility")
             run_func = graupel_split_run
         else:
             run_func = graupel_baseline_run
-        run_kwargs = {}  # Baseline doesn't accept any optimization flags
-    elif args.allinone_fused:
-        run_func = graupel_allinone_fused_run
-        run_kwargs = {}  # All-in-one fused doesn't accept optimization flags
-    else:
+        print("Mode: BASELINE (vmap-batched)")
+        run_kwargs = {}
+    elif args.unrolled:
+        print("Mode: UNROLLED (static unroll)")
         run_func = graupel_run
-        run_kwargs = dict(
-            use_fused_scans=args.fused, use_tiled_scans=args.tiled, tile_size=args.tile_size,
-            optimize_layout=not args.no_layout_opt, use_unrolled=args.unrolled, use_pallas=args.pallas,
-            use_triton=args.triton, use_mlir=args.mlir
-        )
+        run_kwargs = dict(use_unrolled=True)
+    elif args.tiled:
+        print(f"Mode: TILED (tile_size={args.tile_size})")
+        run_func = graupel_run
+        run_kwargs = dict(use_tiled_scans=True, tile_size=args.tile_size)
+    else:
+        print("Mode: DEFAULT")
+        run_func = graupel_run
+        run_kwargs = {}
 
+    # Warmup compilation
+    print("\nWarming up (JIT compilation)...")
     t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
         inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
     )

@@ -20,7 +20,7 @@ from ..core.common.backend import jit_compile
 
 # Import from core modules
 from ..core.definitions import Q, TempState
-from ..core.scans_baseline import precip_scan_batched, temperature_scan_step
+from ..core.scans import precip_scan_batched, temperature_scan_step
 
 
 # ============================================================================
@@ -217,25 +217,22 @@ def q_t_update(t, p, rho, q, dt, qnc):
 
 
 def temperature_update_scan(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask):
-    """Temperature update scan with energy flux."""
+    """Temperature update scan with energy flux.
+
+    All inputs are (ncells, nlev). Internally transposes to (nlev, ncells) for the scan.
+    """
     ncells, nlev = t.shape
 
     init_state = TempState(
-        t=jnp.zeros(ncells), eflx=jnp.zeros(ncells), activated=jnp.zeros(ncells, dtype=bool)
+        t=jnp.zeros(ncells, dtype=t.dtype),
+        eflx=jnp.zeros(ncells, dtype=t.dtype),
+        activated=jnp.zeros(ncells, dtype=bool),
     )
 
     inputs = (
-        t.T,
-        t_kp1.T,
-        ei_old.T,
-        pr.T,
-        pflx_tot.T,
-        qv.T,
-        qliq.T,
-        qice.T,
-        rho.T,
-        dz.T,
-        jnp.full((nlev, ncells), dt),
+        t.T, t_kp1.T, ei_old.T, pr.T, pflx_tot.T,
+        qv.T, qliq.T, qice.T, rho.T, dz.T,
+        jnp.full((nlev, ncells), dt, dtype=t.dtype),
         mask.T,
     )
 
@@ -245,12 +242,7 @@ def temperature_update_scan(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho,
 
 
 def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
-    """
-    Apply precipitation sedimentation and temperature effects.
-    From graupel.py:366-424.
-
-    Optimized to batch all 4 precipitation scans via vmap for better GPU utilization.
-    """
+    """Precipitation sedimentation and temperature effects. Batches all 4 species via vmap."""
     # Store initial state for energy calculation
     qliq = q_in.c + q_in.r
     qice = q_in.s + q_in.i + q_in.g

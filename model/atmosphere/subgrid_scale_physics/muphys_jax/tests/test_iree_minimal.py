@@ -195,7 +195,7 @@ except Exception as e:
 # Test 8c: Test precipitation scan only
 print("\n=== Test 8c: Run precip_scan_batched only ===")
 try:
-    from muphys_jax.core.scans_baseline import precip_scan_batched
+    from muphys_jax.core.scans import precip_scan_batched
     from muphys_jax.core import properties as props
     from muphys_jax.core.common import constants as const
     
@@ -233,7 +233,7 @@ print("  SKIPPED - IREE CUDA has 16 binding limit, precipitation_effects needs 1
 # Test 8d-alt: Test with packed data to reduce bindings
 print("\n=== Test 8d-alt: Run precip with packed kmin masks ===")
 try:
-    from muphys_jax.core.scans_baseline import precip_scan_batched
+    from muphys_jax.core.scans import precip_scan_batched
     from muphys_jax.core import properties as props
     from muphys_jax.core.common import constants as const
     
@@ -288,7 +288,7 @@ print("\n=== Test 8e: Run precip with stacked arrays (fewer bindings) ===")
 try:
     from muphys_jax.core import properties as props
     from muphys_jax.core.common import constants as const
-    from muphys_jax.core.scans_baseline import _single_species_scan
+    from muphys_jax.core.scans import _single_species_scan
     
     ncells, nlev = 4, 5
     t = jnp.ones((ncells, nlev), dtype=jnp.float32) * 270.0
@@ -322,7 +322,7 @@ except Exception as e:
 print("\n=== Test 8f: Combined q_t_update + precip in same JIT ===")
 try:
     from muphys_jax.implementations.graupel_baseline import q_t_update
-    from muphys_jax.core.scans_baseline import precip_scan_batched
+    from muphys_jax.core.scans import precip_scan_batched
     from muphys_jax.core import properties as props
     from muphys_jax.core.common import constants as const
     
@@ -409,7 +409,7 @@ except Exception as e:
 # Test 8h: temperature_update_scan only
 print("\n=== Test 8h: temperature_update_scan only ===")
 try:
-    from muphys_jax.core.scans_baseline import temperature_scan_step
+    from muphys_jax.core.scans import temperature_scan_step
     from muphys_jax.core.definitions import TempState
     from muphys_jax.core import thermo
     
@@ -457,7 +457,7 @@ print("  SKIPPED - Single JIT with all 3 stages exceeds IREE CUDA memory/allocat
 print("\n=== Test 8j: Split JIT approach (separate boundaries) ===")
 try:
     from muphys_jax.implementations.graupel_baseline import q_t_update
-    from muphys_jax.core.scans_baseline import precip_scan_batched, temperature_scan_step
+    from muphys_jax.core.scans import precip_scan_batched, temperature_scan_step
     from muphys_jax.core.definitions import TempState
     from muphys_jax.core import thermo, properties as props
     from muphys_jax.core.common import constants as const

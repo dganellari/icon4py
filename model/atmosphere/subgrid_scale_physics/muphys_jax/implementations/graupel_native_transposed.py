@@ -7,248 +7,31 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Graupel microphysics with NATIVE TRANSPOSED (nlev, ncells) layout.
+Graupel microphysics in (nlev, ncells) layout.
 
-This implementation works entirely in (nlev, ncells) layout with ZERO transposes.
-All functions are rewritten to work natively with transposed data.
-
-Benefits:
-- ZERO transposes during computation
-- Coalesced GPU memory access (2x faster for vertical operations)
-- Maximum performance when data is pre-transposed
-
-Usage:
-    # Data must be pre-transposed to (nlev, ncells) layout BEFORE calling
-    # Typically transpose once at data load time (not measured)
-
-    from muphys_jax.implementations.graupel_native_transposed import graupel_native_transposed
-
-    # Input: (nlev, ncells) layout
-    # Output: (nlev, ncells) layout
-    result = graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc)
+All inputs/outputs are (nlev, ncells). No transposes during computation.
+Data must be pre-transposed before calling.
 """
 
 import jax.numpy as jnp
-from jax import lax
 
-from ..core import properties as props, thermo, transitions as trans
+from ..core import properties as props, thermo
 from ..core.common import constants as const
 from ..core.common.backend import jit_compile
-from ..core.definitions import Q, TempState
-from ..core.scans_transposed import (
+from ..core.definitions import Q
+from ..core.scans import (
     precip_scan_batched_transposed,
     temperature_update_scan_transposed,
 )
 
-# Import fused q_t_update implementation (optimized for GPU kernel fusion)
 from .q_t_update_fused import q_t_update_fused
+from .graupel_baseline import q_t_update as q_t_update_native
 
 
-# ============================================================================
-# q_t_update - works on any layout (purely element-wise operations)
-# ============================================================================
-
-def q_t_update_native(t, p, rho, q, dt, qnc):
-    """
-    Update water species and temperature via phase transitions.
-
-    This function is purely element-wise, so it works identically
-    regardless of (ncells, nlev) or (nlev, ncells) layout.
-    """
-    # Activation mask
-    mask = jnp.where(
-        (jnp.maximum(q.c, jnp.maximum(q.g, jnp.maximum(q.i, jnp.maximum(q.r, q.s)))) > const.qmin)
-        | ((t < const.tfrz_het2) & (q.v > thermo.qsat_ice_rho(t, rho))),
-        True,
-        False,
-    )
-
-    is_sig_present = jnp.maximum(q.g, jnp.maximum(q.i, q.s)) > const.qmin
-
-    dvsw = q.v - thermo.qsat_rho(t, rho)
-    qvsi = thermo.qsat_ice_rho(t, rho)
-    dvsi = q.v - qvsi
-
-    # Snow properties
-    n_snow = props.snow_number(t, rho, q.s)
-    l_snow = props.snow_lambda(rho, q.s, n_snow)
-
-    # Define conversion 'matrix'
-    sx2x_c_r = trans.cloud_to_rain(t, q.c, q.r, qnc)
-    sx2x_r_v = trans.rain_to_vapor(t, rho, q.c, q.r, dvsw, dt)
-    sx2x_c_i = trans.cloud_x_ice(t, q.c, q.i, dt)
-    sx2x_i_c = -jnp.minimum(sx2x_c_i, 0.0)
-    sx2x_c_i = jnp.maximum(sx2x_c_i, 0.0)
-
-    sx2x_c_s = trans.cloud_to_snow(t, q.c, q.s, n_snow, l_snow)
-    sx2x_c_g = trans.cloud_to_graupel(t, rho, q.c, q.g)
-
-    t_below_tmelt = t < const.tmelt
-    t_at_least_tmelt = ~t_below_tmelt
-
-    n_ice = props.ice_number(t, rho)
-    m_ice = props.ice_mass(q.i, n_ice)
-    x_ice = props.ice_sticking(t)
-
-    eta = jnp.where(t_below_tmelt & is_sig_present, props.deposition_factor(t, qvsi), 0.0)
-    sx2x_v_i = jnp.where(
-        t_below_tmelt & is_sig_present, trans.vapor_x_ice(q.i, m_ice, eta, dvsi, rho, dt), 0.0
-    )
-    sx2x_i_v = jnp.where(t_below_tmelt & is_sig_present, -jnp.minimum(sx2x_v_i, 0.0), 0.0)
-    sx2x_v_i = jnp.where(t_below_tmelt & is_sig_present, jnp.maximum(sx2x_v_i, 0.0), sx2x_i_v)
-
-    ice_dep = jnp.where(t_below_tmelt & is_sig_present, jnp.minimum(sx2x_v_i, dvsi / dt), 0.0)
-    sx2x_i_s = jnp.where(
-        t_below_tmelt & is_sig_present,
-        props.deposition_auto_conversion(q.i, m_ice, ice_dep)
-        + trans.ice_to_snow(q.i, n_snow, l_snow, x_ice),
-        0.0,
-    )
-    sx2x_i_g = jnp.where(
-        t_below_tmelt & is_sig_present, trans.ice_to_graupel(rho, q.r, q.g, q.i, x_ice), 0.0
-    )
-    sx2x_s_g = jnp.where(
-        t_below_tmelt & is_sig_present, trans.snow_to_graupel(t, rho, q.c, q.s), 0.0
-    )
-    sx2x_r_g = jnp.where(
-        t_below_tmelt & is_sig_present,
-        trans.rain_to_graupel(t, rho, q.c, q.r, q.i, q.s, m_ice, dvsw, dt),
-        0.0,
-    )
-
-    sx2x_v_i = jnp.where(
-        t_below_tmelt, sx2x_v_i + props.ice_deposition_nucleation(t, q.c, q.i, n_ice, dvsi, dt), 0.0
-    )
-    sx2x_c_r = jnp.where(t_at_least_tmelt, sx2x_c_r + sx2x_c_s + sx2x_c_g, sx2x_c_r)
-    sx2x_c_s = jnp.where(t_at_least_tmelt, 0.0, sx2x_c_s)
-    sx2x_c_g = jnp.where(t_at_least_tmelt, 0.0, sx2x_c_g)
-    ice_dep = jnp.where(t_at_least_tmelt, 0.0, ice_dep)
-    eta = jnp.where(t_at_least_tmelt, 0.0, eta)
-
-    dvsw0 = jnp.where(is_sig_present, q.v - thermo.qsat_rho_tmelt(rho), 0.0)
-    sx2x_v_s = jnp.where(
-        is_sig_present,
-        trans.vapor_x_snow(t, p, rho, q.s, n_snow, l_snow, eta, ice_dep, dvsw, dvsi, dvsw0, dt),
-        0.0,
-    )
-    sx2x_s_v = jnp.where(is_sig_present, -jnp.minimum(sx2x_v_s, 0.0), 0.0)
-    sx2x_v_s = jnp.where(is_sig_present, jnp.maximum(sx2x_v_s, 0.0), 0.0)
-
-    sx2x_v_g = jnp.where(
-        is_sig_present, trans.vapor_x_graupel(t, p, rho, q.g, dvsw, dvsi, dvsw0, dt), 0.0
-    )
-    sx2x_g_v = jnp.where(is_sig_present, -jnp.minimum(sx2x_v_g, 0.0), 0.0)
-    sx2x_v_g = jnp.where(is_sig_present, jnp.maximum(sx2x_v_g, 0.0), 0.0)
-
-    sx2x_s_r = jnp.where(is_sig_present, trans.snow_to_rain(t, p, rho, dvsw0, q.s), 0.0)
-    sx2x_g_r = jnp.where(is_sig_present, trans.graupel_to_rain(t, p, rho, dvsw0, q.g), 0.0)
-
-    # Sink calculation
-    sink_v = sx2x_v_s + sx2x_v_i + sx2x_v_g
-    sink_c = sx2x_c_r + sx2x_c_s + sx2x_c_i + sx2x_c_g
-    sink_r = sx2x_r_v + sx2x_r_g
-    sink_s = jnp.where(is_sig_present, sx2x_s_v + sx2x_s_r + sx2x_s_g, 0.0)
-    sink_i = jnp.where(is_sig_present, sx2x_i_v + sx2x_i_c + sx2x_i_s + sx2x_i_g, 0.0)
-    sink_g = jnp.where(is_sig_present, sx2x_g_v + sx2x_g_r, 0.0)
-
-    stot = q.v / dt
-    sink_v_saturated = (sink_v > stot) & (q.v > const.qmin)
-    sx2x_v_s = jnp.where(sink_v_saturated, sx2x_v_s * stot / sink_v, sx2x_v_s)
-    sx2x_v_i = jnp.where(sink_v_saturated, sx2x_v_i * stot / sink_v, sx2x_v_i)
-    sx2x_v_g = jnp.where(sink_v_saturated, sx2x_v_g * stot / sink_v, sx2x_v_g)
-    sink_v = jnp.where(sink_v_saturated, sx2x_v_s + sx2x_v_i + sx2x_v_g, sink_v)
-
-    stot = q.c / dt
-    sink_c_saturated = (sink_c > stot) & (q.c > const.qmin)
-    sx2x_c_r = jnp.where(sink_c_saturated, sx2x_c_r * stot / sink_c, sx2x_c_r)
-    sx2x_c_s = jnp.where(sink_c_saturated, sx2x_c_s * stot / sink_c, sx2x_c_s)
-    sx2x_c_i = jnp.where(sink_c_saturated, sx2x_c_i * stot / sink_c, sx2x_c_i)
-    sx2x_c_g = jnp.where(sink_c_saturated, sx2x_c_g * stot / sink_c, sx2x_c_g)
-    sink_c = jnp.where(sink_c_saturated, sx2x_c_r + sx2x_c_s + sx2x_c_i + sx2x_c_g, sink_c)
-
-    stot = q.r / dt
-    sink_r_saturated = (sink_r > stot) & (q.r > const.qmin)
-    sx2x_r_v = jnp.where(sink_r_saturated, sx2x_r_v * stot / sink_r, sx2x_r_v)
-    sx2x_r_g = jnp.where(sink_r_saturated, sx2x_r_g * stot / sink_r, sx2x_r_g)
-    sink_r = jnp.where(sink_r_saturated, sx2x_r_v + sx2x_r_g, sink_r)
-
-    stot = q.s / dt
-    sink_s_saturated = (sink_s > stot) & (q.s > const.qmin)
-    sx2x_s_v = jnp.where(sink_s_saturated, sx2x_s_v * stot / sink_s, sx2x_s_v)
-    sx2x_s_r = jnp.where(sink_s_saturated, sx2x_s_r * stot / sink_s, sx2x_s_r)
-    sx2x_s_g = jnp.where(sink_s_saturated, sx2x_s_g * stot / sink_s, sx2x_s_g)
-    sink_s = jnp.where(sink_s_saturated, sx2x_s_v + sx2x_s_r + sx2x_s_g, sink_s)
-
-    stot = q.i / dt
-    sink_i_saturated = (sink_i > stot) & (q.i > const.qmin)
-    sx2x_i_v = jnp.where(sink_i_saturated, sx2x_i_v * stot / sink_i, sx2x_i_v)
-    sx2x_i_c = jnp.where(sink_i_saturated, sx2x_i_c * stot / sink_i, sx2x_i_c)
-    sx2x_i_s = jnp.where(sink_i_saturated, sx2x_i_s * stot / sink_i, sx2x_i_s)
-    sx2x_i_g = jnp.where(sink_i_saturated, sx2x_i_g * stot / sink_i, sx2x_i_g)
-    sink_i = jnp.where(sink_i_saturated, sx2x_i_v + sx2x_i_c + sx2x_i_s + sx2x_i_g, sink_i)
-
-    stot = q.g / dt
-    sink_g_saturated = (sink_g > stot) & (q.g > const.qmin)
-    sx2x_g_v = jnp.where(sink_g_saturated, sx2x_g_v * stot / sink_g, sx2x_g_v)
-    sx2x_g_r = jnp.where(sink_g_saturated, sx2x_g_r * stot / sink_g, sx2x_g_r)
-    sink_g = jnp.where(sink_g_saturated, sx2x_g_v + sx2x_g_r, sink_g)
-
-    # Water content updates
-    dqdt_v = sx2x_r_v + sx2x_s_v + sx2x_i_v + sx2x_g_v - sink_v
-    qv = jnp.where(mask, jnp.maximum(0.0, q.v + dqdt_v * dt), q.v)
-
-    dqdt_c = sx2x_i_c - sink_c
-    qc = jnp.where(mask, jnp.maximum(0.0, q.c + dqdt_c * dt), q.c)
-
-    dqdt_r = sx2x_c_r + sx2x_s_r + sx2x_g_r - sink_r
-    qr = jnp.where(mask, jnp.maximum(0.0, q.r + dqdt_r * dt), q.r)
-
-    dqdt_s = sx2x_v_s + sx2x_c_s + sx2x_i_s - sink_s
-    qs = jnp.where(mask, jnp.maximum(0.0, q.s + dqdt_s * dt), q.s)
-
-    dqdt_i = sx2x_v_i + sx2x_c_i - sink_i
-    qi = jnp.where(mask, jnp.maximum(0.0, q.i + dqdt_i * dt), q.i)
-
-    dqdt_g = sx2x_v_g + sx2x_c_g + sx2x_r_g + sx2x_s_g + sx2x_i_g - sink_g
-    qg = jnp.where(mask, jnp.maximum(0.0, q.g + dqdt_g * dt), q.g)
-
-    qice = qs + qi + qg
-    qliq = qc + qr
-    qtot = qv + qice + qliq
-
-    cv = (
-        const.cvd
-        + (const.cvv - const.cvd) * qtot
-        + (const.clw - const.cvv) * qliq
-        + (const.ci - const.cvv) * qice
-    )
-
-    t = jnp.where(
-        mask,
-        t
-        + dt
-        * (
-            (dqdt_c + dqdt_r) * (const.lvc - (const.clw - const.cvv) * t)
-            + (dqdt_i + dqdt_s + dqdt_g) * (const.lsc - (const.ci - const.cvv) * t)
-        )
-        / cv,
-        t,
-    )
-
-    return Q(v=qv, c=qc, r=qr, s=qs, i=qi, g=qg), t
-
-
-# ============================================================================
-# precipitation_effects - native transposed version with HLO injection support
-# ============================================================================
-
-# Import the optimized transposed primitive for HLO injection
 from ..core.optimized_precip import (
     optimized_precip_transposed_p,
     is_optimized_enabled,
 )
-
-# Import the full-graupel optimized primitive (q_t_update + precip combined)
 from ..core.optimized_graupel import (
     optimized_graupel_p,
     is_graupel_optimized_enabled,
@@ -256,20 +39,8 @@ from ..core.optimized_graupel import (
 
 
 def precipitation_effects_native_transposed(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
-    """
-    Apply precipitation sedimentation and temperature effects.
-
-    NATIVE TRANSPOSED version - all data in (nlev, ncells) layout.
-
-    When optimized HLO is enabled (via configure_optimized_precip with transposed=True),
-    this calls the transposed primitive directly - NO transposes needed since data
-    is already in (nlev, ncells) layout.
-
-    When optimized HLO is NOT enabled, uses native transposed JAX scans.
-    """
+    """Precipitation sedimentation and temperature effects. (nlev, ncells) layout."""
     if is_optimized_enabled():
-        # Use the optimized transposed primitive directly - NO transposes!
-        # Data is already in (nlev, ncells) layout, primitive expects (nlev, ncells)
         return optimized_precip_transposed_p.bind(
             kmin_r, kmin_i, kmin_s, kmin_g,
             q_in.v, q_in.c, q_in.r, q_in.s, q_in.i, q_in.g,
@@ -278,17 +49,13 @@ def precipitation_effects_native_transposed(last_lev, kmin_r, kmin_i, kmin_s, km
             dt=dt
         )
 
-    # Fallback: use native transposed JAX scans (no HLO injection)
     return _precipitation_effects_native_transposed_jax(
         last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt
     )
 
 
 def _precipitation_effects_native_transposed_jax(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
-    """
-    Pure JAX implementation of precipitation_effects for transposed layout.
-    Uses native transposed scans - no transposes, but also no HLO injection.
-    """
+    """JAX fallback for precipitation_effects in (nlev, ncells) layout."""
     # Store initial state for energy calculation
     qliq = q_in.c + q_in.r
     qice = q_in.s + q_in.i + q_in.g
@@ -311,7 +78,7 @@ def _precipitation_effects_native_transposed_jax(last_lev, kmin_r, kmin_i, kmin_
         (12.24, 0.217, 1.0e-08),  # graupel
     ]
 
-    # Run batched precipitation scans - NATIVE TRANSPOSED (no transposes!)
+    # Batched precipitation scans in (nlev, ncells) layout
     results = precip_scan_batched_transposed(
         params_list,
         zeta,
@@ -329,14 +96,14 @@ def _precipitation_effects_native_transposed_jax(last_lev, kmin_r, kmin_i, kmin_
     qice = qs + qi + qg
     pflx_tot = ps + pi + pg
 
-    # Shift temperature for next level - adapted for (nlev, ncells) layout
+    # Shift temperature for next level
     nlev, ncells = t.shape
     t_kp1 = jnp.concatenate([t[1:, :], t[-1:, :]], axis=0)
     t_kp1 = jnp.where(jnp.arange(nlev)[:, None] < last_lev, t_kp1, t)
 
     kmin_rsig = kmin_r | kmin_s | kmin_i | kmin_g
 
-    # Temperature update scan - NATIVE TRANSPOSED (no transposes!)
+    # Temperature update scan
     result_t = temperature_update_scan_transposed(
         t, t_kp1, ei_old, pr, pflx_tot, q_in.v, qliq, qice, rho, dz, dt, kmin_rsig
     )
@@ -346,24 +113,12 @@ def _precipitation_effects_native_transposed_jax(last_lev, kmin_r, kmin_i, kmin_
     return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
 
 
-# ============================================================================
-# Main Graupel Function - Native Transposed
-# ============================================================================
-
 def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     """
-    Top-level graupel microphysics with NATIVE TRANSPOSED (nlev, ncells) layout.
+    Top-level graupel in (nlev, ncells) layout.
 
-    ALL data must be in (nlev, ncells) layout.
-    ALL internal computations use (nlev, ncells) layout.
-    ALL outputs are in (nlev, ncells) layout.
-
-    ZERO transposes during computation.
-
-    Three modes:
-    1. Full-graupel HLO injection (q_t_update + precip combined in single module)
-    2. Precip-only HLO injection (q_t_update via JAX, precip via injected HLO)
-    3. Pure JAX fallback (no HLO injection)
+    Uses injected HLO when configured, otherwise falls back to JAX scans.
+    See optimized_graupel.py and optimized_precip.py for HLO configuration.
     """
     # Compute minimum levels for each species
     kmin_r = q.r > const.qmin
@@ -371,7 +126,7 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     kmin_s = q.s > const.qmin
     kmin_g = q.g > const.qmin
 
-    # Mode 1: Full-graupel HLO injection (best performance)
+    # Full-graupel HLO path
     if is_graupel_optimized_enabled():
         results = optimized_graupel_p.bind(
             kmin_r, kmin_i, kmin_s, kmin_g,
@@ -392,11 +147,10 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
             eflx,
         )
 
-    # Mode 2 & 3: q_t_update via JAX, then precip (with or without HLO injection)
-    # Phase transitions - use fused implementation for better GPU kernel fusion
+    # Phase transitions (fused version for fewer kernel launches)
     q_updated, t_updated = q_t_update_fused(te, p, rho, q, dt, qnc)
 
-    # Precipitation effects (native transposed - no transposes!)
+    # Precipitation sedimentation
     qr, qs, qi, qg, t_final, pflx, pr, ps, pi, pg, pre = precipitation_effects_native_transposed(
         last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt
     )
@@ -413,21 +167,9 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     )
 
 
-# ============================================================================
-# JIT-compiled entry point
-# ============================================================================
-
 @jit_compile
 def graupel_run_native_transposed(dz, te, p, rho, q_in, dt, qnc, last_level=None):
-    """
-    JIT-compiled graupel driver with NATIVE TRANSPOSED layout.
-
-    Input: (nlev, ncells) layout (data must be pre-transposed)
-    Internal: (nlev, ncells) layout (no transposes)
-    Output: (nlev, ncells) layout (no transposes)
-
-    ZERO transposes during computation.
-    """
+    """JIT-compiled entry point. All arrays must be (nlev, ncells)."""
     if last_level is None:
         last_level = te.shape[0] - 1  # nlev is first dimension
 

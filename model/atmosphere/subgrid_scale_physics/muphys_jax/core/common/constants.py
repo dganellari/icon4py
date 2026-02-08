@@ -6,12 +6,7 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""
-Physical constants for muphys_jax microphysics.
-
-This module is self-contained and does not depend on the GT4Py muphys implementation.
-All values are defined directly here to ensure muphys_jax is fully independent.
-"""
+"""Physical constants for muphys_jax microphysics (self-contained, no GT4Py dependency)."""
 
 # =============================================================================
 # Thermodynamic constants (from t_d)

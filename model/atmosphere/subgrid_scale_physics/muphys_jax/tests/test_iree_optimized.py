@@ -22,8 +22,8 @@ import time
 
 # Import implementations
 from muphys_jax.core.definitions import Q
-from muphys_jax.core.scans_baseline import precip_scan_batched, temperature_scan_step
-from muphys_jax.core.scans_iree import precip_scan_sequential, precip_scan_fori, temperature_scan_fori
+from muphys_jax.core.scans import precip_scan_batched, temperature_scan_step
+from muphys_jax.core.scans import precip_scan_sequential, precip_scan_fori, temperature_scan_iree as temperature_scan_fori
 from muphys_jax.implementations.graupel_baseline import graupel_run_split
 from muphys_jax.implementations.graupel_iree import graupel_run_iree
 

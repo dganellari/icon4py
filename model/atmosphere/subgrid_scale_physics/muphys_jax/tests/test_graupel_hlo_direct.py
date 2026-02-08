@@ -29,7 +29,7 @@ import pytest
 
 # Add tools directory to path
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "tools"))
-from export_precip_effect import export_precip_effect_hlo
+from export_precip_transposed import export_precip_transposed_hlo
 from run_graupel_optimized import run_graupel
 
 from muphys_jax.utils.data_loading import load_graupel_reference
@@ -78,11 +78,10 @@ def test_graupel_hlo_injection(experiment: MuphysGraupelExperiment):
     with tempfile.TemporaryDirectory() as tmpdir:
         # Step 1: Generate StableHLO
         print(f"\n[1/2] Generating StableHLO for {experiment.name}...")
-        stablehlo_file, hlo_file = export_precip_effect_hlo(
+        stablehlo_file, hlo_file = export_precip_transposed_hlo(
             input_file=str(experiment.input_file),
             skip_compile=True,
             output_dir=tmpdir,
-            mode="baseline",
         )
 
         # Step 2: Run full graupel with HLO injection (same as --optimized-hlo)

@@ -7,15 +7,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Fused q_t_update implementation optimized for GPU kernel fusion.
+Fused q_t_update: all phase transitions inlined into a single function.
 
-This version aims to reduce the number of separate CUDA kernels by:
-1. Using lax.select instead of jnp.where
-2. Using lax.pow instead of jnp.power
-3. Grouping computations to encourage XLA fusion
-4. Minimizing intermediate temporaries
-
-The goal is to reduce from ~24ms (80 kernels) to ~5ms (fewer, fused kernels).
+Uses lax.select/lax.pow instead of jnp.where/jnp.power and groups computations
+to reduce the number of XLA kernels (~80 -> fewer fused kernels).
 """
 
 import jax.numpy as jnp

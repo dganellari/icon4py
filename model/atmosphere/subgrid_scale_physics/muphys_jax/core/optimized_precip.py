@@ -7,34 +7,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-Optimized precipitation_effects using custom JAX primitive with HLO injection.
+Custom JAX primitive that injects pre-compiled StableHLO for precipitation_effects.
 
-This module provides a drop-in replacement for precipitation_effects that can:
-1. Use the original JAX implementation (default)
-2. Use an optimized HLO module loaded from disk
-3. Seamlessly integrate into the graupel pipeline within JIT
-
-The injection works by:
-1. Defining a custom JAX primitive (optimized_precip_p)
-2. During MLIR lowering, if optimized HLO is configured, emit a custom_call
-   that references the pre-compiled HLO module
-3. XLA will execute the optimized HLO instead of re-tracing the original
-
-Usage:
-    # Option 1: Environment variables
-    export MUPHYS_OPTIMIZED_HLO=/path/to/optimized.serialized
-    export MUPHYS_USE_OPTIMIZED=1
-    python your_script.py
-
-    # Option 2: Programmatic configuration
-    from muphys_jax.core.optimized_precip import configure_optimized_precip
-    configure_optimized_precip(
-        hlo_path="/path/to/optimized.serialized",
-        use_optimized=True
-    )
-
-    # Then use graupel_optimized which calls precipitation_effects_optimized
-    from muphys_jax.implementations.graupel_optimized import graupel_run
+When configured (via configure_optimized_precip or MUPHYS_OPTIMIZED_HLO env var),
+the primitive replaces the JAX-traced precipitation scan with a pre-compiled HLO
+module during MLIR lowering. Otherwise falls back to the standard JAX implementation.
 """
 
 import os
@@ -523,29 +500,10 @@ def precipitation_effects_optimized(
     dt: float
 ) -> Tuple[jnp.ndarray, ...]:
     """
-    Drop-in replacement for precipitation_effects.
+    precipitation_effects with optional HLO injection.
 
-    Uses optimized HLO if configured, otherwise falls back to JAX implementation.
-
-    When _TRANSPOSED_LAYOUT is True:
-    - Transposes inputs from (ncells, nlev) to (nlev, ncells)
-    - Calls the transposed primitive (which expects nlev×ncells layout)
-    - Transposes outputs back from (nlev, ncells) to (ncells, nlev)
-
-    This allows injecting HLO with transposed layout for better GPU memory coalescing,
-    while maintaining the original API interface.
-
-    Args:
-        last_lev: Last vertical level index
-        kmin_r, kmin_i, kmin_s, kmin_g: Species activation masks
-        q_in: Q namedtuple with species mixing ratios
-        t: Temperature
-        rho: Air density
-        dz: Layer thickness
-        dt: Time step
-
-    Returns:
-        Tuple of (qr, qs, qi, qg, t_new, pflx_tot, pr, ps, pi, pg, eflx)
+    If _TRANSPOSED_LAYOUT is set, transposes to (nlev, ncells) before calling
+    the primitive and transposes outputs back to (ncells, nlev).
     """
     if _TRANSPOSED_LAYOUT:
         # Transpose all inputs from (ncells, nlev) to (nlev, ncells)
