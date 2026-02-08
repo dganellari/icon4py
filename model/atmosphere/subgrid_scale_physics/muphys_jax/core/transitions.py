@@ -40,9 +40,15 @@ def cloud_to_rain(t, qc, qr, nc):
 
     tau = jnp.maximum(TAU_MIN, jnp.minimum(1.0 - qc / (qc + qr), TAU_MAX))
     phi = jnp.power(tau, B_PHI)
-    phi = A_PHI * phi * jnp.power(1.0 - phi, 3.0)
-    xau = AU_KERNEL * jnp.power(qc * qc / nc, 2.0) * (1.0 + phi / jnp.power(1.0 - tau, 2.0))
-    xac = AC_KERNEL * qc * qr * jnp.power(tau / (tau + C_PHI), 4.0)
+    # Expand powers to multiplications to avoid jnp.power overhead
+    one_minus_phi = 1.0 - phi
+    phi = A_PHI * phi * (one_minus_phi * one_minus_phi * one_minus_phi)  # (1-phi)^3
+    qc_ratio = qc * qc / nc
+    one_minus_tau = 1.0 - tau
+    xau = AU_KERNEL * (qc_ratio * qc_ratio) * (1.0 + phi / (one_minus_tau * one_minus_tau))  # (qc^2/nc)^2, (1-tau)^2
+    tau_ratio = tau / (tau + C_PHI)
+    tau_ratio_sq = tau_ratio * tau_ratio
+    xac = AC_KERNEL * qc * qr * (tau_ratio_sq * tau_ratio_sq)
 
     mask = (qc > QMIN_AC) & (t > const.tfrz_hom)
     return jnp.where(mask, xau + xac, 0.0)

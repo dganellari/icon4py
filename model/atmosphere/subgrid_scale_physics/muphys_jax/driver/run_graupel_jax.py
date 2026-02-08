@@ -13,9 +13,43 @@ Uses the same NetCDF input files and produces comparable output.
 
 Usage:
     python run_graupel_jax.py -o output.nc -b xla input.nc 10 30.0 100.0
+
+For IREE backend:
+    python run_graupel_jax.py -o output.nc -b iree input.nc 10 30.0 100.0
+
+NOTE: Backend must be set BEFORE importing JAX. Use -b flag, not JAX_BACKEND env var.
 """
 
 import argparse
+import os
+import sys
+
+# Parse backend argument BEFORE importing JAX
+# This is critical because JAX backend is set at import time
+def _get_backend_early():
+    """Parse just the backend argument before importing JAX."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "-b" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("-b="):
+            return arg[3:]
+        if arg.startswith("--backend="):
+            return arg[10:]
+    # Check next arg after --backend
+    for i, arg in enumerate(sys.argv):
+        if arg == "--backend" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return "xla"  # default
+
+_backend = _get_backend_early()
+if _backend == "iree":
+    # Must set before JAX import
+    os.environ["JAX_PLATFORMS"] = "iree_cuda"
+    # Configure consteval to use local-sync CPU backend
+    # This only affects compile-time constant folding, runtime uses CUDA
+    os.environ["IREE_PJRT_CONSTEVAL_BACKENDS"] = "local-sync"
+    print(f"Setting JAX_PLATFORMS=iree_cuda, consteval=local-sync (before JAX import)")
+
 import pathlib
 import time
 from typing import NamedTuple
@@ -27,6 +61,9 @@ import numpy as np
 
 from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
+from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline_run
+from muphys_jax.implementations.graupel_baseline import graupel_run_split as graupel_split_run
+from muphys_jax.implementations.graupel_iree import graupel_run_iree
 
 
 def _calc_dz(z: np.ndarray) -> np.ndarray:
@@ -155,17 +192,49 @@ def get_args():
         type=float,
         default=100.0,
     )
-
+    parser.add_argument(
+        "--tiled",
+        help="use tiled scans (process multiple levels per iteration)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--tile-size",
+        help="number of levels per tiled scan iteration",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--unrolled",
+        help="use unrolled loop (static unroll at trace time)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--baseline",
+        help="use baseline implementation (vmap-batched)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--split",
+        help="use split JIT implementation (IREE-compatible, 2 separate JIT boundaries)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--iree-optimized",
+        help="use IREE-optimized implementation (fori_loop scans, sequential species)",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
 def main():
     args = get_args()
 
-    # Set JAX backend
-    import os
-
-    os.environ["JAX_BACKEND"] = args.backend
+    # Backend was already set before JAX import (see top of file)
     print(f"Using JAX backend: {args.backend}")
     print(f"JAX devices: {jax.devices()}")
     print(f"JAX default backend: {jax.default_backend()}")
@@ -173,17 +242,48 @@ def main():
     # Load input data
     print(f"Loading input from: {args.input_file}")
     inp = GraupelInput.load(pathlib.Path(args.input_file))
-    print(f"Grid size: {inp.ncells} cells × {inp.nlev} levels")
+    print(f"Grid size: {inp.ncells} cells x {inp.nlev} levels")
     print(f"Temperature range: {np.array(inp.t).min():.1f} - {np.array(inp.t).max():.1f} K")
     print(f"Timestep: {args.dt} s")
     print(f"Cloud droplet concentration: {args.qnc} m^-3")
 
+    # Choose which implementation to use
+    use_iree = args.backend == "iree" or os.environ.get("JAX_PLATFORMS", "").startswith("iree")
+
+    if args.iree_optimized:
+        print("Mode: IREE-OPTIMIZED (fori_loop scans, sequential species)")
+        run_func = graupel_run_iree
+        run_kwargs = {}
+    elif args.split:
+        print("Mode: SPLIT JIT (IREE-compatible, 2 separate JIT boundaries)")
+        run_func = graupel_split_run
+        run_kwargs = {}
+    elif args.baseline:
+        if use_iree:
+            print("Note: IREE detected, using split JIT version for compatibility")
+            run_func = graupel_split_run
+        else:
+            run_func = graupel_baseline_run
+        print("Mode: BASELINE (vmap-batched)")
+        run_kwargs = {}
+    elif args.unrolled:
+        print("Mode: UNROLLED (static unroll)")
+        run_func = graupel_run
+        run_kwargs = dict(use_unrolled=True)
+    elif args.tiled:
+        print(f"Mode: TILED (tile_size={args.tile_size})")
+        run_func = graupel_run
+        run_kwargs = dict(use_tiled_scans=True, tile_size=args.tile_size)
+    else:
+        print("Mode: DEFAULT")
+        run_func = graupel_run
+        run_kwargs = {}
+
     # Warmup compilation
     print("\nWarming up (JIT compilation)...")
-    t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc
+    t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
+        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
     )
-    # Block until compilation completes
     t_out.block_until_ready()
     print("Compilation complete!")
 
@@ -192,14 +292,12 @@ def main():
     num_iters = int(args.itime)
 
     for iteration in range(num_iters + 1):
-        if iteration == 1:  # Start timing after first warmup iteration
+        if iteration == 1:
             start_time = time.time()
-
-        t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run(
-            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc
+        t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
+            inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
         )
 
-    # Block until all computations complete
     t_out.block_until_ready()
     end_time = time.time()
 
@@ -208,7 +306,6 @@ def main():
         print(f"\nFor {num_iters} iterations it took {elapsed_time:.4f} seconds!")
         print(f"Time per iteration: {elapsed_time / num_iters:.4f} seconds")
 
-    # Convert outputs to numpy
     print("\nConverting outputs to numpy arrays...")
     out = GraupelOutput(
         t=np.array(t_out),
