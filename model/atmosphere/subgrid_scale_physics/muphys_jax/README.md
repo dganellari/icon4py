@@ -8,11 +8,9 @@ for GPU optimization. Self-contained — no dependency on the GT4Py `muphys` pac
 | Implementation | Time (ms) | Notes |
 |---|---|---|
 | Baseline (vmap-batched) | ~51 | `(ncells, nlev)` layout, internal transposes |
-| Native transposed | ~35 | `(nlev, ncells)` layout, zero transposes |
-| + StableHLO precip injection | ~33 | Precip scan replaced by pre-compiled HLO |
-| + Combined HLO (q_t_update + precip) | ~32 | Single HLO module for the full computation |
+| Native transposed + Combined HLO (q_t_update + precip) | ~32 | Single HLO module for the full computation |
 
-Measured on NVIDIA A100, R2B05 grid (327680 cells, 90 levels), float64.
+Measured on NVIDIA GH200, R2B06 grid (327680 cells, 90 levels), float64.
 
 ## Architecture
 
