@@ -18,14 +18,14 @@ import os
 import pathlib
 from typing import Final
 
+
 # Configure JAX before any JAX imports
-os.environ.setdefault('JAX_PLATFORMS', 'cpu')
-os.environ.setdefault('JAX_ENABLE_X64', '1')
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from muphys_jax.implementations.graupel_baseline import graupel_run
 from muphys_jax.utils.data_loading import load_graupel_inputs, load_graupel_reference
 
@@ -33,6 +33,7 @@ from muphys_jax.utils.data_loading import load_graupel_inputs, load_graupel_refe
 @dataclasses.dataclass(frozen=True)
 class MuphysGraupelExperiment:
     """Configuration for a graupel microphysics test experiment."""
+
     name: str
     uri: str = ""
     dt: float = 30.0
@@ -55,8 +56,12 @@ class MuphysGraupelExperiment:
 
 
 GRAUPEL_EXPERIMENTS: Final = [
-    MuphysGraupelExperiment("mini", "https://polybox.ethz.ch/index.php/s/7B9MWyKTTBrNQBd/download?files=mini.tar.gz"),
-    MuphysGraupelExperiment("R2B05", "https://polybox.ethz.ch/index.php/s/7B9MWyKTTBrNQBd/download?files=R2B05.tar.gz"),
+    MuphysGraupelExperiment(
+        "mini", "https://polybox.ethz.ch/index.php/s/7B9MWyKTTBrNQBd/download?files=mini.tar.gz"
+    ),
+    MuphysGraupelExperiment(
+        "R2B05", "https://polybox.ethz.ch/index.php/s/7B9MWyKTTBrNQBd/download?files=R2B05.tar.gz"
+    ),
 ]
 
 
@@ -65,7 +70,7 @@ GRAUPEL_EXPERIMENTS: Final = [
 def test_graupel_run_jax(experiment: MuphysGraupelExperiment):
     """
     Test the JAX implementation of the Graupel microphysics scheme.
-    
+
     This test loads NetCDF input/reference data directly and compares
     the JAX implementation output against reference values.
     """
@@ -91,10 +96,24 @@ def test_graupel_run_jax(experiment: MuphysGraupelExperiment):
     atol = 1e-16
 
     # Verify results
-    np.testing.assert_allclose(np.array(t_out), ref["t"], rtol=rtol, atol=atol, err_msg="Temperature mismatch")
-    np.testing.assert_allclose(np.array(q_out.v), ref["qv"], rtol=rtol, atol=atol, err_msg="Water vapor mismatch")
-    np.testing.assert_allclose(np.array(q_out.c), ref["qc"], rtol=rtol, atol=atol, err_msg="Cloud water mismatch")
-    np.testing.assert_allclose(np.array(q_out.i), ref["qi"], rtol=rtol, atol=atol, err_msg="Ice mismatch")
-    np.testing.assert_allclose(np.array(q_out.r), ref["qr"], rtol=rtol, atol=atol, err_msg="Rain mismatch")
-    np.testing.assert_allclose(np.array(q_out.s), ref["qs"], rtol=rtol, atol=atol, err_msg="Snow mismatch")
-    np.testing.assert_allclose(np.array(q_out.g), ref["qg"], rtol=rtol, atol=atol, err_msg="Graupel mismatch")
+    np.testing.assert_allclose(
+        np.array(t_out), ref["t"], rtol=rtol, atol=atol, err_msg="Temperature mismatch"
+    )
+    np.testing.assert_allclose(
+        np.array(q_out.v), ref["qv"], rtol=rtol, atol=atol, err_msg="Water vapor mismatch"
+    )
+    np.testing.assert_allclose(
+        np.array(q_out.c), ref["qc"], rtol=rtol, atol=atol, err_msg="Cloud water mismatch"
+    )
+    np.testing.assert_allclose(
+        np.array(q_out.i), ref["qi"], rtol=rtol, atol=atol, err_msg="Ice mismatch"
+    )
+    np.testing.assert_allclose(
+        np.array(q_out.r), ref["qr"], rtol=rtol, atol=atol, err_msg="Rain mismatch"
+    )
+    np.testing.assert_allclose(
+        np.array(q_out.s), ref["qs"], rtol=rtol, atol=atol, err_msg="Snow mismatch"
+    )
+    np.testing.assert_allclose(
+        np.array(q_out.g), ref["qg"], rtol=rtol, atol=atol, err_msg="Graupel mismatch"
+    )

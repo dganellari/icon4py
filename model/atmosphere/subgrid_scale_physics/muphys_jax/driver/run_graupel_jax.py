@@ -24,6 +24,7 @@ import argparse
 import os
 import sys
 
+
 # Parse backend argument BEFORE importing JAX
 # This is critical because JAX backend is set at import time
 def _get_backend_early():
@@ -41,6 +42,7 @@ def _get_backend_early():
             return sys.argv[i + 1]
     return "xla"  # default
 
+
 _backend = _get_backend_early()
 if _backend == "iree":
     # Must set before JAX import
@@ -48,7 +50,7 @@ if _backend == "iree":
     # Configure consteval to use local-sync CPU backend
     # This only affects compile-time constant folding, runtime uses CUDA
     os.environ["IREE_PJRT_CONSTEVAL_BACKENDS"] = "local-sync"
-    print(f"Setting JAX_PLATFORMS=iree_cuda, consteval=local-sync (before JAX import)")
+    print("Setting JAX_PLATFORMS=iree_cuda, consteval=local-sync (before JAX import)")
 
 import pathlib
 import time
@@ -58,11 +60,12 @@ import jax
 import jax.numpy as jnp
 import netCDF4
 import numpy as np
-
 from muphys_jax.core.definitions import Q
 from muphys_jax.implementations.graupel import graupel_run
-from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline_run
-from muphys_jax.implementations.graupel_baseline import graupel_run_split as graupel_split_run
+from muphys_jax.implementations.graupel_baseline import (
+    graupel_run as graupel_baseline_run,
+    graupel_run_split as graupel_split_run,
+)
 from muphys_jax.implementations.graupel_iree import graupel_run_iree
 
 

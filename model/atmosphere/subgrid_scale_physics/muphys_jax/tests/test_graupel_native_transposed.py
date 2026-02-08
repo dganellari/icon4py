@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Test graupel_native_transposed implementation against reference values.
 
@@ -12,21 +20,24 @@ Usage:
 """
 
 import argparse
-import sys
 import pathlib
+import sys
 import time
 
 import jax
+
+
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
 
+
 # Add parent to path for imports
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.parent.parent))
 
-from muphys_jax.utils.data_loading import load_graupel_inputs, load_graupel_reference
 from muphys_jax.core.definitions import Q
+from muphys_jax.utils.data_loading import load_graupel_inputs, load_graupel_reference
 
 
 def benchmark(fn, args, name, num_warmup=10, num_runs=50):
@@ -45,7 +56,9 @@ def benchmark(fn, args, name, num_warmup=10, num_runs=50):
         times.append((time.perf_counter() - start) * 1000)
 
     times = np.array(times)
-    print(f"  {name}: {np.median(times):.3f} ms (min: {np.min(times):.3f}, std: {np.std(times):.3f})")
+    print(
+        f"  {name}: {np.median(times):.3f} ms (min: {np.min(times):.3f}, std: {np.std(times):.3f})"
+    )
     return np.median(times), result
 
 
@@ -77,11 +90,13 @@ def main():
     if args.graupel_hlo:
         print(f"Configuring FULL GRAUPEL HLO injection: {args.graupel_hlo}")
         from muphys_jax.core.optimized_graupel import configure_optimized_graupel
+
         configure_optimized_graupel(hlo_path=args.graupel_hlo, use_optimized=True)
         print("  ✓ Full graupel HLO configured (q_t_update + precip combined)")
     elif args.optimized_hlo:
         print(f"Configuring precip-only HLO injection: {args.optimized_hlo}")
         from muphys_jax.core.optimized_precip import configure_optimized_precip
+
         configure_optimized_precip(hlo_path=args.optimized_hlo, use_optimized=True, transposed=True)
         print("  ✓ Optimized HLO configured for transposed layout (precip only)")
     else:
@@ -115,8 +130,9 @@ def main():
     print("=" * 70)
     graupel_fn = jax.jit(graupel_run_native_transposed)
     graupel_args = (dz_t, t_t, p_t, rho_t, q_t, dt, qnc_t)
-    time_native, result_native = benchmark(graupel_fn, graupel_args, "Native-transposed",
-                                            args.num_warmup, args.num_runs)
+    time_native, result_native = benchmark(
+        graupel_fn, graupel_args, "Native-transposed", args.num_warmup, args.num_runs
+    )
 
     # Also measure WITH transposes included (end-to-end cost)
     print()
@@ -130,9 +146,12 @@ def main():
         rho_tr = jnp.transpose(rho)
         qnc_tr = jnp.transpose(qnc)
         q_tr = Q(
-            v=jnp.transpose(q.v), c=jnp.transpose(q.c),
-            r=jnp.transpose(q.r), s=jnp.transpose(q.s),
-            i=jnp.transpose(q.i), g=jnp.transpose(q.g),
+            v=jnp.transpose(q.v),
+            c=jnp.transpose(q.c),
+            r=jnp.transpose(q.r),
+            s=jnp.transpose(q.s),
+            i=jnp.transpose(q.i),
+            g=jnp.transpose(q.g),
         )
         t_out, q_out, pflx, pr, ps, pi, pg, pre = graupel_run_native_transposed(
             dz_tr, t_tr, p_tr, rho_tr, q_tr, dt, qnc_tr
@@ -140,17 +159,31 @@ def main():
         # Transpose outputs back
         return (
             jnp.transpose(t_out),
-            Q(v=jnp.transpose(q_out.v), c=jnp.transpose(q_out.c),
-              r=jnp.transpose(q_out.r), s=jnp.transpose(q_out.s),
-              i=jnp.transpose(q_out.i), g=jnp.transpose(q_out.g)),
-            jnp.transpose(pflx), jnp.transpose(pr), jnp.transpose(ps),
-            jnp.transpose(pi), jnp.transpose(pg), jnp.transpose(pre),
+            Q(
+                v=jnp.transpose(q_out.v),
+                c=jnp.transpose(q_out.c),
+                r=jnp.transpose(q_out.r),
+                s=jnp.transpose(q_out.s),
+                i=jnp.transpose(q_out.i),
+                g=jnp.transpose(q_out.g),
+            ),
+            jnp.transpose(pflx),
+            jnp.transpose(pr),
+            jnp.transpose(ps),
+            jnp.transpose(pi),
+            jnp.transpose(pg),
+            jnp.transpose(pre),
         )
 
     graupel_e2e_fn = jax.jit(graupel_with_transposes)
     graupel_e2e_args = (dz, t, p, rho, q, dt, qnc)
-    time_e2e, _ = benchmark(graupel_e2e_fn, graupel_e2e_args, "With-transposes (end-to-end)",
-                             args.num_warmup, args.num_runs)
+    time_e2e, _ = benchmark(
+        graupel_e2e_fn,
+        graupel_e2e_args,
+        "With-transposes (end-to-end)",
+        args.num_warmup,
+        args.num_runs,
+    )
     transpose_overhead = time_e2e - time_native
     print(f"  Transpose overhead: {transpose_overhead:.3f} ms")
 
@@ -160,12 +193,12 @@ def main():
     # Transpose outputs back to (ncells, nlev) for comparison with reference
     t_out_np = np.transpose(np.array(t_out))
     q_out_np = {
-        'v': np.transpose(np.array(q_out.v)),
-        'c': np.transpose(np.array(q_out.c)),
-        'r': np.transpose(np.array(q_out.r)),
-        's': np.transpose(np.array(q_out.s)),
-        'i': np.transpose(np.array(q_out.i)),
-        'g': np.transpose(np.array(q_out.g)),
+        "v": np.transpose(np.array(q_out.v)),
+        "c": np.transpose(np.array(q_out.c)),
+        "r": np.transpose(np.array(q_out.r)),
+        "s": np.transpose(np.array(q_out.s)),
+        "i": np.transpose(np.array(q_out.i)),
+        "g": np.transpose(np.array(q_out.g)),
     }
 
     print()
@@ -194,22 +227,22 @@ def main():
     # Compare native-transposed vs baseline
     t_base_np = np.array(t_base)
     q_base_np = {
-        'v': np.array(q_base.v),
-        'c': np.array(q_base.c),
-        'r': np.array(q_base.r),
-        's': np.array(q_base.s),
-        'i': np.array(q_base.i),
-        'g': np.array(q_base.g),
+        "v": np.array(q_base.v),
+        "c": np.array(q_base.c),
+        "r": np.array(q_base.r),
+        "s": np.array(q_base.s),
+        "i": np.array(q_base.i),
+        "g": np.array(q_base.g),
     }
 
     print("\nComparing native-transposed vs baseline:")
     diff_t = np.max(np.abs(t_out_np - t_base_np))
-    diff_qv = np.max(np.abs(q_out_np['v'] - q_base_np['v']))
-    diff_qc = np.max(np.abs(q_out_np['c'] - q_base_np['c']))
-    diff_qr = np.max(np.abs(q_out_np['r'] - q_base_np['r']))
-    diff_qs = np.max(np.abs(q_out_np['s'] - q_base_np['s']))
-    diff_qi = np.max(np.abs(q_out_np['i'] - q_base_np['i']))
-    diff_qg = np.max(np.abs(q_out_np['g'] - q_base_np['g']))
+    diff_qv = np.max(np.abs(q_out_np["v"] - q_base_np["v"]))
+    diff_qc = np.max(np.abs(q_out_np["c"] - q_base_np["c"]))
+    diff_qr = np.max(np.abs(q_out_np["r"] - q_base_np["r"]))
+    diff_qs = np.max(np.abs(q_out_np["s"] - q_base_np["s"]))
+    diff_qi = np.max(np.abs(q_out_np["i"] - q_base_np["i"]))
+    diff_qg = np.max(np.abs(q_out_np["g"] - q_base_np["g"]))
 
     print(f"  Max diff t:  {diff_t:.2e}")
     print(f"  Max diff qv: {diff_qv:.2e}")
@@ -223,7 +256,9 @@ def main():
 
     # Accept differences up to 1e-5 (numerical precision from fused implementation)
     if max_diff_baseline < 1e-5:
-        print(f"\n  ✓ Native-transposed matches baseline within tolerance ({max_diff_baseline:.2e})")
+        print(
+            f"\n  ✓ Native-transposed matches baseline within tolerance ({max_diff_baseline:.2e})"
+        )
         baseline_match = True
     else:
         print(f"\n  ⚠ Native-transposed differs from baseline! Max diff: {max_diff_baseline:.2e}")
@@ -249,23 +284,23 @@ def main():
         try:
             np.testing.assert_allclose(t_out_np, ref["t"], rtol=rtol, atol=atol)
             print("  ✓ Temperature matches reference")
-        except AssertionError as e:
+        except AssertionError:
             diff = np.max(np.abs(t_out_np - ref["t"]))
             print(f"  ✗ Temperature differs: max diff = {diff:.2e}")
             errors.append(("t", diff))
 
         for name, arr_out, arr_ref in [
-            ("qv", q_out_np['v'], ref["qv"]),
-            ("qc", q_out_np['c'], ref["qc"]),
-            ("qr", q_out_np['r'], ref["qr"]),
-            ("qs", q_out_np['s'], ref["qs"]),
-            ("qi", q_out_np['i'], ref["qi"]),
-            ("qg", q_out_np['g'], ref["qg"]),
+            ("qv", q_out_np["v"], ref["qv"]),
+            ("qc", q_out_np["c"], ref["qc"]),
+            ("qr", q_out_np["r"], ref["qr"]),
+            ("qs", q_out_np["s"], ref["qs"]),
+            ("qi", q_out_np["i"], ref["qi"]),
+            ("qg", q_out_np["g"], ref["qg"]),
         ]:
             try:
                 np.testing.assert_allclose(arr_out, arr_ref, rtol=rtol, atol=atol)
                 print(f"  ✓ {name} matches reference")
-            except AssertionError as e:
+            except AssertionError:
                 diff = np.max(np.abs(arr_out - arr_ref))
                 print(f"  ✗ {name} differs: max diff = {diff:.2e}")
                 errors.append((name, diff))
@@ -278,7 +313,9 @@ def main():
             # Check if differences are within acceptable physics tolerance
             max_ref_diff = max(e[1] for e in errors)
             if max_ref_diff < 1e-5:
-                print(f"\n  However, max diff ({max_ref_diff:.2e}) is within physics tolerance (1e-5)")
+                print(
+                    f"\n  However, max diff ({max_ref_diff:.2e}) is within physics tolerance (1e-5)"
+                )
                 print("  ✓ Results are acceptable for physics simulation")
                 reference_match = True
             else:
@@ -297,17 +334,19 @@ def main():
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Implementation: graupel_native_transposed (fused q_t_update)")
+    print("Implementation: graupel_native_transposed (fused q_t_update)")
     print(f"Grid size:      {ncells} cells x {nlev} levels")
     print(f"Timing (no transpose):   {time_native:.2f} ms")
     print(f"Timing (with transpose): {time_e2e:.2f} ms  (overhead: {transpose_overhead:.2f} ms)")
     print()
     print("Validation:")
-    print(f"  vs baseline:  {'✓ PASS' if baseline_match else '✗ FAIL'} (max diff: {max_diff_baseline:.2e})")
+    print(
+        f"  vs baseline:  {'✓ PASS' if baseline_match else '✗ FAIL'} (max diff: {max_diff_baseline:.2e})"
+    )
     if reference_match is not None:
         print(f"  vs reference: {'✓ PASS' if reference_match else '✗ FAIL'}")
     else:
-        print(f"  vs reference: (not tested)")
+        print("  vs reference: (not tested)")
     print()
 
     if baseline_match and (reference_match is None or reference_match):

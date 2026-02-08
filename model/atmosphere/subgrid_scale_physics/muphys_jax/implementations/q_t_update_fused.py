@@ -97,16 +97,16 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     y_sn = jnp.exp(N0S2 * tc_sn)
     n0smn = jnp.maximum(N0S4 * y_sn, N0S5)
     n0smx = jnp.minimum(N0S6 * y_sn, N0S7)
-    n_snow = lax.select(q.s > qmin, jnp.minimum(n0smx, jnp.maximum(n0smn, n0s_val)), jnp.full_like(t, N0S0))
+    n_snow = lax.select(
+        q.s > qmin, jnp.minimum(n0smx, jnp.maximum(n0smn, n0s_val)), jnp.full_like(t, N0S0)
+    )
 
     # Snow lambda
     A2_LAM = const.ams * 2.0
     LMD_0 = 1.0e10
     BX_LAM = 1.0 / (const.bms + 1.0)
     l_snow = lax.select(
-        q.s > qmin,
-        lax.pow(A2_LAM * n_snow / (q.s * rho + 1e-30), BX_LAM),
-        jnp.full_like(t, LMD_0)
+        q.s > qmin, lax.pow(A2_LAM * n_snow / (q.s * rho + 1e-30), BX_LAM), jnp.full_like(t, LMD_0)
     )
 
     # ============================================================
@@ -128,7 +128,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     TCRIT = tmelt - 85.0
     x_ice = jnp.maximum(
         jnp.maximum(jnp.minimum(jnp.exp(A_FREEZ * (t - tmelt)), B_MAX_EXP), EFF_MIN),
-        EFF_FAC * (t - TCRIT)
+        EFF_FAC * (t - TCRIT),
     )
 
     # Deposition factor
@@ -140,7 +140,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     eta = lax.select(
         t_below_tmelt & is_sig_present,
         x_df / (1.0 + A_DF * x_df * qvsi / (t * t)),
-        jnp.zeros_like(t)
+        jnp.zeros_like(t),
     )
 
     # ============================================================
@@ -190,9 +190,9 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
         (q.r > qmin) & (dvsw + q.c <= 0.0),
         jnp.minimum(
             A1_RV * (A2_RV + A3_RV * lax.pow(qr_rho, B1_RV)) * (-dvsw) * lax.pow(qr_rho, B2_RV),
-            evap_max
+            evap_max,
         ),
-        zero
+        zero,
     )
 
     # --- Cloud x Ice (freezing/melting) ---
@@ -208,7 +208,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     sx2x_c_s = lax.select(
         (jnp.minimum(q.c, q.s) > qmin) & (t > tfrz_hom),
         C_RIM_CS * n_snow * q.c * lax.pow(l_snow, B_RIM_CS),
-        zero
+        zero,
     )
 
     # --- Cloud to Graupel (riming) ---
@@ -217,7 +217,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     sx2x_c_g = lax.select(
         (jnp.minimum(q.c, q.g) > qmin) & (t > tfrz_hom),
         A_RIM_CG * q.c * lax.pow(q.g * rho + 1e-30, B_RIM_CG),
-        zero
+        zero,
     )
 
     # --- Vapor x Ice (deposition/sublimation) ---
@@ -229,7 +229,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     vi_raw = lax.select(
         vi_raw > 0.0,
         jnp.minimum(vi_raw, dvsi / dt),
-        jnp.maximum(jnp.maximum(vi_raw, dvsi / dt), -q.i / dt)
+        jnp.maximum(jnp.maximum(vi_raw, dvsi / dt), -q.i / dt),
     )
     sx2x_v_i_base = lax.select((q.i > qmin) & t_below_tmelt & is_sig_present, vi_raw, zero)
     sx2x_i_v = lax.select(t_below_tmelt & is_sig_present, -jnp.minimum(sx2x_v_i_base, 0.0), zero)
@@ -239,9 +239,10 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
 
     # --- Ice deposition nucleation ---
     sx2x_v_i_nuc = lax.select(
-        (q.i <= qmin) & (((t < tfrz_het2) & (dvsi > 0.0)) | ((t <= const.tfrz_het1) & (q.c > qmin))),
+        (q.i <= qmin)
+        & (((t < tfrz_het2) & (dvsi > 0.0)) | ((t <= const.tfrz_het1) & (q.c > qmin))),
         jnp.minimum(const.m0_ice * n_ice, jnp.maximum(0.0, dvsi)) / dt,
-        zero
+        zero,
     )
     sx2x_v_i = lax.select(t_below_tmelt, sx2x_v_i_pos + sx2x_v_i_nuc, zero)
 
@@ -251,8 +252,10 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     XCRIT = 1.0
     dac = lax.select(
         q.i > qmin,
-        jnp.maximum(0.0, ice_dep) * B_DEP / (lax.pow(M0_S / (m_ice + 1e-30), B_DEP) - XCRIT + 1e-30),
-        zero
+        jnp.maximum(0.0, ice_dep)
+        * B_DEP
+        / (lax.pow(M0_S / (m_ice + 1e-30), B_DEP) - XCRIT + 1e-30),
+        zero,
     )
 
     # --- Ice to Snow ---
@@ -262,8 +265,13 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_AGG_IS = -(const.v1s + 3.0)
     sx2x_i_s = lax.select(
         t_below_tmelt & is_sig_present & (q.i > qmin),
-        x_ice * (dac + C_IAU * jnp.maximum(0.0, q.i - QI0) + q.i * C_AGG_IS * n_snow * lax.pow(l_snow, B_AGG_IS)),
-        zero
+        x_ice
+        * (
+            dac
+            + C_IAU * jnp.maximum(0.0, q.i - QI0)
+            + q.i * C_AGG_IS * n_snow * lax.pow(l_snow, B_AGG_IS)
+        ),
+        zero,
     )
 
     # --- Ice to Graupel ---
@@ -274,12 +282,10 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     ig_agg = lax.select(
         (q.i > qmin) & (q.g > qmin),
         x_ice * q.i * C_AGG_IG * lax.pow(rho * q.g + 1e-30, B_AGG_IG),
-        zero
+        zero,
     )
     ig_coll = lax.select(
-        (q.i > qmin) & (q.r > qmin),
-        A_CT_IG * q.i * lax.pow(rho * q.r + 1e-30, B_CT_IG),
-        zero
+        (q.i > qmin) & (q.r > qmin), A_CT_IG * q.i * lax.pow(rho * q.r + 1e-30, B_CT_IG), zero
     )
     sx2x_i_g = lax.select(t_below_tmelt & is_sig_present, ig_agg + ig_coll, zero)
 
@@ -289,7 +295,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     sx2x_s_g = lax.select(
         (jnp.minimum(q.c, q.s) > qmin) & (t > tfrz_hom) & t_below_tmelt & is_sig_present,
         A_RIM_SG * q.c * lax.pow(q.s * rho + 1e-30, B_RIM_SG),
-        zero
+        zero,
     )
 
     # --- Rain to Graupel ---
@@ -309,15 +315,17 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     rg_imm = lax.select(
         mask_rg & (t > tfrz_hom) & maskinner_rg,
         (jnp.exp(C2_RG * (TFRZ_RAIN - t)) - C3_RG) * A1_RG * lax.pow(q.r * rho + 1e-30, B1_RG),
-        zero
+        zero,
     )
     rg_hom = lax.select(mask_rg & (t <= tfrz_hom), q.r / dt, zero)
     rg_coll = lax.select(
         (jnp.minimum(q.i, q.r) > qmin) & (q.s > QS_CRIT),
         A2_RG * (q.i / (m_ice + 1e-30)) * lax.pow(rho * q.r + 1e-30, B2_RG),
-        zero
+        zero,
     )
-    sx2x_r_g = lax.select(t_below_tmelt & is_sig_present, jnp.maximum(rg_imm, rg_hom) + rg_coll, zero)
+    sx2x_r_g = lax.select(
+        t_below_tmelt & is_sig_present, jnp.maximum(rg_imm, rg_hom) + rg_coll, zero
+    )
 
     # --- Vapor x Snow ---
     NU_VS = 1.75e-5
@@ -333,7 +341,12 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     C3_VS = 0.28003
     C4_VS = -0.146293e-6
 
-    vs_cold = (CNX_VS * n_snow * eta / rho) * (A0_VS + A1_VS * lax.pow(l_snow, A2_VS)) * dvsi / (l_snow * l_snow + EPS_VS)
+    vs_cold = (
+        (CNX_VS * n_snow * eta / rho)
+        * (A0_VS + A1_VS * lax.pow(l_snow, A2_VS))
+        * dvsi
+        / (l_snow * l_snow + EPS_VS)
+    )
     vs_cold = lax.select(vs_cold > 0.0, jnp.minimum(vs_cold, dvsi / dt - ice_dep), vs_cold)
     vs_cold = lax.select(q.s <= QS_LIM, jnp.minimum(vs_cold, 0.0), vs_cold)
 
@@ -341,11 +354,11 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     vs_mid = (C3_VS + C4_VS * p) * dvsw * lax.pow(q.s * rho + 1e-30, B_VS)
 
     sx2x_v_s_raw = lax.select(
-        t < tmelt,
-        vs_cold,
-        lax.select(t > (tmelt - const.tx * dvsw0), vs_warm, vs_mid)
+        t < tmelt, vs_cold, lax.select(t > (tmelt - const.tx * dvsw0), vs_warm, vs_mid)
     )
-    sx2x_v_s_raw = lax.select((q.s > qmin) & is_sig_present, jnp.maximum(sx2x_v_s_raw, -q.s / dt), zero)
+    sx2x_v_s_raw = lax.select(
+        (q.s > qmin) & is_sig_present, jnp.maximum(sx2x_v_s_raw, -q.s / dt), zero
+    )
     sx2x_s_v = lax.select(is_sig_present, -jnp.minimum(sx2x_v_s_raw, 0.0), zero)
     sx2x_v_s = lax.select(is_sig_present, jnp.maximum(sx2x_v_s_raw, 0.0), zero)
 
@@ -367,11 +380,11 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     vg_mid = (A7_VG + A8_VG * p) * dvsw * qg_pow
 
     sx2x_v_g_raw = lax.select(
-        t < tmelt,
-        vg_cold,
-        lax.select(t > (tmelt - const.tx * dvsw0), vg_warm, vg_mid)
+        t < tmelt, vg_cold, lax.select(t > (tmelt - const.tx * dvsw0), vg_warm, vg_mid)
     )
-    sx2x_v_g_raw = lax.select((q.g > qmin) & is_sig_present, jnp.maximum(sx2x_v_g_raw, -q.g / dt), zero)
+    sx2x_v_g_raw = lax.select(
+        (q.g > qmin) & is_sig_present, jnp.maximum(sx2x_v_g_raw, -q.g / dt), zero
+    )
     sx2x_g_v = lax.select(is_sig_present, -jnp.minimum(sx2x_v_g_raw, 0.0), zero)
     sx2x_v_g = lax.select(is_sig_present, jnp.maximum(sx2x_v_g_raw, 0.0), zero)
 
@@ -383,7 +396,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     sx2x_s_r = lax.select(
         (t > jnp.maximum(tmelt, tmelt - const.tx * dvsw0)) & (q.s > qmin) & is_sig_present,
         (C1_SR / p + C2_SR) * (t - tmelt + A_SR * dvsw0) * lax.pow(q.s * rho + 1e-30, B_SR),
-        zero
+        zero,
     )
 
     # --- Graupel to Rain (melting) ---
@@ -394,7 +407,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     sx2x_g_r = lax.select(
         (t > jnp.maximum(tmelt, tmelt - const.tx * dvsw0)) & (q.g > qmin) & is_sig_present,
         (C1_MELT / p + C2_MELT) * (t - tmelt + A_MELT * dvsw0) * lax.pow(q.g * rho + 1e-30, B_MELT),
-        zero
+        zero,
     )
 
     # ============================================================
@@ -500,17 +513,25 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     qtot_new = qv_new + qice_new + qliq_new
 
     # Heat capacity: cv = cvd + (cvv - cvd) * qtot + (clw - cvv) * qliq + (ci - cvv) * qice
-    cv = const.cvd + (const.cvv - const.cvd) * qtot_new + (const.clw - const.cvv) * qliq_new + (const.ci - const.cvv) * qice_new
+    cv = (
+        const.cvd
+        + (const.cvv - const.cvd) * qtot_new
+        + (const.clw - const.cvv) * qliq_new
+        + (const.ci - const.cvv) * qice_new
+    )
 
     # Temperature change from phase transitions
     # dT = dt * ((dqdt_c + dqdt_r) * (lvc - (clw - cvv) * t) + (dqdt_i + dqdt_s + dqdt_g) * (lsc - (ci - cvv) * t)) / cv
     t_new = lax.select(
         mask,
-        t + dt * (
+        t
+        + dt
+        * (
             (dqdt_c + dqdt_r) * (const.lvc - (const.clw - const.cvv) * t)
             + (dqdt_i + dqdt_s + dqdt_g) * (const.lsc - (const.ci - const.cvv) * t)
-        ) / cv,
-        t
+        )
+        / cv,
+        t,
     )
 
     q_out = Q(v=qv_new, c=qc_new, r=qr_new, s=qs_new, i=qi_new, g=qg_new)

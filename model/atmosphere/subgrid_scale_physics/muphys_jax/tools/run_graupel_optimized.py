@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Driver script to benchmark graupel implementations with HLO injection support.
 
@@ -30,16 +38,19 @@ Usage:
 """
 
 import argparse
-import sys
 import pathlib
+import sys
 import time
 
 import jax
+
+
 # Enable x64 before any JAX operations
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
+
 
 # Add parent to path for imports
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.parent.parent))
@@ -63,19 +74,19 @@ def load_hlo_module(hlo_path: str):
     """
     path = pathlib.Path(hlo_path)
 
-    if path.suffix == '.serialized':
-        with open(path, 'rb') as f:
+    if path.suffix == ".serialized":
+        with open(path, "rb") as f:
             return f.read()
-    elif path.suffix in ('.hlo', '.stablehlo', '.txt'):
-        with open(path, 'r') as f:
+    elif path.suffix in (".hlo", ".stablehlo", ".txt"):
+        with open(path) as f:
             return f.read()
     else:
         # Try as text first
         try:
-            with open(path, 'r') as f:
+            with open(path) as f:
                 return f.read()
         except UnicodeDecodeError:
-            with open(path, 'rb') as f:
+            with open(path, "rb") as f:
                 return f.read()
 
 
@@ -95,6 +106,7 @@ def compile_hlo_text(hlo_text: str, platform: str = "cuda"):
     except (AttributeError, ModuleNotFoundError):
         # Fallback for older JAX versions
         from jax.lib import xla_bridge
+
         client = xla_bridge.get_backend(backend_name)
 
     devices = client.local_devices()[:1]
@@ -111,9 +123,13 @@ def compile_hlo_text(hlo_text: str, platform: str = "cuda"):
     return loaded, client
 
 
-def benchmark_hlo_direct(hlo_path: str, input_file: str,
-                         num_warmup: int = 3, num_runs: int = 10,
-                         transposed: bool = False):
+def benchmark_hlo_direct(
+    hlo_path: str,
+    input_file: str,
+    num_warmup: int = 3,
+    num_runs: int = 10,
+    transposed: bool = False,
+):
     """
     Benchmark an HLO/StableHLO file directly using XLA client (most accurate).
 
@@ -129,7 +145,6 @@ def benchmark_hlo_direct(hlo_path: str, input_file: str,
         num_runs: Number of benchmark runs
         transposed: If True, transpose inputs to nlev×ncells layout (for optimized HLO)
     """
-    from muphys_jax.core.definitions import Q
     from muphys_jax.core.common import constants as const
 
     print("=" * 80)
@@ -228,7 +243,9 @@ def benchmark_hlo_direct(hlo_path: str, input_file: str,
     num_outliers = np.sum(outliers)
 
     # Print summary
-    print(f"\n  Min: {min_time:.2f} ms, Max: {max_time:.2f} ms, Median: {median_time:.2f} ms, Mean: {mean_time:.2f} ms")
+    print(
+        f"\n  Min: {min_time:.2f} ms, Max: {max_time:.2f} ms, Median: {median_time:.2f} ms, Mean: {mean_time:.2f} ms"
+    )
     print(f"  Total time for {num_runs} runs: {total_elapsed:.3f} s")
     if num_outliers > 0:
         print(f"  ⚠ WARNING: {num_outliers}/{num_runs} runs were outliers (>1.5x median)")
@@ -239,7 +256,7 @@ def benchmark_hlo_direct(hlo_path: str, input_file: str,
     print(f"HLO file:   {hlo_path}")
     print(f"Grid size:  {ncells} cells × {nlev} levels")
     print(f"Layout:     {'transposed (nlev×ncells)' if transposed else 'original (ncells×nlev)'}")
-    print(f"\nExecution time (ms):")
+    print("\nExecution time (ms):")
     print(f"  Mean:      {mean_time:.2f} ± {std_time:.2f}")
     print(f"  Median:    {median_time:.2f}  ← use this for stable performance")
     print(f"  Min:       {min_time:.2f}")
@@ -247,9 +264,9 @@ def benchmark_hlo_direct(hlo_path: str, input_file: str,
     print(f"  95th %ile: {p95_time:.2f}")
     print(f"  99th %ile: {p99_time:.2f}")
     if num_outliers > 0:
-        print(f"\nOutlier Analysis:")
+        print("\nOutlier Analysis:")
         print(f"  {num_outliers}/{num_runs} runs exceeded 1.5x median ({median_time*1.5:.2f} ms)")
-        print(f"  This indicates GPU throttling or context switching")
+        print("  This indicates GPU throttling or context switching")
         print(f"  → Use MEDIAN ({median_time:.2f} ms) as reliable performance metric")
 
     # Transpose outputs back if needed
@@ -259,8 +276,9 @@ def benchmark_hlo_direct(hlo_path: str, input_file: str,
     return np.mean(times), np.std(times), results
 
 
-def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs: int = 10,
-                                   optimized_hlo: str = None):
+def run_graupel_native_transposed(
+    input_file: str, num_warmup: int = 3, num_runs: int = 10, optimized_hlo: str = None
+):
     """
     Run graupel with NATIVE TRANSPOSED layout - ZERO transposes during computation.
 
@@ -270,8 +288,8 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     When optimized_hlo is provided, injects the transposed HLO for 2x speedup.
     """
     from muphys_jax.core.definitions import Q
+    from muphys_jax.core.optimized_precip import configure_optimized_precip
     from muphys_jax.implementations.graupel_native_transposed import graupel_run_native_transposed
-    from muphys_jax.core.optimized_precip import configure_optimized_precip, is_optimized_enabled
 
     print("=" * 80)
     print("RUNNING GRAUPEL - MODE: NATIVE-TRANSPOSED")
@@ -310,9 +328,9 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     jax.block_until_ready((dz_t, t_t, p_t, rho_t, qnc_t, q_t))
     print(f"  Data transposed: ({nlev}, {ncells}) = {dz_t.shape}")
 
-    print(f"\nImplementation: graupel_native_transposed")
+    print("\nImplementation: graupel_native_transposed")
     print(f"Grid: {ncells} cells × {nlev} levels")
-    print(f"Layout: TRANSPOSED (nlev×ncells) - ZERO transposes during computation")
+    print("Layout: TRANSPOSED (nlev×ncells) - ZERO transposes during computation")
 
     # Warmup
     print(f"\nWarming up ({num_warmup} runs)...")
@@ -368,10 +386,11 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     precip_jit = jax.jit(precipitation_effects_native_transposed, static_argnums=(0,))
 
     # Warmup precipitation_effects
-    print(f"  Warming up isolated precipitation_effects...")
+    print("  Warming up isolated precipitation_effects...")
     for _ in range(max(num_warmup, 10)):
-        precip_result = precip_jit(last_level, kmin_r, kmin_i, kmin_s, kmin_g,
-                                    q_updated, t_updated, rho_t, dz_t, dt)
+        precip_result = precip_jit(
+            last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho_t, dz_t, dt
+        )
         jax.block_until_ready(precip_result)
 
     # Benchmark isolated precipitation_effects
@@ -379,8 +398,9 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     precip_times = []
     for i in range(num_runs):
         start = time.perf_counter()
-        precip_result = precip_jit(last_level, kmin_r, kmin_i, kmin_s, kmin_g,
-                                    q_updated, t_updated, rho_t, dz_t, dt)
+        precip_result = precip_jit(
+            last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho_t, dz_t, dt
+        )
         jax.block_until_ready(precip_result)
         elapsed = time.perf_counter() - start
         precip_times.append(elapsed * 1000)
@@ -392,7 +412,7 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     precip_median = np.median(precip_times)
     precip_min = np.min(precip_times)
 
-    print(f"\n  Isolated precipitation_effects (NATIVE TRANSPOSED):")
+    print("\n  Isolated precipitation_effects (NATIVE TRANSPOSED):")
     print(f"    Median: {precip_median:.2f} ms")
     print(f"    Mean:   {precip_mean:.2f} ms")
     print(f"    Min:    {precip_min:.2f} ms")
@@ -404,16 +424,16 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     print("\n" + "=" * 80)
     print("RESULTS")
     print("=" * 80)
-    print(f"Implementation: graupel_native_transposed")
+    print("Implementation: graupel_native_transposed")
     print(f"Optimized HLO:  {optimized_hlo if optimized_hlo else 'None (pure JAX)'}")
-    print(f"Layout:         TRANSPOSED (nlev×ncells) - ZERO transposes during computation")
+    print("Layout:         TRANSPOSED (nlev×ncells) - ZERO transposes during computation")
     print(f"Grid size:      {ncells} cells × {nlev} levels")
-    print(f"\nFull Graupel Timing (ms):")
+    print("\nFull Graupel Timing (ms):")
     print(f"  Mean:   {mean_time:.2f} ± {std_time:.2f}")
     print(f"  Min:    {min_time:.2f}")
     print(f"  Max:    {max_time:.2f}")
     print(f"  Median: {median_time:.2f}")
-    print(f"\nIsolated precipitation_effects (ms):")
+    print("\nIsolated precipitation_effects (ms):")
     print(f"  Median: {precip_median:.2f} ({precip_median/median_time*100:.1f}% of full graupel)")
 
     # Check output shapes (should be nlev, ncells)
@@ -426,8 +446,14 @@ def run_graupel_native_transposed(input_file: str, num_warmup: int = 3, num_runs
     return mean_time, std_time, result
 
 
-def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
-                num_warmup: int = 3, num_runs: int = 10, transposed: bool = False):
+def run_graupel(
+    mode: str,
+    optimized_hlo: str = None,
+    input_file: str = None,
+    num_warmup: int = 3,
+    num_runs: int = 10,
+    transposed: bool = False,
+):
     """Run graupel with or without optimization."""
     from muphys_jax.core.common import constants as const
 
@@ -444,7 +470,10 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     # Configure optimization if requested
     if optimized_hlo:
         from muphys_jax.core.optimized_precip import configure_optimized_precip
-        configure_optimized_precip(hlo_path=optimized_hlo, use_optimized=True, transposed=transposed)
+
+        configure_optimized_precip(
+            hlo_path=optimized_hlo, use_optimized=True, transposed=transposed
+        )
         layout = "transposed" if transposed else "original"
         print(f"✓ Configured optimized HLO: {optimized_hlo} [{layout}]")
 
@@ -454,9 +483,9 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     # Select implementation
     if mode == "baseline":
         from muphys_jax.implementations.graupel_baseline import graupel_run
+
         impl_name = "graupel_baseline"
     elif mode == "native-transposed":
-        from muphys_jax.implementations.graupel_native_transposed import graupel_run_native_transposed
         impl_name = "graupel_native_transposed"
         # This mode requires special handling - return early with custom benchmark
         return run_graupel_native_transposed(input_file, num_warmup, num_runs, optimized_hlo)
@@ -517,10 +546,11 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     precip_jit = jax.jit(precipitation_effects, static_argnums=(0,))
 
     # Warmup precipitation_effects
-    print(f"  Warming up isolated precipitation_effects...")
+    print("  Warming up isolated precipitation_effects...")
     for _ in range(max(num_warmup, 10)):
-        precip_result = precip_jit(last_level, kmin_r, kmin_i, kmin_s, kmin_g,
-                                    q_updated, t_updated, rho, dz, dt)
+        precip_result = precip_jit(
+            last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt
+        )
         jax.block_until_ready(precip_result)
 
     # Benchmark isolated precipitation_effects
@@ -528,8 +558,9 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     precip_times = []
     for i in range(num_runs):
         start = time.perf_counter()
-        precip_result = precip_jit(last_level, kmin_r, kmin_i, kmin_s, kmin_g,
-                                    q_updated, t_updated, rho, dz, dt)
+        precip_result = precip_jit(
+            last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt
+        )
         jax.block_until_ready(precip_result)
         elapsed = time.perf_counter() - start
         precip_times.append(elapsed * 1000)
@@ -541,7 +572,7 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     precip_median = np.median(precip_times)
     precip_min = np.min(precip_times)
 
-    print(f"\n  Isolated precipitation_effects (JAX baseline):")
+    print("\n  Isolated precipitation_effects (JAX baseline):")
     print(f"    Median: {precip_median:.2f} ms")
     print(f"    Mean:   {precip_mean:.2f} ms")
     print(f"    Min:    {precip_min:.2f} ms")
@@ -559,10 +590,11 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
         precip_opt_jit = jax.jit(precipitation_effects_optimized, static_argnums=(0,))
 
         # Warmup
-        print(f"  Warming up isolated OPTIMIZED precipitation_effects...")
+        print("  Warming up isolated OPTIMIZED precipitation_effects...")
         for _ in range(max(num_warmup, 10)):
-            precip_opt_result = precip_opt_jit(last_level, kmin_r, kmin_i, kmin_s, kmin_g,
-                                                q_updated, t_updated, rho, dz, dt)
+            precip_opt_result = precip_opt_jit(
+                last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt
+            )
             jax.block_until_ready(precip_opt_result)
 
         # Benchmark
@@ -570,8 +602,9 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
         precip_opt_times = []
         for i in range(num_runs):
             start = time.perf_counter()
-            precip_opt_result = precip_opt_jit(last_level, kmin_r, kmin_i, kmin_s, kmin_g,
-                                                q_updated, t_updated, rho, dz, dt)
+            precip_opt_result = precip_opt_jit(
+                last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt
+            )
             jax.block_until_ready(precip_opt_result)
             elapsed = time.perf_counter() - start
             precip_opt_times.append(elapsed * 1000)
@@ -582,7 +615,7 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
         precip_opt_median = np.median(precip_opt_times)
 
         speedup = precip_median / precip_opt_median
-        print(f"\n  Isolated precipitation_effects (OPTIMIZED):")
+        print("\n  Isolated precipitation_effects (OPTIMIZED):")
         print(f"    Median: {precip_opt_median:.2f} ms")
         print(f"    Speedup vs baseline: {speedup:.2f}x")
 
@@ -595,17 +628,17 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     print(f"Implementation: {impl_name}")
     print(f"Optimized HLO:  {optimized_hlo if optimized_hlo else 'None'}")
     print(f"Grid size:      {ncells} cells × {nlev} levels")
-    print(f"\nFull Graupel Timing (ms):")
+    print("\nFull Graupel Timing (ms):")
     print(f"  Mean:   {mean_time:.2f} ± {std_time:.2f}")
     print(f"  Min:    {min_time:.2f}")
     print(f"  Max:    {max_time:.2f}")
     print(f"  Median: {median_time:.2f}")
-    print(f"\nIsolated precipitation_effects (ms):")
+    print("\nIsolated precipitation_effects (ms):")
     print(f"  Median: {precip_median:.2f} ({precip_median/median_time*100:.1f}% of full graupel)")
 
     # Check output shapes
     t_out, q_out, pflx, pr, ps, pi, pg, pre = result
-    print(f"\nOutput shapes:")
+    print("\nOutput shapes:")
     print(f"  t_out: {t_out.shape}")
     print(f"  q.v:   {q_out.v.shape}")
     print(f"  pflx:  {pflx.shape}")
@@ -613,8 +646,13 @@ def run_graupel(mode: str, optimized_hlo: str = None, input_file: str = None,
     return mean_time, std_time, result
 
 
-def compare_hlo_files(input_file: str, hlo_files: list, num_warmup: int = 3, num_runs: int = 10,
-                      transposed: bool = False):
+def compare_hlo_files(
+    input_file: str,
+    hlo_files: list,
+    num_warmup: int = 3,
+    num_runs: int = 10,
+    transposed: bool = False,
+):
     """Compare multiple HLO files directly."""
     print("=" * 80)
     print("COMPARING HLO FILES (direct execution)")
@@ -629,10 +667,11 @@ def compare_hlo_files(input_file: str, hlo_files: list, num_warmup: int = 3, num
             mean, std, _ = benchmark_hlo_direct(
                 hlo_file, input_file, num_warmup, num_runs, transposed=transposed
             )
-            results[hlo_file] = {'mean': mean, 'std': std}
+            results[hlo_file] = {"mean": mean, "std": std}
         except Exception as e:
             print(f"ERROR benchmarking {hlo_file}: {e}")
             import traceback
+
             traceback.print_exc()
             results[hlo_file] = None
 
@@ -647,8 +686,8 @@ def compare_hlo_files(input_file: str, hlo_files: list, num_warmup: int = 3, num
         if result is None:
             print(f"{name:45s}: FAILED")
         else:
-            mean = result['mean']
-            std = result['std']
+            mean = result["mean"]
+            std = result["std"]
 
             if baseline_time is None:
                 baseline_time = mean
@@ -665,8 +704,14 @@ def compare_hlo_files(input_file: str, hlo_files: list, num_warmup: int = 3, num
     return results
 
 
-def compare_modes(input_file: str, optimized_hlo: str = None, mode: str = "baseline",
-                  num_warmup: int = 3, num_runs: int = 10, transposed: bool = False):
+def compare_modes(
+    input_file: str,
+    optimized_hlo: str = None,
+    mode: str = "baseline",
+    num_warmup: int = 3,
+    num_runs: int = 10,
+    transposed: bool = False,
+):
     """Compare optimized vs unoptimized."""
     print("=" * 80)
     print("COMPARISON: OPTIMIZED vs BASELINE")
@@ -677,15 +722,23 @@ def compare_modes(input_file: str, optimized_hlo: str = None, mode: str = "basel
     # Run without optimization
     print("\n[1/2] Running baseline (no optimization)...")
     time_baseline, std_baseline, result_baseline = run_graupel(
-        mode=mode, optimized_hlo=None, input_file=input_file,
-        num_warmup=num_warmup, num_runs=num_runs, transposed=False
+        mode=mode,
+        optimized_hlo=None,
+        input_file=input_file,
+        num_warmup=num_warmup,
+        num_runs=num_runs,
+        transposed=False,
     )
 
     # Run with optimization
     print("\n[2/2] Running with optimization...")
     time_optimized, std_optimized, result_optimized = run_graupel(
-        mode=mode, optimized_hlo=optimized_hlo, input_file=input_file,
-        num_warmup=num_warmup, num_runs=num_runs, transposed=transposed
+        mode=mode,
+        optimized_hlo=optimized_hlo,
+        input_file=input_file,
+        num_warmup=num_warmup,
+        num_runs=num_runs,
+        transposed=transposed,
     )
 
     # Compare
@@ -745,27 +798,35 @@ Implementation modes:
     baseline          - Original graupel with (ncells, nlev) layout
     native-transposed - Data pre-transposed ONCE, then ZERO transposes during computation
                         Best performance - all computation in (nlev, ncells) layout (~32ms)
-"""
+""",
     )
-    parser.add_argument('--input', '-i', required=True, help='Input netCDF file')
-    parser.add_argument('--optimized-hlo', type=str,
-                       help='Path to optimized HLO file (.hlo or .serialized)')
-    parser.add_argument('--mode', '-m', choices=['baseline', 'native-transposed'],
-                       default='native-transposed', help='Implementation mode (baseline, native-transposed)')
-    parser.add_argument('--compare', action='store_true',
-                       help='Compare optimized vs baseline (full graupel)')
-    parser.add_argument('--hlo-direct', type=str,
-                       help='Benchmark HLO file directly (no JAX overhead)')
-    parser.add_argument('--compare-hlo', nargs='+',
-                       help='Compare multiple HLO files directly')
-    parser.add_argument('--transposed', action='store_true',
-                       help='Use transposed layout (nlev×ncells) for HLO - 2x faster on GPU. '
-                            'Use with both --hlo-direct and --optimized-hlo when the HLO '
-                            'was exported with transposed layout.')
-    parser.add_argument('--num-warmup', type=int, default=3,
-                       help='Number of warmup runs')
-    parser.add_argument('--num-runs', type=int, default=10,
-                       help='Number of benchmark runs')
+    parser.add_argument("--input", "-i", required=True, help="Input netCDF file")
+    parser.add_argument(
+        "--optimized-hlo", type=str, help="Path to optimized HLO file (.hlo or .serialized)"
+    )
+    parser.add_argument(
+        "--mode",
+        "-m",
+        choices=["baseline", "native-transposed"],
+        default="native-transposed",
+        help="Implementation mode (baseline, native-transposed)",
+    )
+    parser.add_argument(
+        "--compare", action="store_true", help="Compare optimized vs baseline (full graupel)"
+    )
+    parser.add_argument(
+        "--hlo-direct", type=str, help="Benchmark HLO file directly (no JAX overhead)"
+    )
+    parser.add_argument("--compare-hlo", nargs="+", help="Compare multiple HLO files directly")
+    parser.add_argument(
+        "--transposed",
+        action="store_true",
+        help="Use transposed layout (nlev×ncells) for HLO - 2x faster on GPU. "
+        "Use with both --hlo-direct and --optimized-hlo when the HLO "
+        "was exported with transposed layout.",
+    )
+    parser.add_argument("--num-warmup", type=int, default=3, help="Number of warmup runs")
+    parser.add_argument("--num-runs", type=int, default=10, help="Number of benchmark runs")
 
     args = parser.parse_args()
 
@@ -777,24 +838,35 @@ Implementation modes:
 
     if args.compare_hlo:
         # Compare multiple HLO files directly
-        compare_hlo_files(args.input, args.compare_hlo,
-                         args.num_warmup, args.num_runs,
-                         transposed=args.transposed)
+        compare_hlo_files(
+            args.input, args.compare_hlo, args.num_warmup, args.num_runs, transposed=args.transposed
+        )
     elif args.hlo_direct:
         # Benchmark single HLO file directly
-        benchmark_hlo_direct(args.hlo_direct, args.input,
-                            args.num_warmup, args.num_runs,
-                            transposed=args.transposed)
+        benchmark_hlo_direct(
+            args.hlo_direct, args.input, args.num_warmup, args.num_runs, transposed=args.transposed
+        )
     elif args.compare:
         if not args.optimized_hlo:
             print("ERROR: --compare requires --optimized-hlo")
             sys.exit(1)
-        compare_modes(args.input, args.optimized_hlo, args.mode,
-                     args.num_warmup, args.num_runs, transposed=args.transposed)
+        compare_modes(
+            args.input,
+            args.optimized_hlo,
+            args.mode,
+            args.num_warmup,
+            args.num_runs,
+            transposed=args.transposed,
+        )
     else:
-        run_graupel(args.mode, args.optimized_hlo, args.input,
-                   num_warmup=args.num_warmup, num_runs=args.num_runs,
-                   transposed=args.transposed)
+        run_graupel(
+            args.mode,
+            args.optimized_hlo,
+            args.input,
+            num_warmup=args.num_warmup,
+            num_runs=args.num_runs,
+            transposed=args.transposed,
+        )
 
     print("\n" + "=" * 80)
     print("DONE")
