@@ -21,23 +21,25 @@ import sys
 import tempfile
 from typing import Final
 
+
 # Configure JAX before any JAX imports
-os.environ.setdefault('JAX_ENABLE_X64', '1')
+os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import numpy as np
 import pytest
 
+
 # Add tools directory to path
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "tools"))
 from export_precip_transposed import export_precip_transposed_hlo
-from run_graupel_optimized import run_graupel
-
 from muphys_jax.utils.data_loading import load_graupel_reference
+from run_graupel_optimized import run_graupel
 
 
 @dataclasses.dataclass(frozen=True)
 class MuphysGraupelExperiment:
     """Configuration for a graupel microphysics test experiment."""
+
     name: str
     dt: float = 30.0
     qnc: float = 100.0
@@ -104,13 +106,27 @@ def test_graupel_hlo_injection(experiment: MuphysGraupelExperiment):
         rtol = 1e-14
         atol = 1e-16
 
-        np.testing.assert_allclose(np.array(t_out), ref["t"], rtol=rtol, atol=atol, err_msg="Temperature mismatch")
-        np.testing.assert_allclose(np.array(q_out.v), ref["qv"], rtol=rtol, atol=atol, err_msg="Water vapor mismatch")
-        np.testing.assert_allclose(np.array(q_out.c), ref["qc"], rtol=rtol, atol=atol, err_msg="Cloud water mismatch")
-        np.testing.assert_allclose(np.array(q_out.i), ref["qi"], rtol=rtol, atol=atol, err_msg="Ice mismatch")
-        np.testing.assert_allclose(np.array(q_out.r), ref["qr"], rtol=rtol, atol=atol, err_msg="Rain mismatch")
-        np.testing.assert_allclose(np.array(q_out.s), ref["qs"], rtol=rtol, atol=atol, err_msg="Snow mismatch")
-        np.testing.assert_allclose(np.array(q_out.g), ref["qg"], rtol=rtol, atol=atol, err_msg="Graupel mismatch")
+        np.testing.assert_allclose(
+            np.array(t_out), ref["t"], rtol=rtol, atol=atol, err_msg="Temperature mismatch"
+        )
+        np.testing.assert_allclose(
+            np.array(q_out.v), ref["qv"], rtol=rtol, atol=atol, err_msg="Water vapor mismatch"
+        )
+        np.testing.assert_allclose(
+            np.array(q_out.c), ref["qc"], rtol=rtol, atol=atol, err_msg="Cloud water mismatch"
+        )
+        np.testing.assert_allclose(
+            np.array(q_out.i), ref["qi"], rtol=rtol, atol=atol, err_msg="Ice mismatch"
+        )
+        np.testing.assert_allclose(
+            np.array(q_out.r), ref["qr"], rtol=rtol, atol=atol, err_msg="Rain mismatch"
+        )
+        np.testing.assert_allclose(
+            np.array(q_out.s), ref["qs"], rtol=rtol, atol=atol, err_msg="Snow mismatch"
+        )
+        np.testing.assert_allclose(
+            np.array(q_out.g), ref["qg"], rtol=rtol, atol=atol, err_msg="Graupel mismatch"
+        )
 
         print(f"\n✓ Full graupel with HLO injection matches reference for {experiment.name}")
 

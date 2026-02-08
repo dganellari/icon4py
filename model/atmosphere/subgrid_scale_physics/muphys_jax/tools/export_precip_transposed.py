@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Export precipitation_effects_native_transposed to StableHLO for optimization.
 
@@ -16,12 +24,12 @@ Usage:
 """
 
 import argparse
-import sys
 import pathlib
+import sys
 
 import jax
 import jax.numpy as jnp
-import numpy as np
+
 
 # Enable x64 precision for float64 support
 jax.config.update("jax_enable_x64", True)
@@ -29,8 +37,8 @@ jax.config.update("jax_enable_x64", True)
 # Add parent to path for imports
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.parent.parent))
 
-from muphys_jax.core.definitions import Q
 from muphys_jax.core.common import constants as const
+from muphys_jax.core.definitions import Q
 
 
 def load_precip_inputs_transposed(input_file: str = None, timestep: int = 0):
@@ -39,8 +47,10 @@ def load_precip_inputs_transposed(input_file: str = None, timestep: int = 0):
     if input_file:
         print(f"Loading inputs from: {input_file}")
         from muphys_jax.utils.data_loading import load_precip_inputs as _load_precip_inputs
-        last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt, ncells, nlev = \
+
+        last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt, ncells, nlev = (
             _load_precip_inputs(input_file, timestep)
+        )
 
         # Transpose from (ncells, nlev) to (nlev, ncells)
         kmin_r = jnp.transpose(kmin_r)
@@ -108,45 +118,61 @@ def export_precip_transposed_hlo(input_file=None, skip_compile=False, output_dir
 
     # Import the native transposed implementation
     from muphys_jax.implementations.graupel_native_transposed import (
-        _precipitation_effects_native_transposed_jax
+        _precipitation_effects_native_transposed_jax,
     )
 
     # Load inputs in transposed layout
-    last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt, ncells, nlev = \
+    last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt, ncells, nlev = (
         load_precip_inputs_transposed(input_file)
+    )
 
-    print(f"\nFunction: _precipitation_effects_native_transposed_jax")
+    print("\nFunction: _precipitation_effects_native_transposed_jax")
     print(f"  Layout: (nlev={nlev}, ncells={ncells})")
-    print(f"  Inputs: last_lev (scalar), kmin_r/i/s/g (bool), q (Q namedtuple), t, rho, dz, dt")
-    print(f"  Outputs: qr, qs, qi, qg, t_new, pflx_tot, pr, ps, pi, pg, eflx")
+    print("  Inputs: last_lev (scalar), kmin_r/i/s/g (bool), q (Q namedtuple), t, rho, dz, dt")
+    print("  Outputs: qr, qs, qi, qg, t_new, pflx_tot, pr, ps, pi, pg, eflx")
 
     # Create function with explicit array arguments (no closure captures)
     def precip_transposed_fn(
-        kmin_r_arg, kmin_i_arg, kmin_s_arg, kmin_g_arg,
-        q_v_arg, q_c_arg, q_r_arg, q_s_arg, q_i_arg, q_g_arg,
-        t_arg, rho_arg, dz_arg
+        kmin_r_arg,
+        kmin_i_arg,
+        kmin_s_arg,
+        kmin_g_arg,
+        q_v_arg,
+        q_c_arg,
+        q_r_arg,
+        q_s_arg,
+        q_i_arg,
+        q_g_arg,
+        t_arg,
+        rho_arg,
+        dz_arg,
     ):
         from muphys_jax.core.definitions import Q
+
         q_arg = Q(v=q_v_arg, c=q_c_arg, r=q_r_arg, s=q_s_arg, i=q_i_arg, g=q_g_arg)
         # last_lev and dt are constants baked into the HLO
         return _precipitation_effects_native_transposed_jax(
-            last_lev, kmin_r_arg, kmin_i_arg, kmin_s_arg, kmin_g_arg,
-            q_arg, t_arg, rho_arg, dz_arg, dt
+            last_lev,
+            kmin_r_arg,
+            kmin_i_arg,
+            kmin_s_arg,
+            kmin_g_arg,
+            q_arg,
+            t_arg,
+            rho_arg,
+            dz_arg,
+            dt,
         )
 
     print("\nLowering...")
     jitted = jax.jit(precip_transposed_fn)
 
     # Lower with concrete shapes (transposed: nlev×ncells)
-    lowered = jitted.lower(
-        kmin_r, kmin_i, kmin_s, kmin_g,
-        q.v, q.c, q.r, q.s, q.i, q.g,
-        t, rho, dz
-    )
+    lowered = jitted.lower(kmin_r, kmin_i, kmin_s, kmin_g, q.v, q.c, q.r, q.s, q.i, q.g, t, rho, dz)
 
     # Get StableHLO and HLO
     stablehlo_text = lowered.as_text()
-    hlo_text = lowered.as_text(dialect='hlo')
+    hlo_text = lowered.as_text(dialect="hlo")
 
     precision = "x64" if jax.config.jax_enable_x64 else "x32"
     out_path = pathlib.Path(output_dir)
@@ -156,14 +182,14 @@ def export_precip_transposed_hlo(input_file=None, skip_compile=False, output_dir
 
     # Save StableHLO
     stablehlo_file = out_path / f"{output_name}_{precision}_lowered.stablehlo"
-    with open(stablehlo_file, 'w') as f:
+    with open(stablehlo_file, "w") as f:
         f.write(stablehlo_text)
     print(f"✓ StableHLO: {stablehlo_file}")
     print(f"  Size: {len(stablehlo_text) / 1024 / 1024:.2f} MB")
 
     # Save HLO
     hlo_file = out_path / f"{output_name}_{precision}_lowered.hlo"
-    with open(hlo_file, 'w') as f:
+    with open(hlo_file, "w") as f:
         f.write(hlo_text)
     print(f"✓ HLO: {hlo_file}")
     print(f"  Size: {len(hlo_text) / 1024 / 1024:.2f} MB")
@@ -173,10 +199,10 @@ def export_precip_transposed_hlo(input_file=None, skip_compile=False, output_dir
     print("ANALYSIS")
     print("=" * 80)
 
-    while_count = stablehlo_text.count('stablehlo.while')
-    scan_count = hlo_text.count('while (')
-    dynamic_slice = stablehlo_text.count('dynamic_slice')
-    dynamic_update = stablehlo_text.count('dynamic_update')
+    while_count = stablehlo_text.count("stablehlo.while")
+    scan_count = hlo_text.count("while (")
+    dynamic_slice = stablehlo_text.count("dynamic_slice")
+    dynamic_update = stablehlo_text.count("dynamic_update")
 
     print(f"  While loops (StableHLO): {while_count}")
     print(f"  While loops (HLO):       {scan_count}")
@@ -193,15 +219,25 @@ def export_precip_transposed_hlo(input_file=None, skip_compile=False, output_dir
             # Quick correctness test
             print("\nRunning correctness test...")
             result = jitted(
-                kmin_r, kmin_i, kmin_s, kmin_g,
-                q.v, q.c, q.r, q.s, q.i, q.g,
-                t, rho, dz
+                kmin_r, kmin_i, kmin_s, kmin_g, q.v, q.c, q.r, q.s, q.i, q.g, t, rho, dz
             )
             print(f"✓ Execution successful, got {len(result)} outputs")
 
             # Verify output shapes are transposed
             print(f"\nOutput shapes (should be nlev×ncells = {nlev}×{ncells}):")
-            output_names = ['qr', 'qs', 'qi', 'qg', 't_new', 'pflx_tot', 'pr', 'ps', 'pi', 'pg', 'eflx']
+            output_names = [
+                "qr",
+                "qs",
+                "qi",
+                "qg",
+                "t_new",
+                "pflx_tot",
+                "pr",
+                "ps",
+                "pi",
+                "pg",
+                "eflx",
+            ]
             for name, arr in zip(output_names, result):
                 print(f"  {name}: {arr.shape}")
                 assert arr.shape == (nlev, ncells), f"Wrong shape for {name}!"
@@ -209,6 +245,7 @@ def export_precip_transposed_hlo(input_file=None, skip_compile=False, output_dir
         except Exception as e:
             print(f"⚠ Compilation/execution failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     # Print usage instructions
@@ -239,10 +276,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export precipitation_effects_native_transposed to StableHLO/HLO"
     )
-    parser.add_argument('--input', '-i', type=str, help='Input netCDF file')
-    parser.add_argument('--skip-compile', action='store_true', help='Skip compilation')
-    parser.add_argument('--output-dir', '-o', type=str, default='stablehlo',
-                       help='Output directory')
+    parser.add_argument("--input", "-i", type=str, help="Input netCDF file")
+    parser.add_argument("--skip-compile", action="store_true", help="Skip compilation")
+    parser.add_argument(
+        "--output-dir", "-o", type=str, default="stablehlo", help="Output directory"
+    )
 
     args = parser.parse_args()
 
@@ -252,9 +290,7 @@ def main():
     print()
 
     export_precip_transposed_hlo(
-        input_file=args.input,
-        skip_compile=args.skip_compile,
-        output_dir=args.output_dir
+        input_file=args.input, skip_compile=args.skip_compile, output_dir=args.output_dir
     )
 
     print("\n" + "=" * 80)

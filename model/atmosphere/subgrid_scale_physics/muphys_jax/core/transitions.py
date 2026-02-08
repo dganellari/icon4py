@@ -45,7 +45,9 @@ def cloud_to_rain(t, qc, qr, nc):
     phi = A_PHI * phi * (one_minus_phi * one_minus_phi * one_minus_phi)  # (1-phi)^3
     qc_ratio = qc * qc / nc
     one_minus_tau = 1.0 - tau
-    xau = AU_KERNEL * (qc_ratio * qc_ratio) * (1.0 + phi / (one_minus_tau * one_minus_tau))  # (qc^2/nc)^2, (1-tau)^2
+    xau = (
+        AU_KERNEL * (qc_ratio * qc_ratio) * (1.0 + phi / (one_minus_tau * one_minus_tau))
+    )  # (qc^2/nc)^2, (1-tau)^2
     tau_ratio = tau / (tau + C_PHI)
     tau_ratio_sq = tau_ratio * tau_ratio
     xac = AC_KERNEL * qc * qr * (tau_ratio_sq * tau_ratio_sq)

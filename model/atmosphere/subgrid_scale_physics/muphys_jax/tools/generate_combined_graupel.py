@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Combine q_t_update and precipitation_effects StableHLO into a single module.
 
@@ -39,9 +47,9 @@ Usage:
 """
 
 import argparse
+import pathlib
 import re
 import sys
-import pathlib
 
 
 def rename_main_function(stablehlo_text: str, new_name: str) -> str:
@@ -54,36 +62,34 @@ def rename_main_function(stablehlo_text: str, new_name: str) -> str:
     """
     # Replace function declaration
     text = re.sub(
-        r'func\.func\s+public\s+@main\s*\(',
-        f'func.func private @{new_name}(',
-        stablehlo_text
+        r"func\.func\s+public\s+@main\s*\(", f"func.func private @{new_name}(", stablehlo_text
     )
     # Replace any internal calls to @main
-    text = text.replace('func.call @main(', f'func.call @{new_name}(')
-    text = text.replace('@main', f'@{new_name}')
+    text = text.replace("func.call @main(", f"func.call @{new_name}(")
+    text = text.replace("@main", f"@{new_name}")
     return text
 
 
 def extract_function_body(stablehlo_text: str) -> str:
     """Extract everything between the module braces."""
     # Find the first { after module and the last }
-    lines = stablehlo_text.split('\n')
+    lines = stablehlo_text.split("\n")
     inside = []
     depth = 0
     in_module = False
 
     for line in lines:
-        if 'module' in line and '{' in line:
+        if "module" in line and "{" in line:
             in_module = True
             depth = 1
             continue
         if in_module:
-            depth += line.count('{') - line.count('}')
+            depth += line.count("{") - line.count("}")
             if depth <= 0:
                 break
             inside.append(line)
 
-    return '\n'.join(inside)
+    return "\n".join(inside)
 
 
 def parse_function_signature(stablehlo_text: str):
@@ -91,15 +97,13 @@ def parse_function_signature(stablehlo_text: str):
     # Find the func.func line(s) for @main
     # It may span multiple lines
     main_pattern = re.compile(
-        r'func\.func\s+(?:public\s+)?@main\s*\(([^)]*)\)\s*->\s*\(([^)]*)\)',
-        re.DOTALL
+        r"func\.func\s+(?:public\s+)?@main\s*\(([^)]*)\)\s*->\s*\(([^)]*)\)", re.DOTALL
     )
     match = main_pattern.search(stablehlo_text)
     if not match:
         # Try single return type (no parens)
         main_pattern2 = re.compile(
-            r'func\.func\s+(?:public\s+)?@main\s*\(([^)]*)\)\s*->\s*(\S+)',
-            re.DOTALL
+            r"func\.func\s+(?:public\s+)?@main\s*\(([^)]*)\)\s*->\s*(\S+)", re.DOTALL
         )
         match = main_pattern2.search(stablehlo_text)
 
@@ -112,11 +116,11 @@ def parse_function_signature(stablehlo_text: str):
 
     # Parse argument types: %arg0: tensor<90x327680xf64>, ...
     arg_types = []
-    for arg_match in re.finditer(r'%\w+:\s*(tensor<[^>]+>)', args_str):
+    for arg_match in re.finditer(r"%\w+:\s*(tensor<[^>]+>)", args_str):
         arg_types.append(arg_match.group(1))
 
     # Parse return types
-    ret_types = re.findall(r'tensor<[^>]+>', rets_str)
+    ret_types = re.findall(r"tensor<[^>]+>", rets_str)
 
     return arg_types, ret_types
 
@@ -133,12 +137,12 @@ def combine_stablehlo(qt_update_file: str, precip_file: str, nlev: int, ncells: 
             pflx, pr, ps, pi, pg, eflx)
     """
     print(f"Reading q_t_update StableHLO: {qt_update_file}")
-    with open(qt_update_file, 'r') as f:
+    with open(qt_update_file) as f:
         qt_text = f.read()
     print(f"  Size: {len(qt_text) / 1024:.1f} KB")
 
     print(f"Reading precipitation StableHLO: {precip_file}")
-    with open(precip_file, 'r') as f:
+    with open(precip_file) as f:
         precip_text = f.read()
     print(f"  Size: {len(precip_text) / 1024:.1f} KB")
 
@@ -154,27 +158,29 @@ def combine_stablehlo(qt_update_file: str, precip_file: str, nlev: int, ncells: 
     print(f"  Outputs: {precip_ret_types}")
 
     # Rename functions
-    qt_body = extract_function_body(rename_main_function(qt_text, '_qt_update'))
-    precip_body = extract_function_body(rename_main_function(precip_text, '_precip_effects'))
+    qt_body = extract_function_body(rename_main_function(qt_text, "_qt_update"))
+    precip_body = extract_function_body(rename_main_function(precip_text, "_precip_effects"))
 
     # Type shortcuts
-    tf = f'tensor<{nlev}x{ncells}xf64>'
-    tb = f'tensor<{nlev}x{ncells}xi1>'
+    tf = f"tensor<{nlev}x{ncells}xf64>"
+    tb = f"tensor<{nlev}x{ncells}xi1>"
 
     # Build combined module
     lines = []
-    lines.append(f'module @jit_graupel_combined_{nlev} attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{')
-    lines.append('')
+    lines.append(
+        f"module @jit_graupel_combined_{nlev} attributes {{mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32}} {{"
+    )
+    lines.append("")
 
     # Insert q_t_update function body (private)
-    lines.append('  // ============ q_t_update (private) ============')
+    lines.append("  // ============ q_t_update (private) ============")
     lines.append(qt_body)
-    lines.append('')
+    lines.append("")
 
     # Insert precip function body (private)
-    lines.append('  // ============ precipitation_effects (private) ============')
+    lines.append("  // ============ precipitation_effects (private) ============")
     lines.append(precip_body)
-    lines.append('')
+    lines.append("")
 
     # Build the combined @main
     # Combined inputs:
@@ -187,110 +193,134 @@ def combine_stablehlo(qt_update_file: str, precip_file: str, nlev: int, ncells: 
     # precip signature: (kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz)
     #                -> (qr, qs, qi, qg, t_new, pflx_tot, pr, ps, pi, pg, eflx)
 
-    combined_args = ', '.join([
-        f'%arg0: {tb}',   # kmin_r
-        f'%arg1: {tb}',   # kmin_i
-        f'%arg2: {tb}',   # kmin_s
-        f'%arg3: {tb}',   # kmin_g
-        f'%arg4: {tf}',   # t
-        f'%arg5: {tf}',   # p
-        f'%arg6: {tf}',   # rho
-        f'%arg7: {tf}',   # dz
-        f'%arg8: {tf}',   # qv
-        f'%arg9: {tf}',   # qc
-        f'%arg10: {tf}',  # qr
-        f'%arg11: {tf}',  # qs
-        f'%arg12: {tf}',  # qi
-        f'%arg13: {tf}',  # qg
-    ])
+    combined_args = ", ".join(
+        [
+            f"%arg0: {tb}",  # kmin_r
+            f"%arg1: {tb}",  # kmin_i
+            f"%arg2: {tb}",  # kmin_s
+            f"%arg3: {tb}",  # kmin_g
+            f"%arg4: {tf}",  # t
+            f"%arg5: {tf}",  # p
+            f"%arg6: {tf}",  # rho
+            f"%arg7: {tf}",  # dz
+            f"%arg8: {tf}",  # qv
+            f"%arg9: {tf}",  # qc
+            f"%arg10: {tf}",  # qr
+            f"%arg11: {tf}",  # qs
+            f"%arg12: {tf}",  # qi
+            f"%arg13: {tf}",  # qg
+        ]
+    )
 
     # Return types: t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx
-    ret_types_str = ', '.join([tf] * 13)
+    ret_types_str = ", ".join([tf] * 13)
 
-    lines.append('  // ============ Combined graupel (public) ============')
-    lines.append(f'  func.func public @main({combined_args}) -> ({ret_types_str}) {{')
-    lines.append('')
-    lines.append('    // Phase 1: q_t_update(t, p, rho, qv, qc, qr, qs, qi, qg)')
-    lines.append('    //   -> (qv_new, qc_new, qr_new, qs_new, qi_new, qg_new, t_new)')
+    lines.append("  // ============ Combined graupel (public) ============")
+    lines.append(f"  func.func public @main({combined_args}) -> ({ret_types_str}) {{")
+    lines.append("")
+    lines.append("    // Phase 1: q_t_update(t, p, rho, qv, qc, qr, qs, qi, qg)")
+    lines.append("    //   -> (qv_new, qc_new, qr_new, qs_new, qi_new, qg_new, t_new)")
 
     # Build the q_t_update call
-    qt_call_args = ', '.join([
-        '%arg4',   # t
-        '%arg5',   # p
-        '%arg6',   # rho
-        '%arg8',   # qv
-        '%arg9',   # qc
-        '%arg10',  # qr
-        '%arg11',  # qs
-        '%arg12',  # qi
-        '%arg13',  # qg
-    ])
-    qt_ret = ', '.join([tf] * 7)
-    lines.append(f'    %qt:7 = func.call @_qt_update({qt_call_args}) : ({", ".join([tf]*9)}) -> ({qt_ret})')
-    lines.append('    // qt#0=qv_new, qt#1=qc_new, qt#2=qr_new, qt#3=qs_new, qt#4=qi_new, qt#5=qg_new, qt#6=t_new')
-    lines.append('')
+    qt_call_args = ", ".join(
+        [
+            "%arg4",  # t
+            "%arg5",  # p
+            "%arg6",  # rho
+            "%arg8",  # qv
+            "%arg9",  # qc
+            "%arg10",  # qr
+            "%arg11",  # qs
+            "%arg12",  # qi
+            "%arg13",  # qg
+        ]
+    )
+    qt_ret = ", ".join([tf] * 7)
+    lines.append(
+        f'    %qt:7 = func.call @_qt_update({qt_call_args}) : ({", ".join([tf]*9)}) -> ({qt_ret})'
+    )
+    lines.append(
+        "    // qt#0=qv_new, qt#1=qc_new, qt#2=qr_new, qt#3=qs_new, qt#4=qi_new, qt#5=qg_new, qt#6=t_new"
+    )
+    lines.append("")
 
-    lines.append('    // Phase 2: precip_effects(kmin_r, kmin_i, kmin_s, kmin_g,')
-    lines.append('    //                         qv_new, qc_new, qr_new, qs_new, qi_new, qg_new,')
-    lines.append('    //                         t_new, rho, dz)')
-    lines.append('    //   -> (qr_out, qs_out, qi_out, qg_out, t_final, pflx, pr, ps, pi, pg, eflx)')
+    lines.append("    // Phase 2: precip_effects(kmin_r, kmin_i, kmin_s, kmin_g,")
+    lines.append("    //                         qv_new, qc_new, qr_new, qs_new, qi_new, qg_new,")
+    lines.append("    //                         t_new, rho, dz)")
+    lines.append(
+        "    //   -> (qr_out, qs_out, qi_out, qg_out, t_final, pflx, pr, ps, pi, pg, eflx)"
+    )
 
     # Build the precip call - using q_t_update outputs
-    precip_call_args = ', '.join([
-        '%arg0',    # kmin_r
-        '%arg1',    # kmin_i
-        '%arg2',    # kmin_s
-        '%arg3',    # kmin_g
-        '%qt#0',    # qv_new
-        '%qt#1',    # qc_new
-        '%qt#2',    # qr_new
-        '%qt#3',    # qs_new
-        '%qt#4',    # qi_new
-        '%qt#5',    # qg_new
-        '%qt#6',    # t_new
-        '%arg6',    # rho (unchanged)
-        '%arg7',    # dz (unchanged)
-    ])
-    precip_ret = ', '.join([tf] * 11)
-    precip_in_types = ', '.join([tb]*4 + [tf]*9)
-    lines.append(f'    %pr:11 = func.call @_precip_effects({precip_call_args}) : ({precip_in_types}) -> ({precip_ret})')
-    lines.append('    // pr#0=qr_out, pr#1=qs_out, pr#2=qi_out, pr#3=qg_out, pr#4=t_final,')
-    lines.append('    // pr#5=pflx, pr#6=pr, pr#7=ps, pr#8=pi, pr#9=pg, pr#10=eflx')
-    lines.append('')
+    precip_call_args = ", ".join(
+        [
+            "%arg0",  # kmin_r
+            "%arg1",  # kmin_i
+            "%arg2",  # kmin_s
+            "%arg3",  # kmin_g
+            "%qt#0",  # qv_new
+            "%qt#1",  # qc_new
+            "%qt#2",  # qr_new
+            "%qt#3",  # qs_new
+            "%qt#4",  # qi_new
+            "%qt#5",  # qg_new
+            "%qt#6",  # t_new
+            "%arg6",  # rho (unchanged)
+            "%arg7",  # dz (unchanged)
+        ]
+    )
+    precip_ret = ", ".join([tf] * 11)
+    precip_in_types = ", ".join([tb] * 4 + [tf] * 9)
+    lines.append(
+        f"    %pr:11 = func.call @_precip_effects({precip_call_args}) : ({precip_in_types}) -> ({precip_ret})"
+    )
+    lines.append("    // pr#0=qr_out, pr#1=qs_out, pr#2=qi_out, pr#3=qg_out, pr#4=t_final,")
+    lines.append("    // pr#5=pflx, pr#6=pr, pr#7=ps, pr#8=pi, pr#9=pg, pr#10=eflx")
+    lines.append("")
 
     # Return: t_final, qv_out(=qt#0), qc_out(=qt#1), qr_out, qs_out, qi_out, qg_out,
     #         pflx, pr, ps, pi, pg, eflx
     # Note: qv and qc are NOT modified by precip_effects, only qr/qs/qi/qg are
-    ret_vals = ', '.join([
-        '%pr#4',   # t_final
-        '%qt#0',   # qv (from q_t_update, unchanged by precip)
-        '%qt#1',   # qc (from q_t_update, unchanged by precip)
-        '%pr#0',   # qr_out (from precip)
-        '%pr#1',   # qs_out (from precip)
-        '%pr#2',   # qi_out (from precip)
-        '%pr#3',   # qg_out (from precip)
-        '%pr#5',   # pflx
-        '%pr#6',   # pr
-        '%pr#7',   # ps
-        '%pr#8',   # pi
-        '%pr#9',   # pg
-        '%pr#10',  # eflx
-    ])
-    lines.append(f'    return {ret_vals} : {ret_types_str}')
-    lines.append('  }')
-    lines.append('}')
+    ret_vals = ", ".join(
+        [
+            "%pr#4",  # t_final
+            "%qt#0",  # qv (from q_t_update, unchanged by precip)
+            "%qt#1",  # qc (from q_t_update, unchanged by precip)
+            "%pr#0",  # qr_out (from precip)
+            "%pr#1",  # qs_out (from precip)
+            "%pr#2",  # qi_out (from precip)
+            "%pr#3",  # qg_out (from precip)
+            "%pr#5",  # pflx
+            "%pr#6",  # pr
+            "%pr#7",  # ps
+            "%pr#8",  # pi
+            "%pr#9",  # pg
+            "%pr#10",  # eflx
+        ]
+    )
+    lines.append(f"    return {ret_vals} : {ret_types_str}")
+    lines.append("  }")
+    lines.append("}")
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Combine q_t_update + precip StableHLO")
-    parser.add_argument("--qt-update", default="stablehlo/qt_update.stablehlo",
-                       help="q_t_update StableHLO file")
-    parser.add_argument("--precip", default="stablehlo/precip_transposed.stablehlo",
-                       help="precipitation_effects StableHLO file")
-    parser.add_argument("-o", "--output", default="stablehlo/graupel_combined.stablehlo",
-                       help="Output combined StableHLO file")
+    parser.add_argument(
+        "--qt-update", default="stablehlo/qt_update.stablehlo", help="q_t_update StableHLO file"
+    )
+    parser.add_argument(
+        "--precip",
+        default="stablehlo/precip_transposed.stablehlo",
+        help="precipitation_effects StableHLO file",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="stablehlo/graupel_combined.stablehlo",
+        help="Output combined StableHLO file",
+    )
     parser.add_argument("--nlev", type=int, default=90)
     parser.add_argument("--ncells", type=int, default=327680)
     args = parser.parse_args()
@@ -303,7 +333,7 @@ def main():
     combined = combine_stablehlo(args.qt_update, args.precip, args.nlev, args.ncells)
 
     pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, 'w') as f:
+    with open(args.output, "w") as f:
         f.write(combined)
 
     print(f"\nCombined StableHLO written to: {args.output}")

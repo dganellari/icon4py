@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import pathlib
-from typing import Dict, Tuple, Any
+from typing import Any
 
 import jax.numpy as jnp
 import netCDF4
@@ -23,10 +23,10 @@ from ..core.definitions import Q
 def calc_dz(z: np.ndarray) -> np.ndarray:
     """
     Calculate layer thickness from geometric height.
-    
+
     Args:
         z: Geometric height array of shape (nlev, ncells), must be float64
-    
+
     Returns:
         Layer thickness array of shape (nlev, ncells)
     """
@@ -44,40 +44,40 @@ def load_graupel_inputs(
     input_file: str | pathlib.Path,
     timestep: int = 0,
     as_jax: bool = True,
-) -> Tuple[Any, Any, Any, Any, Q, float, float, int, int]:
+) -> tuple[Any, Any, Any, Any, Q, float, float, int, int]:
     """
     Load graupel inputs from NetCDF file.
-    
+
     Args:
         input_file: Path to input NetCDF file
         timestep: Time index to load (default: 0)
         as_jax: If True, return JAX arrays; if False, return numpy arrays
-    
+
     Returns:
         Tuple of (dz, t, p, rho, q, dt, qnc, ncells, nlev)
         where q is a Q namedtuple with species mixing ratios
     """
-    ds = netCDF4.Dataset(input_file, 'r')
-    
+    ds = netCDF4.Dataset(input_file, "r")
+
     try:
         ncells = len(ds.dimensions["cell"])
     except KeyError:
         ncells = len(ds.dimensions["ncells"])
     nlev = len(ds.dimensions["height"])
-    
+
     # Calculate dz from geometric height
     # Must be float64 before dz calculation or we lose precision
     zg = np.asarray(ds.variables["zg"]).astype(np.float64)
     dz_calc = calc_dz(zg)
     dz_transposed = np.transpose(dz_calc)  # (height, ncells) -> (ncells, height)
-    
+
     def load_var(varname: str) -> np.ndarray:
         """Load and transpose a variable to (ncells, nlev) layout."""
         var = ds.variables[varname]
         if var.dimensions[0] == "time":
             var = var[timestep, :, :]
         return np.transpose(var).astype(np.float64)
-    
+
     # Load all variables as numpy float64
     t = load_var("ta")
     p = load_var("pfull")
@@ -88,12 +88,12 @@ def load_graupel_inputs(
     qs = load_var("qs")
     qi = load_var("cli")
     qg = load_var("qg")
-    
+
     ds.close()
-    
+
     dt = 30.0
     qnc = 100.0
-    
+
     if as_jax:
         dz = jnp.array(dz_transposed, dtype=jnp.float64)
         t = jnp.array(t, dtype=jnp.float64)
@@ -110,17 +110,17 @@ def load_graupel_inputs(
     else:
         dz = dz_transposed
         q = Q(v=qv, c=qc, r=qr, s=qs, i=qi, g=qg)
-    
+
     return dz, t, p, rho, q, dt, qnc, ncells, nlev
 
 
-def load_graupel_reference(reference_file: str | pathlib.Path) -> Dict[str, np.ndarray]:
+def load_graupel_reference(reference_file: str | pathlib.Path) -> dict[str, np.ndarray]:
     """
     Load reference output from NetCDF file.
-    
+
     Args:
         reference_file: Path to reference NetCDF file
-    
+
     Returns:
         Dictionary with reference fields as numpy arrays of shape (ncells, nlev):
         - t: Temperature
@@ -146,31 +146,42 @@ def load_graupel_reference(reference_file: str | pathlib.Path) -> Dict[str, np.n
 def load_precip_inputs(
     input_file: str | pathlib.Path,
     timestep: int = 0,
-) -> Tuple[int, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Q, jnp.ndarray, jnp.ndarray, jnp.ndarray, float, int, int]:
+) -> tuple[
+    int,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    Q,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    float,
+    int,
+    int,
+]:
     """
     Load inputs specifically for precipitation_effects function.
-    
+
     Args:
         input_file: Path to input NetCDF file
         timestep: Time index to load (default: 0)
-    
+
     Returns:
         Tuple of (last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt, ncells, nlev)
     """
     from ..core.common import constants as const
-    
-    dz, t, p, rho, q, dt, qnc, ncells, nlev = load_graupel_inputs(
-        input_file, timestep, as_jax=True
-    )
-    
+
+    dz, t, p, rho, q, dt, qnc, ncells, nlev = load_graupel_inputs(input_file, timestep, as_jax=True)
+
     last_lev = nlev - 1
-    
+
     # Compute kmin masks (species present above threshold)
     kmin_r = q.r > const.qmin
     kmin_i = q.i > const.qmin
     kmin_s = q.s > const.qmin
     kmin_g = q.g > const.qmin
-    
+
     return last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q, t, rho, dz, dt, ncells, nlev
 
 

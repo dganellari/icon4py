@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Export q_t_update_fused as standalone StableHLO for HLO injection.
 
@@ -17,12 +25,12 @@ Usage:
 """
 
 import argparse
-import sys
 import pathlib
+import sys
 
 import jax
 import jax.numpy as jnp
-from jax import lax
+
 
 # Enable x64
 jax.config.update("jax_enable_x64", True)
@@ -50,9 +58,9 @@ def export_qt_update(nlev: int = 90, ncells: int = 327680, output: str = None) -
     if output is None:
         output = "stablehlo/qt_update.stablehlo"
 
-    print(f"Exporting q_t_update_fused as StableHLO...")
+    print("Exporting q_t_update_fused as StableHLO...")
     print(f"  Layout: tensor<{nlev}x{ncells}xf64> (nlev x ncells, transposed)")
-    print(f"  Constants baked in: dt=30.0, qnc=100.0")
+    print("  Constants baked in: dt=30.0, qnc=100.0")
 
     # Create abstract input shapes - transposed layout (nlev, ncells)
     shape = (nlev, ncells)
@@ -96,7 +104,7 @@ def export_qt_update(nlev: int = 90, ncells: int = 327680, output: str = None) -
 
     # Save
     pathlib.Path(output).parent.mkdir(parents=True, exist_ok=True)
-    with open(output, 'w') as f:
+    with open(output, "w") as f:
         f.write(stablehlo_text)
 
     print(f"\n  Written to: {output}")
@@ -105,7 +113,9 @@ def export_qt_update(nlev: int = 90, ncells: int = 327680, output: str = None) -
 
 def main():
     parser = argparse.ArgumentParser(description="Export q_t_update_fused as StableHLO")
-    parser.add_argument("-o", "--output", help="Output file (default: stablehlo/qt_update.stablehlo)")
+    parser.add_argument(
+        "-o", "--output", help="Output file (default: stablehlo/qt_update.stablehlo)"
+    )
     parser.add_argument("--nlev", type=int, default=90)
     parser.add_argument("--ncells", type=int, default=327680)
     args = parser.parse_args()

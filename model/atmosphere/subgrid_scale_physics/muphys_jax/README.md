@@ -5,10 +5,10 @@ for GPU optimization. Self-contained — no dependency on the GT4Py `muphys` pac
 
 ## Performance
 
-| Implementation | Time (ms) | Notes |
-|---|---|---|
-| Baseline (vmap-batched) | ~51 | `(ncells, nlev)` layout, internal transposes |
-| Native transposed + Combined HLO (q_t_update + precip) | ~32 | Single HLO module for the full computation |
+| Implementation                                         | Time (ms) | Notes                                        |
+| ------------------------------------------------------ | --------- | -------------------------------------------- |
+| Baseline (vmap-batched)                                | ~51       | `(ncells, nlev)` layout, internal transposes |
+| Native transposed + Combined HLO (q_t_update + precip) | ~32       | Single HLO module for the full computation   |
 
 Measured on NVIDIA GH200, R2B06 grid (327680 cells, 90 levels), float64.
 
@@ -16,38 +16,38 @@ Measured on NVIDIA GH200, R2B06 grid (327680 cells, 90 levels), float64.
 
 ### Core (`core/`)
 
-| Module | Description |
-|---|---|
-| `common/constants.py` | Physical constants (self-contained, no GT4Py dependency) |
-| `common/backend.py` | JIT compilation wrapper |
-| `definitions.py` | `Q` namedtuple (v, c, r, s, i, g) and `TempState` |
-| `properties.py` | Fall speed, velocity scale factors |
-| `transitions.py` | Phase transition rates (cloud-to-rain, ice nucleation, etc.) |
-| `thermo.py` | Thermodynamic functions (saturation, internal energy) |
-| `scans.py` | `lax.scan`-based precipitation and temperature update scans (all layouts) |
-| `optimized_precip.py` | Custom JAX primitive for HLO injection of precipitation_effects |
+| Module                 | Description                                                                  |
+| ---------------------- | ---------------------------------------------------------------------------- |
+| `common/constants.py`  | Physical constants (self-contained, no GT4Py dependency)                     |
+| `common/backend.py`    | JIT compilation wrapper                                                      |
+| `definitions.py`       | `Q` namedtuple (v, c, r, s, i, g) and `TempState`                            |
+| `properties.py`        | Fall speed, velocity scale factors                                           |
+| `transitions.py`       | Phase transition rates (cloud-to-rain, ice nucleation, etc.)                 |
+| `thermo.py`            | Thermodynamic functions (saturation, internal energy)                        |
+| `scans.py`             | `lax.scan`-based precipitation and temperature update scans (all layouts)    |
+| `optimized_precip.py`  | Custom JAX primitive for HLO injection of precipitation_effects              |
 | `optimized_graupel.py` | Custom JAX primitive for HLO injection of full graupel (q_t_update + precip) |
 
 ### Implementations (`implementations/`)
 
-| Module | Layout | Description |
-|---|---|---|
-| `graupel_baseline.py` | `(ncells, nlev)` | Canonical baseline. Contains `q_t_update` (all phase transitions) and `temperature_update_scan`. All other implementations import shared functions from here. |
-| `graupel.py` | `(ncells, nlev)` | Variant with tiled/unrolled scan options. Imports `q_t_update` and `temperature_update_scan` from baseline. |
-| `graupel_native_transposed.py` | `(nlev, ncells)` | Zero-transpose implementation. Three modes: (1) Full-graupel HLO, (2) Precip-only HLO + JAX q_t_update, (3) Pure JAX fallback. |
-| `q_t_update_fused.py` | any | Monolithic q_t_update with inlined physics (`lax.select`/`lax.pow`) for better GPU kernel fusion. Used by native transposed mode 2. |
-| `graupel_iree.py` | `(ncells, nlev)` | IREE backend variant (`fori_loop` scans). |
+| Module                         | Layout           | Description                                                                                                                                                   |
+| ------------------------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `graupel_baseline.py`          | `(ncells, nlev)` | Canonical baseline. Contains `q_t_update` (all phase transitions) and `temperature_update_scan`. All other implementations import shared functions from here. |
+| `graupel.py`                   | `(ncells, nlev)` | Variant with tiled/unrolled scan options. Imports `q_t_update` and `temperature_update_scan` from baseline.                                                   |
+| `graupel_native_transposed.py` | `(nlev, ncells)` | Zero-transpose implementation. Three modes: (1) Full-graupel HLO, (2) Precip-only HLO + JAX q_t_update, (3) Pure JAX fallback.                                |
+| `q_t_update_fused.py`          | any              | Monolithic q_t_update with inlined physics (`lax.select`/`lax.pow`) for better GPU kernel fusion. Used by native transposed mode 2.                           |
+| `graupel_iree.py`              | `(ncells, nlev)` | IREE backend variant (`fori_loop` scans).                                                                                                                     |
 
 ### Driver (`driver/`)
 
-| Module | Description |
-|---|---|
+| Module               | Description                                                                                                                                  |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `run_graupel_jax.py` | CLI driver compatible with GT4Py `run_graupel_only.py`. Supports `--baseline`, `--split`, `--iree-optimized`, `--tiled`, `--unrolled` modes. |
 
 ### Utils (`utils/`)
 
-| Module | Description |
-|---|---|
+| Module            | Description                                                                                                      |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `data_loading.py` | Shared NetCDF loading: `load_graupel_inputs()`, `load_graupel_reference()`, `load_precip_inputs()`, `calc_dz()`. |
 
 ## Pipeline: StableHLO Injection
@@ -102,15 +102,15 @@ result = graupel_run_native_transposed(dz_t, t_t, p_t, rho_t, q_t, dt, qnc_t)
 
 ## Tools (`tools/`)
 
-| Script | Description |
-|---|---|
-| `export_precip_transposed.py` | Export `precipitation_effects_native_transposed` to StableHLO |
-| `generate_qt_update_stablehlo.py` | Export `q_t_update_fused` to StableHLO |
-| `generate_unrolled_stablehlo.py` | Generate unrolled precipitation scan StableHLO |
-| `generate_unrolled_transposed.py` | Generate unrolled transposed precipitation scan StableHLO |
-| `generate_combined_graupel.py` | Combine q_t_update + precip into single StableHLO module |
-| `run_graupel_optimized.py` | Benchmark driver with HLO injection support |
-| `benchmark_stablehlo.py` | Benchmark StableHLO export and compilation |
+| Script                            | Description                                                   |
+| --------------------------------- | ------------------------------------------------------------- |
+| `export_precip_transposed.py`     | Export `precipitation_effects_native_transposed` to StableHLO |
+| `generate_qt_update_stablehlo.py` | Export `q_t_update_fused` to StableHLO                        |
+| `generate_unrolled_stablehlo.py`  | Generate unrolled precipitation scan StableHLO                |
+| `generate_unrolled_transposed.py` | Generate unrolled transposed precipitation scan StableHLO     |
+| `generate_combined_graupel.py`    | Combine q_t_update + precip into single StableHLO module      |
+| `run_graupel_optimized.py`        | Benchmark driver with HLO injection support                   |
+| `benchmark_stablehlo.py`          | Benchmark StableHLO export and compilation                    |
 
 ## Tests (`tests/`)
 
@@ -128,14 +128,14 @@ JAX_ENABLE_X64=1 pytest tests/test_graupel_hlo_direct.py -v
 JAX_ENABLE_X64=1 python tests/test_graupel_native_transposed.py --input data.nc --reference ref.nc
 ```
 
-| Test | What it validates |
-|---|---|
-| `test_graupel_standalone.py` | Baseline graupel vs Fortran reference (pytest) |
-| `test_graupel_hlo_direct.py` | End-to-end HLO export + injection vs reference (pytest) |
+| Test                                | What it validates                                                    |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| `test_graupel_standalone.py`        | Baseline graupel vs Fortran reference (pytest)                       |
+| `test_graupel_hlo_direct.py`        | End-to-end HLO export + injection vs reference (pytest)              |
 | `test_graupel_native_transposed.py` | Native transposed vs baseline + optional reference (CLI + benchmark) |
-| `test_q_t_update_fused.py` | Fused q_t_update vs original (correctness + benchmark) |
-| `test_iree_minimal.py` | IREE backend basic functionality |
-| `test_iree_optimized.py` | IREE scan comparison |
+| `test_q_t_update_fused.py`          | Fused q_t_update vs original (correctness + benchmark)               |
+| `test_iree_minimal.py`              | IREE backend basic functionality                                     |
+| `test_iree_optimized.py`            | IREE scan comparison                                                 |
 
 ## Execution Modes in `graupel_native_transposed`
 
@@ -153,5 +153,6 @@ The native transposed implementation selects its mode automatically:
 ## Test Data
 
 Test data is expected in:
+
 - `testdata/muphys/graupel_only/{mini,R2B05}/input.nc` — graupel input
 - `testdata/muphys_graupel_data/{mini,R2B05}/reference.nc` — Fortran reference output

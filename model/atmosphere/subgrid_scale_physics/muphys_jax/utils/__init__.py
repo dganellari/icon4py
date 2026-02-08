@@ -10,12 +10,8 @@
 Utility functions for muphys_jax.
 """
 
-from .data_loading import (
-    calc_dz,
-    load_graupel_inputs,
-    load_graupel_reference,
-    load_precip_inputs,
-)
+from .data_loading import calc_dz, load_graupel_inputs, load_graupel_reference, load_precip_inputs
+
 
 __all__ = [
     "calc_dz",
