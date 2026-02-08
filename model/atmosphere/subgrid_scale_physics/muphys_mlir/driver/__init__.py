@@ -6,4 +6,4 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from . import run_graupel_mlir
+from . import run_graupel_mlir as run_graupel_mlir

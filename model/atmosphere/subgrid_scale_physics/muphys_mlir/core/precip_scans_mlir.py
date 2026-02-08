@@ -35,20 +35,23 @@ Lowering Pipeline:
     8. reconcile-unrealized-casts - Cleanup
 """
 
+from typing import Any
+
 import numpy as np
-from typing import List, Tuple, Optional, Dict, Any
-import hashlib
+
 
 # Check MLIR availability
 MLIR_AVAILABLE = False
 MLIR_IMPORT_ERROR = None
 
 try:
-    from mlir import ir
-    from mlir.dialects import arith, func, gpu, memref, scf, math as mlir_math
-    from mlir.passmanager import PassManager
-    from mlir.execution_engine import ExecutionEngine
     import ctypes
+
+    from mlir import ir
+    from mlir.dialects import arith, func, gpu, math as mlir_math, memref, scf
+    from mlir.execution_engine import ExecutionEngine
+    from mlir.passmanager import PassManager
+
     MLIR_AVAILABLE = True
 except ImportError as e:
     MLIR_IMPORT_ERROR = str(e)
@@ -58,10 +61,10 @@ except ImportError as e:
 # Kernel Cache - Avoid recompilation for same grid sizes
 # =============================================================================
 
-_kernel_cache: Dict[Tuple[int, int], Any] = {}
+_kernel_cache: dict[tuple[int, int], Any] = {}
 
 
-def _get_cache_key(nlev: int, ncells: int) -> Tuple[int, int]:
+def _get_cache_key(nlev: int, ncells: int) -> tuple[int, int]:
     """Generate cache key for kernel lookup."""
     return (nlev, ncells)
 
@@ -75,6 +78,7 @@ def clear_kernel_cache():
 # =============================================================================
 # MLIR Code Generation
 # =============================================================================
+
 
 def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
     """
@@ -124,7 +128,7 @@ def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
             # Params: prefactors and offsets
             func_type = ir.FunctionType.get(
                 inputs=[memref_2d] * 22 + [memref_params],  # 14 in + 8 out + params
-                results=[]
+                results=[],
             )
 
             func_op = func.FuncOp("precip_scan_unified", func_type, visibility="public")
@@ -135,9 +139,9 @@ def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
 
                 # Unpack arguments
                 zeta, rho = args[0], args[1]
-                q = args[2:6]      # q0, q1, q2, q3
-                vc = args[6:10]    # vc0, vc1, vc2, vc3
-                mask = args[10:14] # mask0, mask1, mask2, mask3
+                q = args[2:6]  # q0, q1, q2, q3
+                vc = args[6:10]  # vc0, vc1, vc2, vc3
+                mask = args[10:14]  # mask0, mask1, mask2, mask3
                 q_out = args[14:18]
                 flx_out = args[18:22]
                 params = args[22]
@@ -156,8 +160,8 @@ def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
 
                 # Load parameters (prefactor, offset for each species)
                 param_idx = [arith.ConstantOp(idx, ir.IntegerAttr.get(idx, i)) for i in range(8)]
-                prefactor = [memref.LoadOp(params, [param_idx[2*i]]).result for i in range(4)]
-                offset = [memref.LoadOp(params, [param_idx[2*i+1]]).result for i in range(4)]
+                prefactor = [memref.LoadOp(params, [param_idx[2 * i]]).result for i in range(4)]
+                offset = [memref.LoadOp(params, [param_idx[2 * i + 1]]).result for i in range(4)]
 
                 # GPU Launch: one block per cell, one thread per block
                 # Each thread processes entire vertical column sequentially
@@ -167,7 +171,7 @@ def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
                     gridSizeZ=c1.result,
                     blockSizeX=c1.result,
                     blockSizeY=c1.result,
-                    blockSizeZ=c1.result
+                    blockSizeZ=c1.result,
                 )
 
                 with ir.InsertionPoint(launch.body):
@@ -261,7 +265,9 @@ def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
 
                             # Select outputs based on activation (branchless)
                             q_result = arith.SelectOp(activated, q_activated, q_k).result
-                            flx_result = arith.SelectOp(activated, flx_activated, zero_f64.result).result
+                            flx_result = arith.SelectOp(
+                                activated, flx_activated, zero_f64.result
+                            ).result
 
                             # Store outputs
                             memref.StoreOp(q_result, q_out[s], [k, cell])
@@ -289,6 +295,7 @@ def generate_precip_scan_mlir(nlev: int, ncells: int) -> str:
 # Optimization Passes
 # =============================================================================
 
+
 def get_optimization_pipeline(optimization_level: int = 2) -> str:
     """
     Get MLIR optimization pass pipeline.
@@ -304,23 +311,27 @@ def get_optimization_pipeline(optimization_level: int = 2) -> str:
 
     # Basic optimizations (level 1+)
     passes = [
-        "canonicalize",           # Pattern-based simplification
-        "cse",                    # Common subexpression elimination
+        "canonicalize",  # Pattern-based simplification
+        "cse",  # Common subexpression elimination
     ]
 
     if optimization_level >= 2:
         # Standard optimizations
-        passes.extend([
-            "loop-invariant-code-motion",  # Hoist loop-invariant ops
-            "canonicalize",                # Run again after LICM
-        ])
+        passes.extend(
+            [
+                "loop-invariant-code-motion",  # Hoist loop-invariant ops
+                "canonicalize",  # Run again after LICM
+            ]
+        )
 
     if optimization_level >= 3:
         # Aggressive optimizations
-        passes.extend([
-            "symbol-dce",          # Dead code elimination
-            "canonicalize",
-        ])
+        passes.extend(
+            [
+                "symbol-dce",  # Dead code elimination
+                "canonicalize",
+            ]
+        )
 
     return f"builtin.module({','.join(passes)})"
 
@@ -353,11 +364,8 @@ def get_gpu_lowering_pipeline() -> str:
 # Compilation and Execution
 # =============================================================================
 
-def compile_mlir_to_gpu(
-    mlir_code: str,
-    optimization_level: int = 2,
-    verbose: bool = False
-) -> Any:
+
+def compile_mlir_to_gpu(mlir_code: str, optimization_level: int = 2, verbose: bool = False) -> Any:
     """
     Compile MLIR code to GPU executable using NVVM pipeline.
 
@@ -405,10 +413,7 @@ def compile_mlir_to_gpu(
 
 
 def get_or_compile_kernel(
-    nlev: int,
-    ncells: int,
-    optimization_level: int = 2,
-    force_recompile: bool = False
+    nlev: int, ncells: int, optimization_level: int = 2, force_recompile: bool = False
 ) -> Any:
     """
     Get compiled kernel from cache or compile new one.
@@ -440,6 +445,7 @@ def get_or_compile_kernel(
 # Memory Descriptors for MLIR ABI
 # =============================================================================
 
+
 class MemRefDescriptor2D(ctypes.Structure):
     """
     MLIR memref descriptor for 2D ranked memrefs.
@@ -453,6 +459,7 @@ class MemRefDescriptor2D(ctypes.Structure):
             int64_t strides[2];
         }
     """
+
     _fields_ = [
         ("allocated", ctypes.c_void_p),
         ("aligned", ctypes.c_void_p),
@@ -481,6 +488,7 @@ class MemRefDescriptor2D(ctypes.Structure):
 
 class MemRefDescriptor1D(ctypes.Structure):
     """MLIR memref descriptor for 1D ranked memrefs."""
+
     _fields_ = [
         ("allocated", ctypes.c_void_p),
         ("aligned", ctypes.c_void_p),
@@ -509,16 +517,17 @@ class MemRefDescriptor1D(ctypes.Structure):
 # Main Entry Point
 # =============================================================================
 
+
 def precip_scan_mlir(
-    params_list: List[Tuple[float, float, float]],
+    params_list: list[tuple[float, float, float]],
     zeta: np.ndarray,
     rho: np.ndarray,
-    q_list: List[np.ndarray],
-    vc_list: List[np.ndarray],
-    mask_list: List[np.ndarray],
+    q_list: list[np.ndarray],
+    vc_list: list[np.ndarray],
+    mask_list: list[np.ndarray],
     optimization_level: int = 2,
-    use_cache: bool = True
-) -> List[Tuple[np.ndarray, np.ndarray]]:
+    use_cache: bool = True,
+) -> list[tuple[np.ndarray, np.ndarray]]:
     """
     Execute precipitation scans using MLIR-generated GPU kernel.
 
@@ -566,8 +575,8 @@ def precip_scan_mlir(
     # Prepare parameters: [p0, o0, p1, o1, p2, o2, p3, o3]
     params_arr = np.zeros(8, dtype=np.float64)
     for i, (prefactor, exponent, offset) in enumerate(params_list):
-        params_arr[2*i] = prefactor
-        params_arr[2*i + 1] = offset
+        params_arr[2 * i] = prefactor
+        params_arr[2 * i + 1] = offset
 
     # Create memref descriptors
     descs = []
@@ -594,6 +603,7 @@ def precip_scan_mlir(
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
 
 def print_mlir_code(nlev: int = 65, ncells: int = 100):
     """Print generated MLIR code for inspection."""

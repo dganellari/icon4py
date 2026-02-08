@@ -15,29 +15,24 @@ easy comparison and drop-in replacement.
 """
 
 import numpy as np
-from typing import Tuple, List
 
-from ..core.precip_scans_mlir import (
-    precip_scan_mlir,
-    generate_precip_scan_mlir,
-    MLIR_AVAILABLE,
-    MLIR_IMPORT_ERROR,
-)
+from ..core.precip_scans_mlir import MLIR_AVAILABLE, MLIR_IMPORT_ERROR, precip_scan_mlir
+
 
 __all__ = [
-    "graupel_run",
-    "precipitation_effects",
     "MLIR_AVAILABLE",
     "MLIR_IMPORT_ERROR",
+    "graupel_run",
+    "precipitation_effects",
 ]
 
 # Physical constants (same as muphys_jax)
 TMELT = 273.15  # Melting temperature of ice [K]
-RVAP = 461.51   # Gas constant for water vapor [J/(kg*K)]
-LVAP = 2.5008e6 # Latent heat of vaporization [J/kg]
-LSUB = 2.8345e6 # Latent heat of sublimation [J/kg]
+RVAP = 461.51  # Gas constant for water vapor [J/(kg*K)]
+LVAP = 2.5008e6  # Latent heat of vaporization [J/kg]
+LSUB = 2.8345e6  # Latent heat of sublimation [J/kg]
 LFUS = LSUB - LVAP  # Latent heat of fusion [J/kg]
-CPD = 1004.64   # Specific heat of dry air [J/(kg*K)]
+CPD = 1004.64  # Specific heat of dry air [J/(kg*K)]
 RHO_00 = 1.225  # Reference air density [kg/m^3]
 QMIN = 1.0e-15  # Minimum mixing ratio threshold
 
@@ -54,7 +49,9 @@ def vel_scale_factor_default(xrho: np.ndarray) -> np.ndarray:
     return xrho
 
 
-def vel_scale_factor_snow(xrho: np.ndarray, rho: np.ndarray, t: np.ndarray, qs: np.ndarray) -> np.ndarray:
+def vel_scale_factor_snow(
+    xrho: np.ndarray, rho: np.ndarray, t: np.ndarray, qs: np.ndarray
+) -> np.ndarray:
     """Velocity scale factor for snow (simplified)."""
     return xrho * 0.8
 
@@ -72,9 +69,18 @@ def precipitation_effects(
     qs: np.ndarray,
     qi: np.ndarray,
     qg: np.ndarray,
-    dt: float
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    dt: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """
     Compute precipitation effects using MLIR-generated GPU kernel.
 
@@ -134,17 +140,17 @@ def precipitation_effects(
         rho=rho,
         q_list=[qr, qs, qi, qg],
         vc_list=[vc_r, vc_s, vc_i, vc_g],
-        mask_list=[mask_r, mask_s, mask_i, mask_g]
+        mask_list=[mask_r, mask_s, mask_i, mask_g],
     )
 
     # Unpack results
     (qr_out, flx_rain), (qs_out, flx_snow), (qi_out, flx_ice), (qg_out, flx_graupel) = results
 
     # Compute precipitation rates at surface (bottom level flux)
-    pr = flx_rain[-1, :]   # Rain precipitation rate
-    ps = flx_snow[-1, :]   # Snow precipitation rate
-    pi = flx_ice[-1, :]    # Ice precipitation rate
-    pg = flx_graupel[-1, :] # Graupel precipitation rate
+    pr = flx_rain[-1, :]  # Rain precipitation rate
+    ps = flx_snow[-1, :]  # Snow precipitation rate
+    pi = flx_ice[-1, :]  # Ice precipitation rate
+    pg = flx_graupel[-1, :]  # Graupel precipitation rate
 
     # Total precipitation flux
     pflx = flx_rain + flx_snow + flx_ice + flx_graupel
@@ -175,8 +181,8 @@ def graupel_run(
     qi: np.ndarray,
     qg: np.ndarray,
     dt: float,
-    qnc: float = 100.0
-) -> Tuple[np.ndarray, ...]:
+    qnc: float = 100.0,
+) -> tuple[np.ndarray, ...]:
     """
     Main graupel microphysics driver function.
 
@@ -217,14 +223,7 @@ def graupel_run(
 
     # Run precipitation effects (MLIR-accelerated)
     qr_out, qs_out, qi_out, qg_out, t_out, pflx, pr, ps, pi, pg = precipitation_effects(
-        dz=dz,
-        t=t,
-        rho=rho,
-        qr=qr,
-        qs=qs,
-        qi=qi,
-        qg=qg,
-        dt=dt
+        dz=dz, t=t, rho=rho, qr=qr, qs=qs, qi=qi, qg=qg, dt=dt
     )
 
     # Total surface precipitation

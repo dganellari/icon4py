@@ -29,8 +29,8 @@ from typing import NamedTuple
 import netCDF4
 import numpy as np
 
-from ..implementations.graupel import graupel_run, MLIR_AVAILABLE, MLIR_IMPORT_ERROR
 from ..core.precip_scans_mlir import generate_precip_scan_mlir
+from ..implementations.graupel import MLIR_AVAILABLE, MLIR_IMPORT_ERROR, graupel_run
 
 
 def _calc_dz(z: np.ndarray) -> np.ndarray:
@@ -47,6 +47,7 @@ def _calc_dz(z: np.ndarray) -> np.ndarray:
 
 class Q(NamedTuple):
     """Mixing ratios for hydrometeor species."""
+
     v: np.ndarray  # water vapor
     c: np.ndarray  # cloud water
     r: np.ndarray  # rain
@@ -90,12 +91,12 @@ class GraupelInput(NamedTuple):
 
             # Create Q structure
             q = Q(
-                v=load_var("hus"),   # specific humidity (vapor)
-                c=load_var("clw"),   # cloud liquid water
-                r=load_var("qr"),    # rain
-                s=load_var("qs"),    # snow
-                i=load_var("cli"),   # cloud ice
-                g=load_var("qg"),    # graupel
+                v=load_var("hus"),  # specific humidity (vapor)
+                c=load_var("clw"),  # cloud liquid water
+                r=load_var("qr"),  # rain
+                s=load_var("qs"),  # snow
+                i=load_var("cli"),  # cloud ice
+                g=load_var("qg"),  # graupel
             )
 
             return cls(
@@ -243,7 +244,7 @@ def main():
         qi=qi,
         qg=qg,
         dt=args.dt,
-        qnc=args.qnc
+        qnc=args.qnc,
     )
     print("Compilation complete!")
 
@@ -268,7 +269,7 @@ def main():
             qi=qi,
             qg=qg,
             dt=args.dt,
-            qnc=args.qnc
+            qnc=args.qnc,
         )
 
     end_time = time.time()
@@ -324,4 +325,5 @@ def main():
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

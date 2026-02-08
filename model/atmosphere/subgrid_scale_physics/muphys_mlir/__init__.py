@@ -37,11 +37,12 @@ from .core.precip_scans_mlir import (
 )
 from .implementations.graupel import graupel_run, precipitation_effects
 
+
 __all__ = [
     "MLIR_AVAILABLE",
     "MLIR_IMPORT_ERROR",
     "generate_precip_scan_mlir",
-    "precip_scan_mlir",
     "graupel_run",
+    "precip_scan_mlir",
     "precipitation_effects",
 ]

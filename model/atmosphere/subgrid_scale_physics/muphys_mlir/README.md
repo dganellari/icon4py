@@ -31,6 +31,7 @@ Execution on GPU
 ## Key Features
 
 ### 1. Register-Resident Carry State
+
 ```mlir
 // Carry variables live in SSA values (registers), not memory
 scf.for %k = %c0 to %nlev iter_args(%q_carry, %flx_carry, ...) {
@@ -40,14 +41,18 @@ scf.for %k = %c0 to %nlev iter_args(%q_carry, %flx_carry, ...) {
 ```
 
 ### 2. Unified Kernel
+
 Process all 4 precipitation species in one GPU kernel launch:
+
 - Rain (q0)
 - Snow (q1)
 - Ice (q2)
 - Graupel (q3)
 
 ### 3. Direct GPU Control
+
 MLIR's GPU dialect gives us explicit control over:
+
 - Thread blocks and grids
 - Register allocation
 - Memory coalescing
@@ -60,6 +65,7 @@ pip install mlir-python-bindings
 ```
 
 Or build from source:
+
 ```bash
 git clone https://github.com/llvm/llvm-project.git
 cd llvm-project
@@ -79,7 +85,7 @@ results = precip_scan_mlir(
     rho=rho_array,
     q_list=[q0, q1, q2, q3],
     vc_list=[vc0, vc1, vc2, vc3],
-    mask_list=[mask0, mask1, mask2, mask3]
+    mask_list=[mask0, mask1, mask2, mask3],
 )
 
 # Returns: [(q0_out, flx0_out), (q1_out, flx1_out), ...]
@@ -88,17 +94,20 @@ results = precip_scan_mlir(
 ## Implementation Status
 
 ### ✅ Completed
+
 - Module structure
 - MLIR code generation skeleton
 - Compilation pipeline design
 - Documentation
 
 ### 🚧 In Progress
+
 - Complete MLIR IR generation for scan kernel
 - GPU launch configuration
 - Memref descriptor setup for numpy arrays
 
 ### 📋 TODO
+
 - ExecutionEngine invocation
 - Numpy ↔ MLIR memref integration
 - Testing and validation
@@ -186,13 +195,13 @@ func.func @precip_scan_unified(
 
 ## Advantages Over Other Approaches
 
-| Approach | Performance | Complexity | Control |
-|----------|-------------|------------|---------|
-| JAX lax.scan | ❌ 51ms | ✅ Simple | ❌ No control |
-| Triton + callback | ⚠️ 68ms | ⚠️ Medium | ⚠️ Some control |
-| XLA custom call | ✅ ~15ms | ❌ High (C++) | ✅ Full control |
-| **MLIR** | ✅ ~15ms | ⚠️ Medium (Python) | ✅ Full control |
-| DaCe | ✅ 14.6ms | ⚠️ Medium | ⚠️ DaCe-specific |
+| Approach          | Performance | Complexity         | Control          |
+| ----------------- | ----------- | ------------------ | ---------------- |
+| JAX lax.scan      | ❌ 51ms     | ✅ Simple          | ❌ No control    |
+| Triton + callback | ⚠️ 68ms     | ⚠️ Medium          | ⚠️ Some control  |
+| XLA custom call   | ✅ ~15ms    | ❌ High (C++)      | ✅ Full control  |
+| **MLIR**          | ✅ ~15ms    | ⚠️ Medium (Python) | ✅ Full control  |
+| DaCe              | ✅ 14.6ms   | ⚠️ Medium          | ⚠️ DaCe-specific |
 
 MLIR gives us DaCe-like performance with Python-based code generation and full control over the GPU implementation.
 
