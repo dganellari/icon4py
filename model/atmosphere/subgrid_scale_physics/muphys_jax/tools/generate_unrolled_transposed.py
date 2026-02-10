@@ -20,12 +20,19 @@ Optimizations vs previous version:
 - Interleaved: precip and temp scans fused per-level (no concat-then-reslice)
 - Reduced carry: rho_prev/vc_prev eliminated (direct reference to level k-1)
 - Lazy slicing: inputs sliced at point of use, not upfront
+- Fast power: Replace stablehlo.power with cbrt/sqrt/exp+log decompositions
+  - x^(2/3) -> cbrt(x)^2  (vc_i: exact, ~46 vs ~100 cycles on A100)
+  - x^(-1/6) -> 1/cbrt(sqrt(x))  (snow number: exact)
+  - x^(1/6) -> cbrt(sqrt(x))  (snow species per-level: exact)
+  - 10^y -> exp(y * ln10)  (snow alf: exact decomposition)
+  - x^c -> exp(c * log(x))  (ALL per-level species: power blocks XLA fusion!)
 
 Usage:
     python generate_unrolled_transposed.py --ncells 327680 --nlev 90
 """
 
 import argparse
+import math
 
 
 def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
@@ -48,6 +55,7 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append("")
     lines.append("  // TRANSPOSED LAYOUT: tensor<nlev x ncells> for coalesced GPU memory access")
     lines.append("  // Interleaved precip + temp scans, reduced carry state")
+    lines.append("  // Fast power: all stablehlo.power replaced with cbrt/sqrt/exp+log")
     lines.append("")
 
     # Function signature - inputs are nlev x ncells (transposed)
@@ -82,7 +90,6 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append("    %cst_2 = stablehlo.constant dense<2.0> : tensor<f64>")
     lines.append("    %cst_3 = stablehlo.constant dense<3.0> : tensor<f64>")
     lines.append("    %cst_4 = stablehlo.constant dense<4.0> : tensor<f64>")
-    lines.append("    %cst_10 = stablehlo.constant dense<10.0> : tensor<f64>")
     lines.append("    %cst_30 = stablehlo.constant dense<30.0> : tensor<f64>")
     lines.append("    %false = stablehlo.constant dense<false> : tensor<i1>")
     lines.append("")
@@ -124,10 +131,7 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append("    %cst_n0s7 = stablehlo.constant dense<1.0e9> : tensor<f64>")
     lines.append("    %cst_ams = stablehlo.constant dense<0.069> : tensor<f64>")
     lines.append(
-        "    %cst_neg_one_sixth = stablehlo.constant dense<-0.16666666666666666> : tensor<f64>"
-    )
-    lines.append(
-        "    %cst_two_thirds = stablehlo.constant dense<0.66666666666666667> : tensor<f64>"
+        f"    %cst_ln10 = stablehlo.constant dense<{math.log(10.0):.17e}> : tensor<f64>"
     )
     lines.append("")
 
@@ -151,7 +155,7 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     # Broadcast constants to full size (only for Phase 1/2 on full tensors)
     # ================================================================
     lines.append("    // ========== FULL-SIZE BROADCASTS (Phase 1/2 only) ==========")
-    for name in ["0", "1", "2", "3", "4", "10", "30"]:
+    for name in ["0", "1", "2", "3", "4", "30"]:
         lines.append(
             f"    %bcast_{name} = stablehlo.broadcast_in_dim %cst_{name}, dims = [] : (tensor<f64>) -> {tf}"
         )
@@ -185,8 +189,7 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
         "n0s6",
         "n0s7",
         "ams",
-        "neg_one_sixth",
-        "two_thirds",
+        "ln10",
     ]:
         lines.append(
             f"    %bcast_{name} = stablehlo.broadcast_in_dim %cst_{name}, dims = [] : (tensor<f64>) -> {tf}"
@@ -232,8 +235,9 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
 
     # vc_r = xrho (default) — just use xrho directly, no copy
     # vc_g = xrho (default) — just use xrho directly, no copy
-    # vc_i = xrho^(2/3)
-    lines.append(f"    %vc_i_full = stablehlo.power %xrho, %bcast_two_thirds : {tf}")
+    # vc_i = cbrt(xrho)^2  [replaces: power(xrho, 2/3)]
+    lines.append(f"    %xrho_cbrt = stablehlo.cbrt %xrho : {tf}")
+    lines.append(f"    %vc_i_full = stablehlo.multiply %xrho_cbrt, %xrho_cbrt : {tf}")
     lines.append("")
 
     # vc_s = xrho * snow_number(t, rho, qs)^(-1/6)
@@ -244,7 +248,9 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append(f"    %sn_xa2_sum = stablehlo.add %bcast_xa2, %sn_xa3_tc : {tf}")
     lines.append(f"    %sn_xa2_tc = stablehlo.multiply %sn_xa2_sum, %sn_tc : {tf}")
     lines.append(f"    %sn_exp_arg = stablehlo.add %bcast_xa1, %sn_xa2_tc : {tf}")
-    lines.append(f"    %sn_alf = stablehlo.power %bcast_10, %sn_exp_arg : {tf}")
+    # 10^exp_arg = exp(exp_arg * ln10)  [replaces: power(10, exp_arg)]
+    lines.append(f"    %sn_exp_ln10 = stablehlo.multiply %sn_exp_arg, %bcast_ln10 : {tf}")
+    lines.append(f"    %sn_alf = stablehlo.exponential %sn_exp_ln10 : {tf}")
     lines.append(f"    %sn_xb3_tc = stablehlo.multiply %bcast_xb3, %sn_tc : {tf}")
     lines.append(f"    %sn_xb2_sum = stablehlo.add %bcast_xb2, %sn_xb3_tc : {tf}")
     lines.append(f"    %sn_xb2_tc = stablehlo.multiply %sn_xb2_sum, %sn_tc : {tf}")
@@ -254,7 +260,10 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append(f"    %sn_qs_rho_ams = stablehlo.divide %sn_qs_rho, %bcast_ams : {tf}")
     lines.append(f"    %sn_3bet = stablehlo.multiply %bcast_3, %sn_bet : {tf}")
     lines.append(f"    %sn_exponent = stablehlo.subtract %bcast_4, %sn_3bet : {tf}")
-    lines.append(f"    %sn_base_pow = stablehlo.power %sn_qs_rho_ams, %sn_exponent : {tf}")
+    # base^variable_exp = exp(variable_exp * log(base))  [replaces: power(base, exp)]
+    lines.append(f"    %sn_log_base = stablehlo.log %sn_qs_rho_ams : {tf}")
+    lines.append(f"    %sn_exp_times_log = stablehlo.multiply %sn_exponent, %sn_log_base : {tf}")
+    lines.append(f"    %sn_base_pow = stablehlo.exponential %sn_exp_times_log : {tf}")
     lines.append(f"    %sn_alf3 = stablehlo.multiply %sn_alf, %sn_alf : {tf}")
     lines.append(f"    %sn_alf_cubed = stablehlo.multiply %sn_alf3, %sn_alf : {tf}")
     lines.append(f"    %sn_n0s_num = stablehlo.multiply %bcast_n0s3, %sn_base_pow : {tf}")
@@ -273,7 +282,10 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append(
         f"    %snow_number = stablehlo.select %sn_qs_gt_qmin, %sn_clamped_result, %bcast_n0s0 : {tb}, {tf}"
     )
-    lines.append(f"    %sn_pow = stablehlo.power %snow_number, %bcast_neg_one_sixth : {tf}")
+    # snow_number^(-1/6) = 1/cbrt(sqrt(snow_number))  [replaces: power(snow_number, -1/6)]
+    lines.append(f"    %sn_sqrt = stablehlo.sqrt %snow_number : {tf}")
+    lines.append(f"    %sn_cbrt_sqrt = stablehlo.cbrt %sn_sqrt : {tf}")
+    lines.append(f"    %sn_pow = stablehlo.divide %bcast_1, %sn_cbrt_sqrt : {tf}")
     lines.append(f"    %vc_s_full = stablehlo.multiply %xrho, %sn_pow : {tf}")
     lines.append("")
 
@@ -444,12 +456,29 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
             )
 
             # fall_speed = prefactor * pow(rho_x + offset, exponent)
+            # [replaces: power(rho_x + offset, vel_exp)]
             lines.append(
                 f"    %rho_x_offset_{sp}_{k} = stablehlo.add %rho_x_{sp}_{k}, %bcast_qmin_{sp} : {tf1}"
             )
-            lines.append(
-                f"    %rho_x_pow_{sp}_{k} = stablehlo.power %rho_x_offset_{sp}_{k}, %bcast_vel_exp_{sp} : {tf1}"
-            )
+            if sp == "s":
+                # Snow: exponent = 1/6 -> cbrt(sqrt(x))
+                lines.append(
+                    f"    %rho_x_sqrt_{sp}_{k} = stablehlo.sqrt %rho_x_offset_{sp}_{k} : {tf1}"
+                )
+                lines.append(
+                    f"    %rho_x_pow_{sp}_{k} = stablehlo.cbrt %rho_x_sqrt_{sp}_{k} : {tf1}"
+                )
+            else:
+                # Rain/ice/graupel: exp(c*log(x))
+                lines.append(
+                    f"    %rho_x_log_{sp}_{k} = stablehlo.log %rho_x_offset_{sp}_{k} : {tf1}"
+                )
+                lines.append(
+                    f"    %rho_x_exparg_{sp}_{k} = stablehlo.multiply %bcast_vel_exp_{sp}, %rho_x_log_{sp}_{k} : {tf1}"
+                )
+                lines.append(
+                    f"    %rho_x_pow_{sp}_{k} = stablehlo.exponential %rho_x_exparg_{sp}_{k} : {tf1}"
+                )
             lines.append(
                 f"    %fall_speed_{sp}_{k} = stablehlo.multiply %bcast_vel_coeff_{sp}, %rho_x_pow_{sp}_{k} : {tf1}"
             )
@@ -485,6 +514,7 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
 
             # vt_active = vc_prev * prefactor * pow(rhox_prev + offset, exponent)
             # vc_prev is vc[k-1] (direct reference, not carry)
+            # [replaces: power(rhox_prev + offset, vel_exp)]
             if k == 0:
                 # At level 0, activated_prev=false so vt = 0 regardless
                 lines.append(
@@ -494,9 +524,25 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
                 lines.append(
                     f"    %rhox_prev_offset_{sp}_{k} = stablehlo.add %rhox_prev_{sp}_{k}, %bcast_qmin_{sp} : {tf1}"
                 )
-                lines.append(
-                    f"    %rhox_prev_pow_{sp}_{k} = stablehlo.power %rhox_prev_offset_{sp}_{k}, %bcast_vel_exp_{sp} : {tf1}"
-                )
+                if sp == "s":
+                    # Snow: exponent = 1/6 -> cbrt(sqrt(x))
+                    lines.append(
+                        f"    %rhox_prev_sqrt_{sp}_{k} = stablehlo.sqrt %rhox_prev_offset_{sp}_{k} : {tf1}"
+                    )
+                    lines.append(
+                        f"    %rhox_prev_pow_{sp}_{k} = stablehlo.cbrt %rhox_prev_sqrt_{sp}_{k} : {tf1}"
+                    )
+                else:
+                    # Rain/ice/graupel: exp(c*log(x))
+                    lines.append(
+                        f"    %rhox_prev_log_{sp}_{k} = stablehlo.log %rhox_prev_offset_{sp}_{k} : {tf1}"
+                    )
+                    lines.append(
+                        f"    %rhox_prev_exparg_{sp}_{k} = stablehlo.multiply %bcast_vel_exp_{sp}, %rhox_prev_log_{sp}_{k} : {tf1}"
+                    )
+                    lines.append(
+                        f"    %rhox_prev_pow_{sp}_{k} = stablehlo.exponential %rhox_prev_exparg_{sp}_{k} : {tf1}"
+                    )
                 lines.append(
                     f"    %vel_prefactor_{sp}_{k} = stablehlo.multiply %vc_{sp}_{k-1}, %bcast_vel_coeff_{sp} : {tf1}"
                 )
@@ -710,7 +756,10 @@ def generate_unrolled_transposed(nlev: int = 90, ncells: int = 327680) -> str:
     lines.append(f"    %pflx_tot_plus_pr = stablehlo.add %pflx_tot_full, %pflx_r_full : {tf}")
 
     # eflx / dt
-    lines.append(f"    %eflx_over_dt = stablehlo.divide %eflx_full, %bcast_30 : {tf}")
+    lines.append(
+        f"    %bcast_30_full = stablehlo.broadcast_in_dim %cst_30, dims = [] : (tensor<f64>) -> {tf}"
+    )
+    lines.append(f"    %eflx_over_dt = stablehlo.divide %eflx_full, %bcast_30_full : {tf}")
     lines.append("")
 
     # Return: qr, qs, qi, qg, t_new, pflx_tot+pr, pr, ps, pi, pg, eflx/dt
@@ -739,6 +788,9 @@ def main():
     print(f"  Layout: tensor<{args.nlev}x{args.ncells}> (nlev x ncells)")
     print("  Interleaved: precip + temp scan fused per-level")
     print("  Reduced carry: no rho_prev/vc_prev (direct references)")
+    print(
+        "  Fast power: cbrt/sqrt for x^(1/6,2/3,-1/6), exp+log for x^(0.111,0.16,0.217)"
+    )
     print("  Outputs: 11 (qr, qs, qi, qg, t_new, pflx_tot+pr, pr, ps, pi, pg, eflx/dt)")
 
     stablehlo_text = generate_unrolled_transposed(args.nlev, args.ncells)
@@ -752,6 +804,36 @@ def main():
     print(f"Written to: {args.output}")
     print(f"File size: {len(stablehlo_text) / 1024:.1f} KB")
     print(f"Lines: {stablehlo_text.count(chr(10))}")
+
+    # Count ops
+    op_count = 0
+    for op in [
+        "slice",
+        "multiply",
+        "add",
+        "subtract",
+        "divide",
+        "select",
+        "compare",
+        "concatenate",
+        "broadcast_in_dim",
+        "log",
+        "exponential",
+        "sqrt",
+        "cbrt",
+        "power",
+        "minimum",
+        "maximum",
+        "or",
+        "constant",
+    ]:
+        count = stablehlo_text.count(f"stablehlo.{op}")
+        if count > 0:
+            print(f"  stablehlo.{op}: {count}")
+            op_count += count
+    print(f"  TOTAL ops: {op_count}")
+    power_count = stablehlo_text.count("stablehlo.power")
+    print(f"  stablehlo.power: {power_count} (should be 0)")
 
 
 if __name__ == "__main__":
