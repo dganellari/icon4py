@@ -44,13 +44,17 @@ def _get_backend_early():
 
 
 _backend = _get_backend_early()
-if _backend == "iree":
-    # Must set before JAX import
+# Also check shell env in case -b was not passed
+_env_platform = os.environ.get("JAX_PLATFORMS", "")
+
+if _backend in ("iree", "iree_cuda") or _env_platform == "iree_cuda":
     os.environ["JAX_PLATFORMS"] = "iree_cuda"
-    # Configure consteval to use local-sync CPU backend
-    # This only affects compile-time constant folding, runtime uses CUDA
     os.environ["IREE_PJRT_CONSTEVAL_BACKENDS"] = "local-sync"
     print("Setting JAX_PLATFORMS=iree_cuda, consteval=local-sync (before JAX import)")
+elif _backend == "iree_rocm" or _env_platform == "iree_rocm":
+    os.environ["JAX_PLATFORMS"] = "iree_rocm"
+    os.environ["IREE_PJRT_CONSTEVAL_BACKENDS"] = "local-sync"
+    print("Setting JAX_PLATFORMS=iree_rocm, consteval=local-sync (before JAX import)")
 
 import pathlib
 import time
@@ -67,6 +71,7 @@ from muphys_jax.implementations.graupel_baseline import (
     graupel_run_split as graupel_split_run,
 )
 from muphys_jax.implementations.graupel_iree import graupel_run_iree
+from muphys_jax.implementations.graupel_iree_rocm import graupel_run_iree_rocm
 
 
 def _calc_dz(z: np.ndarray) -> np.ndarray:
@@ -231,13 +236,18 @@ def get_args():
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--iree-rocm",
+        help="use IREE ROCm optimized implementation (lax.scan, (nlev,ncells) layout, single JIT)",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
 def main():
     args = get_args()
 
-    # Backend was already set before JAX import (see top of file)
     print(f"Using JAX backend: {args.backend}")
     print(f"JAX devices: {jax.devices()}")
     print(f"JAX default backend: {jax.default_backend()}")
@@ -250,58 +260,92 @@ def main():
     print(f"Timestep: {args.dt} s")
     print(f"Cloud droplet concentration: {args.qnc} m^-3")
 
-    # Choose which implementation to use
-    use_iree = args.backend == "iree" or os.environ.get("JAX_PLATFORMS", "").startswith("iree")
+    use_iree = args.backend in ("iree", "iree_cuda", "iree_rocm") or os.environ.get(
+        "JAX_PLATFORMS", ""
+    ).startswith("iree")
 
-    if args.iree_optimized:
-        print("Mode: IREE-OPTIMIZED (fori_loop scans, sequential species)")
-        run_func = graupel_run_iree
-        run_kwargs = {}
-    elif args.split:
-        print("Mode: SPLIT JIT (IREE-compatible, 2 separate JIT boundaries)")
-        run_func = graupel_split_run
-        run_kwargs = {}
-    elif args.baseline:
-        if use_iree:
-            print("Note: IREE detected, using split JIT version for compatibility")
-            run_func = graupel_split_run
-        else:
-            run_func = graupel_baseline_run
-        print("Mode: BASELINE (vmap-batched)")
-        run_kwargs = {}
-    elif args.unrolled:
-        print("Mode: UNROLLED (static unroll)")
-        run_func = graupel_run
-        run_kwargs = dict(use_unrolled=True)
-    elif args.tiled:
-        print(f"Mode: TILED (tile_size={args.tile_size})")
-        run_func = graupel_run
-        run_kwargs = dict(use_tiled_scans=True, tile_size=args.tile_size)
+    if args.iree_rocm:
+        print("Mode: IREE-ROCM (Python-unrolled, (nlev,ncells) layout, single JIT)")
+
+        def _transpose_q(q):
+            return Q(v=q.v.T, c=q.c.T, r=q.r.T, s=q.s.T, i=q.i.T, g=q.g.T)
+
+        inp_t = jnp.array(inp.t.T)
+        inp_p = jnp.array(inp.p.T)
+        inp_rho = jnp.array(inp.rho.T)
+        inp_dz = jnp.array(inp.dz.T)
+        inp_q_t = _transpose_q(inp.q)
+
+        def _run_iree_rocm():
+            t_o, q_o, pflx_o, pr_o, ps_o, pi_o, pg_o, pre_o = graupel_run_iree_rocm(
+                inp_dz, inp_t, inp_p, inp_rho, inp_q_t, args.dt, args.qnc
+            )
+            return (
+                t_o.T,
+                Q(v=q_o.v.T, c=q_o.c.T, r=q_o.r.T, s=q_o.s.T, i=q_o.i.T, g=q_o.g.T),
+                pflx_o.T, pr_o.T, ps_o.T, pi_o.T, pg_o.T, pre_o.T,
+            )
+
+        print("\nWarming up (JIT compilation)...")
+        t_out, q_out, pflx, pr, ps, pi, pg, pre = _run_iree_rocm()
+        t_out.block_until_ready()
+        print("Compilation complete!")
+
+        start_time = None
+        num_iters = int(args.itime)
+        for iteration in range(num_iters + 1):
+            if iteration == 1:
+                start_time = time.time()
+            t_out, q_out, pflx, pr, ps, pi, pg, pre = _run_iree_rocm()
+        t_out.block_until_ready()
+
     else:
-        print("Mode: DEFAULT")
-        run_func = graupel_run
-        run_kwargs = {}
+        if args.iree_optimized:
+            print("Mode: IREE-OPTIMIZED (Python-unrolled scans, split JIT)")
+            run_func = graupel_run_iree
+            run_kwargs = {}
+        elif args.split:
+            print("Mode: SPLIT JIT (IREE-compatible, 2 separate JIT boundaries)")
+            run_func = graupel_split_run
+            run_kwargs = {}
+        elif args.baseline:
+            if use_iree:
+                print("Note: IREE detected, using split JIT version for compatibility")
+                run_func = graupel_split_run
+            else:
+                run_func = graupel_baseline_run
+            print("Mode: BASELINE (vmap-batched)")
+            run_kwargs = {}
+        elif args.unrolled:
+            print("Mode: UNROLLED (static unroll)")
+            run_func = graupel_run
+            run_kwargs = dict(use_unrolled=True)
+        elif args.tiled:
+            print(f"Mode: TILED (tile_size={args.tile_size})")
+            run_func = graupel_run
+            run_kwargs = dict(use_tiled_scans=True, tile_size=args.tile_size)
+        else:
+            print("Mode: DEFAULT")
+            run_func = graupel_run
+            run_kwargs = {}
 
-    # Warmup compilation
-    print("\nWarming up (JIT compilation)...")
-    t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
-        inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
-    )
-    t_out.block_until_ready()
-    print("Compilation complete!")
-
-    # Run iterations with timing
-    start_time = None
-    num_iters = int(args.itime)
-
-    for iteration in range(num_iters + 1):
-        if iteration == 1:
-            start_time = time.time()
+        print("\nWarming up (JIT compilation)...")
         t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
             inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
         )
+        t_out.block_until_ready()
+        print("Compilation complete!")
 
-    t_out.block_until_ready()
+        start_time = None
+        num_iters = int(args.itime)
+        for iteration in range(num_iters + 1):
+            if iteration == 1:
+                start_time = time.time()
+            t_out, q_out, pflx, pr, ps, pi, pg, pre = run_func(
+                inp.dz, inp.t, inp.p, inp.rho, inp.q, args.dt, args.qnc, **run_kwargs
+            )
+        t_out.block_until_ready()
+
     end_time = time.time()
 
     if start_time is not None:

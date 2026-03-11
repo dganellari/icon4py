@@ -236,7 +236,9 @@ def temperature_update_scan_transposed(
     nlev, ncells = t.shape
 
     init_state = TempState(
-        t=jnp.zeros(ncells), eflx=jnp.zeros(ncells), activated=jnp.zeros(ncells, dtype=bool)
+        t=jnp.zeros(ncells, dtype=t.dtype),
+        eflx=jnp.zeros(ncells, dtype=t.dtype),
+        activated=jnp.zeros(ncells, dtype=bool),
     )
 
     inputs = (

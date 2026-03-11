@@ -131,7 +131,7 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     # Full-graupel HLO path
     if is_graupel_optimized_enabled():
         results = optimized_graupel_p.bind(
-            kmin_r, kmin_i, kmin_s, kmin_g, te, p, rho, dz, q.v, q.c, q.r, q.s, q.i, q.g, dt=dt
+            kmin_r, kmin_i, kmin_s, kmin_g, te, p, rho, dz, q.v, q.c, q.r, q.s, q.i, q.g, dt
         )
         # results: t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx
         t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx = results
