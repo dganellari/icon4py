@@ -12,21 +12,33 @@ Complete composition of phase transitions and precipitation.
 Original (ncells, nlev) layout with tiled/unrolled scan options.
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
-from jax import lax
-from functools import partial
 
 from ..core import properties as props, thermo
 from ..core.common import constants as const
-from ..core.common.backend import jit_compile
-
 from ..core.definitions import Q
-from ..core.scans import precip_scan_batched, precip_scan_unrolled, precip_scan_tiled
+from ..core.scans import precip_scan_batched, precip_scan_tiled, precip_scan_unrolled
 from .graupel_baseline import q_t_update, temperature_update_scan
 
 
-def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt, tiled=False, tile_size=4, unrolled=False):
+def precipitation_effects(
+    last_lev,
+    kmin_r,
+    kmin_i,
+    kmin_s,
+    kmin_g,
+    q_in,
+    t,
+    rho,
+    dz,
+    dt,
+    tiled=False,
+    tile_size=4,
+    unrolled=False,
+):
     """
     Apply precipitation sedimentation and temperature effects.
 
@@ -59,26 +71,34 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     # Transpose to GPU-optimal layout: (ncells, nlev) -> (nlev, ncells)
     zeta_T = jnp.swapaxes(zeta, 0, 1)
     rho_T = jnp.swapaxes(rho, 0, 1)
-    q_list_T = [jnp.swapaxes(q_in.r, 0, 1), jnp.swapaxes(q_in.s, 0, 1),
-                jnp.swapaxes(q_in.i, 0, 1), jnp.swapaxes(q_in.g, 0, 1)]
-    vc_list_T = [jnp.swapaxes(vc_r, 0, 1), jnp.swapaxes(vc_s, 0, 1),
-                 jnp.swapaxes(vc_i, 0, 1), jnp.swapaxes(vc_g, 0, 1)]
-    mask_list_T = [jnp.swapaxes(kmin_r, 0, 1), jnp.swapaxes(kmin_s, 0, 1),
-                   jnp.swapaxes(kmin_i, 0, 1), jnp.swapaxes(kmin_g, 0, 1)]
+    q_list_T = [
+        jnp.swapaxes(q_in.r, 0, 1),
+        jnp.swapaxes(q_in.s, 0, 1),
+        jnp.swapaxes(q_in.i, 0, 1),
+        jnp.swapaxes(q_in.g, 0, 1),
+    ]
+    vc_list_T = [
+        jnp.swapaxes(vc_r, 0, 1),
+        jnp.swapaxes(vc_s, 0, 1),
+        jnp.swapaxes(vc_i, 0, 1),
+        jnp.swapaxes(vc_g, 0, 1),
+    ]
+    mask_list_T = [
+        jnp.swapaxes(kmin_r, 0, 1),
+        jnp.swapaxes(kmin_s, 0, 1),
+        jnp.swapaxes(kmin_i, 0, 1),
+        jnp.swapaxes(kmin_g, 0, 1),
+    ]
 
     # Run batched precipitation scans
     if unrolled:
-        results = precip_scan_unrolled(
-            params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
-        )
+        results = precip_scan_unrolled(params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T)
     elif tiled:
         results = precip_scan_tiled(
             params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T, tile_size=tile_size
         )
     else:
-        results = precip_scan_batched(
-            params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T
-        )
+        results = precip_scan_batched(params_list, zeta_T, rho_T, q_list_T, vc_list_T, mask_list_T)
 
     # Unpack and transpose back: (nlev, ncells) -> (ncells, nlev)
     (qr_T, pr_T), (qs_T, ps_T), (qi_T, pi_T), (qg_T, pg_T) = results
@@ -108,7 +128,9 @@ def precipitation_effects(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho
     return qr, qs, qi, qg, t_new, pflx_tot + pr, pr, ps, pi, pg, eflx / dt
 
 
-def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_tiled_scans=False, tile_size=4, use_unrolled=False):
+def graupel(
+    last_level, dz, te, p, rho, q, dt, qnc, use_tiled_scans=False, tile_size=4, use_unrolled=False
+):
     """
     Top-level graupel microphysics function.
     Original (ncells, nlev) layout implementation.
@@ -124,8 +146,19 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_tiled_scans=False, tile_
 
     # Precipitation effects
     qr, qs, qi, qg, t_final, pflx, pr, ps, pi, pg, pre = precipitation_effects(
-        last_level, kmin_r, kmin_i, kmin_s, kmin_g, q_updated, t_updated, rho, dz, dt,
-        tiled=use_tiled_scans, tile_size=tile_size, unrolled=use_unrolled
+        last_level,
+        kmin_r,
+        kmin_i,
+        kmin_s,
+        kmin_g,
+        q_updated,
+        t_updated,
+        rho,
+        dz,
+        dt,
+        tiled=use_tiled_scans,
+        tile_size=tile_size,
+        unrolled=use_unrolled,
     )
 
     return (
@@ -145,15 +178,37 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc, use_tiled_scans=False, tile_
 # ============================================================================
 
 
-@partial(jax.jit, static_argnames=['use_tiled_scans', 'tile_size', 'use_unrolled'])
-def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None, use_tiled_scans=False, tile_size=4, use_unrolled=False):
+@partial(jax.jit, static_argnames=["use_tiled_scans", "tile_size", "use_unrolled"])
+def graupel_run(
+    dz,
+    te,
+    p,
+    rho,
+    q_in,
+    dt,
+    qnc,
+    last_level=None,
+    use_tiled_scans=False,
+    tile_size=4,
+    use_unrolled=False,
+):
     """JIT-compiled graupel driver (original ncells x nlev layout)."""
     if last_level is None:
         last_level = te.shape[1] - 1
 
-    return graupel(last_level, dz, te, p, rho, q_in, dt, qnc,
-                   use_tiled_scans=use_tiled_scans, tile_size=tile_size,
-                   use_unrolled=use_unrolled)
+    return graupel(
+        last_level,
+        dz,
+        te,
+        p,
+        rho,
+        q_in,
+        dt,
+        qnc,
+        use_tiled_scans=use_tiled_scans,
+        tile_size=tile_size,
+        use_unrolled=use_unrolled,
+    )
 
 
 __all__ = ["graupel", "graupel_run", "precipitation_effects", "q_t_update"]

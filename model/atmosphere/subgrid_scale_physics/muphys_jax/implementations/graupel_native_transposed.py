@@ -19,34 +19,34 @@ from ..core import properties as props, thermo
 from ..core.common import constants as const
 from ..core.common.backend import jit_compile
 from ..core.definitions import Q
-from ..core.scans import (
-    precip_scan_batched_transposed,
-    temperature_update_scan_transposed,
-)
-
-from .q_t_update_fused import q_t_update_fused
+from ..core.optimized_graupel import is_graupel_optimized_enabled, optimized_graupel_p
+from ..core.optimized_precip import is_optimized_enabled, optimized_precip_transposed_p
+from ..core.scans import precip_scan_batched_transposed, temperature_update_scan_transposed
 from .graupel_baseline import q_t_update as q_t_update_native
+from .q_t_update_fused import q_t_update_fused
 
 
-from ..core.optimized_precip import (
-    optimized_precip_transposed_p,
-    is_optimized_enabled,
-)
-from ..core.optimized_graupel import (
-    optimized_graupel_p,
-    is_graupel_optimized_enabled,
-)
-
-
-def precipitation_effects_native_transposed(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
+def precipitation_effects_native_transposed(
+    last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt
+):
     """Precipitation sedimentation and temperature effects. (nlev, ncells) layout."""
     if is_optimized_enabled():
         return optimized_precip_transposed_p.bind(
-            kmin_r, kmin_i, kmin_s, kmin_g,
-            q_in.v, q_in.c, q_in.r, q_in.s, q_in.i, q_in.g,
-            t, rho, dz,
+            kmin_r,
+            kmin_i,
+            kmin_s,
+            kmin_g,
+            q_in.v,
+            q_in.c,
+            q_in.r,
+            q_in.s,
+            q_in.i,
+            q_in.g,
+            t,
+            rho,
+            dz,
             last_lev=last_lev,
-            dt=dt
+            dt=dt,
         )
 
     return _precipitation_effects_native_transposed_jax(
@@ -54,7 +54,9 @@ def precipitation_effects_native_transposed(last_lev, kmin_r, kmin_i, kmin_s, km
     )
 
 
-def _precipitation_effects_native_transposed_jax(last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt):
+def _precipitation_effects_native_transposed_jax(
+    last_lev, kmin_r, kmin_i, kmin_s, kmin_g, q_in, t, rho, dz, dt
+):
     """JAX fallback for precipitation_effects in (nlev, ncells) layout."""
     # Store initial state for energy calculation
     qliq = q_in.c + q_in.r
@@ -129,10 +131,7 @@ def graupel_native_transposed(last_level, dz, te, p, rho, q, dt, qnc):
     # Full-graupel HLO path
     if is_graupel_optimized_enabled():
         results = optimized_graupel_p.bind(
-            kmin_r, kmin_i, kmin_s, kmin_g,
-            te, p, rho, dz,
-            q.v, q.c, q.r, q.s, q.i, q.g,
-            dt=dt
+            kmin_r, kmin_i, kmin_s, kmin_g, te, p, rho, dz, q.v, q.c, q.r, q.s, q.i, q.g, dt
         )
         # results: t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx
         t_final, qv, qc, qr, qs, qi, qg, pflx, pr, ps, pi, pg, eflx = results

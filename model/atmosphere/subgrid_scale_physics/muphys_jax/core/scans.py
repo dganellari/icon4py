@@ -30,6 +30,7 @@ from .definitions import TempState
 # Core scan steps (shared by all layout/batching variants)
 # ============================================================================
 
+
 def precip_scan_step(carry, inputs):
     """Precipitation scan step — original Fortran formula with 5-element carry.
 
@@ -97,6 +98,7 @@ def temperature_scan_step(previous_level, inputs):
 # Helpers
 # ============================================================================
 
+
 def _init_carry_5(ncells, dtype):
     """Initial carry for 5-element scan step."""
     return (
@@ -131,6 +133,7 @@ def _broadcast_params(prefactor, exponent, offset, nlev, ncells):
 # Single-species scan runners (layout-specific entry/exit)
 # ============================================================================
 
+
 def _single_species_scan(params, zeta, rho, q, vc, mask):
     """Single species precipitation scan — ROW-MAJOR (ncells, nlev).
 
@@ -139,7 +142,9 @@ def _single_species_scan(params, zeta, rho, q, vc, mask):
     prefactor, exponent, offset = params
     ncells, nlev = q.shape
 
-    prefactor_arr, exponent_arr, offset_arr = _broadcast_params(prefactor, exponent, offset, nlev, ncells)
+    prefactor_arr, exponent_arr, offset_arr = _broadcast_params(
+        prefactor, exponent, offset, nlev, ncells
+    )
     init_carry = _init_carry_5(ncells, q.dtype)
 
     inputs = (prefactor_arr, exponent_arr, offset_arr, zeta.T, vc.T, q.T, rho.T, mask.T)
@@ -157,7 +162,9 @@ def _single_species_scan_transposed(params, zeta, rho, q, vc, mask):
     prefactor, exponent, offset = params
     nlev, ncells = q.shape
 
-    prefactor_arr, exponent_arr, offset_arr = _broadcast_params(prefactor, exponent, offset, nlev, ncells)
+    prefactor_arr, exponent_arr, offset_arr = _broadcast_params(
+        prefactor, exponent, offset, nlev, ncells
+    )
     init_carry = _init_carry_5(ncells, q.dtype)
 
     inputs = (prefactor_arr, exponent_arr, offset_arr, zeta, vc, q, rho, mask)
@@ -171,6 +178,7 @@ def _single_species_scan_transposed(params, zeta, rho, q, vc, mask):
 # Batched precipitation scans (4 species)
 # ============================================================================
 
+
 def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
     """4 precipitation scans via vmap — ROW-MAJOR (ncells, nlev) layout."""
     params_stacked = jnp.array(params_list)
@@ -179,8 +187,7 @@ def precip_scan_batched(params_list, zeta, rho, q_list, vc_list, mask_list):
     mask_stacked = jnp.stack(mask_list, axis=0)
 
     batched_scan = jax.vmap(
-        lambda p, q, vc, m: _single_species_scan(p, zeta, rho, q, vc, m),
-        in_axes=(0, 0, 0, 0)
+        lambda p, q, vc, m: _single_species_scan(p, zeta, rho, q, vc, m), in_axes=(0, 0, 0, 0)
     )
 
     q_updates, flxs = batched_scan(params_stacked, q_stacked, vc_stacked, mask_stacked)
@@ -196,7 +203,7 @@ def precip_scan_batched_transposed(params_list, zeta, rho, q_list, vc_list, mask
 
     batched_scan = jax.vmap(
         lambda p, q, vc, m: _single_species_scan_transposed(p, zeta, rho, q, vc, m),
-        in_axes=(0, 0, 0, 0)
+        in_axes=(0, 0, 0, 0),
     )
 
     q_updates, flxs = batched_scan(params_stacked, q_stacked, vc_stacked, mask_stacked)
@@ -210,7 +217,9 @@ def precip_scan_sequential(params_list, zeta, rho, q_list, vc_list, mask_list):
     """
     results = []
     for i in range(4):
-        q_out, flx_out = _single_species_scan(params_list[i], zeta, rho, q_list[i], vc_list[i], mask_list[i])
+        q_out, flx_out = _single_species_scan(
+            params_list[i], zeta, rho, q_list[i], vc_list[i], mask_list[i]
+        )
         results.append((q_out, flx_out))
     return results
 
@@ -219,18 +228,30 @@ def precip_scan_sequential(params_list, zeta, rho, q_list, vc_list, mask_list):
 # Temperature update scans
 # ============================================================================
 
-def temperature_update_scan_transposed(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask):
+
+def temperature_update_scan_transposed(
+    t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz, dt, mask
+):
     """Temperature update scan — COLUMN-MAJOR (nlev, ncells) layout."""
     nlev, ncells = t.shape
 
     init_state = TempState(
-        t=jnp.zeros(ncells),
-        eflx=jnp.zeros(ncells),
-        activated=jnp.zeros(ncells, dtype=bool)
+        t=jnp.zeros(ncells, dtype=t.dtype),
+        eflx=jnp.zeros(ncells, dtype=t.dtype),
+        activated=jnp.zeros(ncells, dtype=bool),
     )
 
     inputs = (
-        t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, dz,
+        t,
+        t_kp1,
+        ei_old,
+        pr,
+        pflx_tot,
+        qv,
+        qliq,
+        qice,
+        rho,
+        dz,
         jnp.full((nlev, ncells), dt),
         mask,
     )
@@ -242,6 +263,7 @@ def temperature_update_scan_transposed(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq,
 # ============================================================================
 # IREE-specific: temperature scan with tuple carry (avoids NamedTuple issues)
 # ============================================================================
+
 
 def _temperature_scan_step_iree(carry, inputs):
     """Temperature scan step with simple tuple carry for IREE compatibility."""
@@ -285,24 +307,30 @@ def temperature_scan_iree(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho, d
     )
 
     inputs = (
-        t.T, t_kp1.T, ei_old.T, pr.T, pflx_tot.T,
-        qv.T, qliq.T, qice.T, rho.T, dz.T,
-        jnp.broadcast_to(dt, (nlev, ncells)), mask.T
+        t.T,
+        t_kp1.T,
+        ei_old.T,
+        pr.T,
+        pflx_tot.T,
+        qv.T,
+        qliq.T,
+        qice.T,
+        rho.T,
+        dz.T,
+        jnp.broadcast_to(dt, (nlev, ncells)),
+        mask.T,
     )
 
     final_carry, outputs = lax.scan(_temperature_scan_step_iree, init_carry, inputs)
     t_out, eflx = outputs
 
-    return TempState(
-        t=t_out.T,
-        eflx=eflx.T,
-        activated=final_carry[1]
-    )
+    return TempState(t=t_out.T, eflx=eflx.T, activated=final_carry[1])
 
 
 # ============================================================================
 # IREE-specific: fori_loop variant
 # ============================================================================
+
 
 def _precip_fori_single_level(k, state_and_arrays):
     """Process single level in fori_loop, accumulating outputs via .at[].set()."""
@@ -361,6 +389,7 @@ def precip_scan_fori(params, zeta, rho, q, vc, mask):
 # Tiled scan (reduces D2D copies) — COLUMN-MAJOR (nlev, ncells)
 # ============================================================================
 
+
 def _single_species_scan_tiled(params, zeta, rho, q, vc, mask, tile_size=4):
     """Single species scan processing multiple levels per iteration.
 
@@ -375,7 +404,9 @@ def _single_species_scan_tiled(params, zeta, rho, q, vc, mask, tile_size=4):
     pad_size = nlev_padded - nlev
 
     if pad_size > 0:
-        pad_fn = lambda x: jnp.concatenate([x, jnp.zeros((pad_size, ncells), dtype=x.dtype)], axis=0)
+        pad_fn = lambda x: jnp.concatenate(
+            [x, jnp.zeros((pad_size, ncells), dtype=x.dtype)], axis=0
+        )
         zeta = pad_fn(zeta)
         vc = pad_fn(vc)
         q = pad_fn(q)
@@ -411,7 +442,9 @@ def _single_species_scan_tiled(params, zeta, rho, q, vc, mask, tile_size=4):
             vt_active = vc_tile[t] * prefactor * lax.pow(rhox_prev + offset, exponent)
             vt = lax.select(activated_prev, vt_active, jnp.zeros_like(q_tile[t]))
 
-            q_activated = (zeta_tile[t] * (flx_eff - flx_partial)) / ((1.0 + zeta_tile[t] * vt) * rho_tile[t])
+            q_activated = (zeta_tile[t] * (flx_eff - flx_partial)) / (
+                (1.0 + zeta_tile[t] * vt) * rho_tile[t]
+            )
             flx_activated = (q_activated * rho_tile[t] * vt + flx_partial) * 0.5
 
             q_out_t = lax.select(activated, q_activated, q_tile[t])
@@ -454,6 +487,7 @@ def precip_scan_tiled(params_list, zeta, rho, q_list, vc_list, mask_list, tile_s
 # ============================================================================
 # Static unrolled scan — COLUMN-MAJOR (nlev, ncells)
 # ============================================================================
+
 
 def _precip_column_static_unroll(params, zeta, rho, q, vc, mask, nlev=90):
     """Single species precipitation with static unroll.

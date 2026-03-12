@@ -15,6 +15,7 @@ is enabled before any test modules import JAX.
 
 import jax
 
+
 # Enable x64 precision for all tests
 # This must be set before any JAX operations or test imports
 jax.config.update("jax_enable_x64", True)

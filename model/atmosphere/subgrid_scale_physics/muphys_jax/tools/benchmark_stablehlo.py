@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Benchmark StableHLO execution time (compilation vs execution separated).
 
@@ -21,21 +29,20 @@ Usage:
 import argparse
 import pathlib
 import time
-import sys
 
-import numpy as np
-import netCDF4
 import jax
-import jax.numpy as jnp
-from jax.lib import xla_bridge
 import jaxlib._jax as jax_cpp
+import netCDF4
+import numpy as np
+from jax.lib import xla_bridge
+
 
 jax.config.update("jax_enable_x64", True)
 
 
 def load_stablehlo(path: str) -> str:
     """Load StableHLO text from file."""
-    with open(path, 'r') as f:
+    with open(path) as f:
         return f.read()
 
 
@@ -59,11 +66,12 @@ def compile_stablehlo(stablehlo_text: str, client):
 def detect_input_count(stablehlo_text: str) -> int:
     """Detect number of inputs from StableHLO @main signature."""
     import re
-    match = re.search(r'func\.func\s+public\s+@main\s*\(([^)]*)\)', stablehlo_text, re.DOTALL)
+
+    match = re.search(r"func\.func\s+public\s+@main\s*\(([^)]*)\)", stablehlo_text, re.DOTALL)
     if not match:
         return 13  # default to precip-only
     args_str = match.group(1)
-    return len(re.findall(r'%arg\d+', args_str))
+    return len(re.findall(r"%arg\d+", args_str))
 
 
 def load_inputs_from_netcdf(input_file: str, num_inputs: int = 13):
@@ -76,7 +84,7 @@ def load_inputs_from_netcdf(input_file: str, num_inputs: int = 13):
             14 = combined graupel: [kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg]
     """
     print(f"Loading inputs from: {input_file}")
-    ds = netCDF4.Dataset(input_file, 'r')
+    ds = netCDF4.Dataset(input_file, "r")
 
     try:
         ncells = len(ds.dimensions["cell"])
@@ -127,15 +135,17 @@ def load_inputs_from_netcdf(input_file: str, num_inputs: int = 13):
 
     if num_inputs == 14:
         # Combined graupel: kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg
-        print(f"  Input layout: combined graupel (14 inputs)")
+        print("  Input layout: combined graupel (14 inputs)")
         return [kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg], ncells, nlev
     else:
         # Precip-only: kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz
-        print(f"  Input layout: precip-only (13 inputs)")
+        print("  Input layout: precip-only (13 inputs)")
         return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
 
 
-def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False, num_inputs: int = 13):
+def generate_synthetic_inputs(
+    ncells: int, nlev: int, transposed: bool = False, num_inputs: int = 13
+):
     """Generate synthetic inputs for benchmarking without NetCDF file.
 
     Args:
@@ -182,10 +192,10 @@ def generate_synthetic_inputs(ncells: int, nlev: int, transposed: bool = False, 
     dz = np.ones(shape, dtype=np.float64) * 100.0
 
     if num_inputs == 14:
-        print(f"  Input layout: combined graupel (14 inputs)")
+        print("  Input layout: combined graupel (14 inputs)")
         return [kmin_r, kmin_i, kmin_s, kmin_g, t, p, rho, dz, qv, qc, qr, qs, qi, qg], ncells, nlev
     else:
-        print(f"  Input layout: precip-only (13 inputs)")
+        print("  Input layout: precip-only (13 inputs)")
         return [kmin_r, kmin_i, kmin_s, kmin_g, qv, qc, qr, qs, qi, qg, t, rho, dz], ncells, nlev
 
 
@@ -226,10 +236,14 @@ def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
     outliers = times_arr > (median_time * 1.5)
     num_outliers = np.sum(outliers)
 
-    print(f"  Min: {np.min(times_arr):.2f} ms, Max: {np.max(times_arr):.2f} ms, Median: {median_time:.2f} ms, Mean: {np.mean(times_arr):.2f} ms")
+    print(
+        f"  Min: {np.min(times_arr):.2f} ms, Max: {np.max(times_arr):.2f} ms, Median: {median_time:.2f} ms, Mean: {np.mean(times_arr):.2f} ms"
+    )
     print(f"  Total time for {num_runs} runs: {total_elapsed:.3f} s")
     if num_outliers > 0:
-        print(f"  ⚠ {num_outliers}/{num_runs} runs were outliers (>1.5x median) - GPU throttling detected")
+        print(
+            f"  ⚠ {num_outliers}/{num_runs} runs were outliers (>1.5x median) - GPU throttling detected"
+        )
 
     return times_arr
 
@@ -237,11 +251,16 @@ def benchmark_execution(executable, client, inputs, num_warmup=3, num_runs=10):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark StableHLO execution")
     parser.add_argument("stablehlo_file", help="Input StableHLO file")
-    parser.add_argument("--input", "-i", help="NetCDF input file (optional if --ncells/--nlev provided)")
+    parser.add_argument(
+        "--input", "-i", help="NetCDF input file (optional if --ncells/--nlev provided)"
+    )
     parser.add_argument("--ncells", type=int, help="Number of cells (for synthetic data)")
     parser.add_argument("--nlev", type=int, help="Number of levels (for synthetic data)")
-    parser.add_argument("--transposed", action="store_true",
-                       help="Use transposed layout (nlev×ncells) for synthetic data")
+    parser.add_argument(
+        "--transposed",
+        action="store_true",
+        help="Use transposed layout (nlev×ncells) for synthetic data",
+    )
     parser.add_argument("--compare", nargs="+", help="Additional files to compare")
     parser.add_argument("--num-warmup", type=int, default=3, help="Warmup runs")
     parser.add_argument("--num-runs", type=int, default=10, help="Benchmark runs")
@@ -288,7 +307,8 @@ def main():
                     inputs = [np.transpose(inp) for inp in inputs]
             else:
                 inputs, ncells, nlev = generate_synthetic_inputs(
-                    args.ncells, args.nlev, args.transposed, num_inputs)
+                    args.ncells, args.nlev, args.transposed, num_inputs
+                )
 
             print("  Compiling...")
             compile_start = time.perf_counter()
@@ -296,20 +316,20 @@ def main():
             compile_time = time.perf_counter() - compile_start
             print(f"  Compilation time: {compile_time:.2f}s")
 
-            times = benchmark_execution(executable, client, inputs,
-                                        args.num_warmup, args.num_runs)
+            times = benchmark_execution(executable, client, inputs, args.num_warmup, args.num_runs)
 
             results[filepath] = {
-                'compile_time': compile_time,
-                'mean': np.mean(times),
-                'std': np.std(times),
-                'min': np.min(times),
+                "compile_time": compile_time,
+                "mean": np.mean(times),
+                "std": np.std(times),
+                "min": np.min(times),
             }
             print()
 
         except Exception as e:
             print(f"  ERROR: {e}")
             import traceback
+
             traceback.print_exc()
             results[filepath] = None
             print()
@@ -326,7 +346,7 @@ def main():
             if result is None:
                 print(f"{name:<45} FAILED")
             else:
-                exec_ms = result['mean']
+                exec_ms = result["mean"]
                 if baseline_exec is None:
                     baseline_exec = exec_ms
                     speedup = "(baseline)"

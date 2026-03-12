@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ICON4Py - ICON inspired code in Python and GT4Py
+#
+# Copyright (c) 2022-2024, ETH Zurich and MeteoSwiss
+# All rights reserved.
+#
+# Please, refer to the LICENSE file in the root directory.
+# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Test and benchmark the fused q_t_update implementation.
 
@@ -12,20 +20,22 @@ Usage:
 """
 
 import argparse
-import sys
 import pathlib
+import sys
 import time
+
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent.parent.parent))
 
 import jax
+
+
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
-
-from muphys_jax.utils.data_loading import load_graupel_inputs
 from muphys_jax.core.definitions import Q
+from muphys_jax.utils.data_loading import load_graupel_inputs
 
 
 def benchmark(fn, args, name, num_warmup=10, num_runs=50):
@@ -44,7 +54,9 @@ def benchmark(fn, args, name, num_warmup=10, num_runs=50):
         times.append((time.perf_counter() - start) * 1000)
 
     times = np.array(times)
-    print(f"  {name}: {np.median(times):.3f} ms (min: {np.min(times):.3f}, std: {np.std(times):.3f})")
+    print(
+        f"  {name}: {np.median(times):.3f} ms (min: {np.min(times):.3f}, std: {np.std(times):.3f})"
+    )
     return np.median(times), result
 
 
@@ -126,7 +138,9 @@ def main():
     print(f"  Max diff qg: {max_diff_qg:.2e}")
     print(f"  Max diff t:  {max_diff_t:.2e}")
 
-    max_diff = max(max_diff_qv, max_diff_qc, max_diff_qr, max_diff_qs, max_diff_qi, max_diff_qg, max_diff_t)
+    max_diff = max(
+        max_diff_qv, max_diff_qc, max_diff_qr, max_diff_qs, max_diff_qi, max_diff_qg, max_diff_t
+    )
     if max_diff < 1e-5:
         print(f"  ✓ Results match within tolerance ({max_diff:.2e})")
     else:
@@ -149,14 +163,14 @@ def main():
 
     def analyze_stablehlo(text):
         return {
-            'size': len(text),
-            'power': text.count('stablehlo.power'),
-            'exp': text.count('stablehlo.exponential'),
-            'mul': text.count('stablehlo.multiply'),
-            'div': text.count('stablehlo.divide'),
-            'select': text.count('stablehlo.select'),
-            'compare': text.count('stablehlo.compare'),
-            'func_calls': text.count('call @'),
+            "size": len(text),
+            "power": text.count("stablehlo.power"),
+            "exp": text.count("stablehlo.exponential"),
+            "mul": text.count("stablehlo.multiply"),
+            "div": text.count("stablehlo.divide"),
+            "select": text.count("stablehlo.select"),
+            "compare": text.count("stablehlo.compare"),
+            "func_calls": text.count("call @"),
         }
 
     def wrapper_orig(t, p, rho, qv, qc, qr, qs, qi, qg, qnc):
@@ -183,7 +197,7 @@ def main():
     hlo_fused = lowered_fused.as_text()
     stats_fused = analyze_stablehlo(hlo_fused)
 
-    print(f"\nOriginal StableHLO:")
+    print("\nOriginal StableHLO:")
     print(f"  Size: {stats_orig['size']:,} chars")
     print(f"  Power ops: {stats_orig['power']}")
     print(f"  Exp ops: {stats_orig['exp']}")
@@ -193,7 +207,7 @@ def main():
     print(f"  Compare ops: {stats_orig['compare']}")
     print(f"  Function calls: {stats_orig['func_calls']}")
 
-    print(f"\nFused StableHLO:")
+    print("\nFused StableHLO:")
     print(f"  Size: {stats_fused['size']:,} chars")
     print(f"  Power ops: {stats_fused['power']}")
     print(f"  Exp ops: {stats_fused['exp']}")
@@ -204,9 +218,13 @@ def main():
     print(f"  Function calls: {stats_fused['func_calls']}")
 
     # Save fused StableHLO
-    output_path = pathlib.Path(__file__).parent.parent.parent.parent.parent.parent / "stablehlo" / "q_t_update_fused.stablehlo"
+    output_path = (
+        pathlib.Path(__file__).parent.parent.parent.parent.parent.parent
+        / "stablehlo"
+        / "q_t_update_fused.stablehlo"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         f.write(hlo_fused)
     print(f"\n✓ Saved fused StableHLO to: {output_path}")
 

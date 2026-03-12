@@ -121,7 +121,7 @@ def q_t_update(t, p, rho, q, dt, qnc):
     sx2x_s_r = jnp.where(is_sig_present, trans.snow_to_rain(t, p, rho, dvsw0, q.s), 0.0)
     sx2x_g_r = jnp.where(is_sig_present, trans.graupel_to_rain(t, p, rho, dvsw0, q.g), 0.0)
 
-    # Sink calculation 
+    # Sink calculation
     sink_v = sx2x_v_s + sx2x_v_i + sx2x_v_g
     sink_c = sx2x_c_r + sx2x_c_s + sx2x_c_i + sx2x_c_g
     sink_r = sx2x_r_v + sx2x_r_g
@@ -230,8 +230,16 @@ def temperature_update_scan(t, t_kp1, ei_old, pr, pflx_tot, qv, qliq, qice, rho,
     )
 
     inputs = (
-        t.T, t_kp1.T, ei_old.T, pr.T, pflx_tot.T,
-        qv.T, qliq.T, qice.T, rho.T, dz.T,
+        t.T,
+        t_kp1.T,
+        ei_old.T,
+        pr.T,
+        pflx_tot.T,
+        qv.T,
+        qliq.T,
+        qice.T,
+        rho.T,
+        dz.T,
         jnp.full((nlev, ncells), dt, dtype=t.dtype),
         mask.T,
     )
@@ -336,74 +344,79 @@ def graupel(last_level, dz, te, p, rho, q, dt, qnc):
 # Split JIT implementation for IREE CUDA compatibility
 # ============================================================================
 
+
 @jit_compile
 def _step1_phase_transitions(t, p, rho, q, dt, qnc):
     """Step 1: Phase transitions (saturation adjustment, ice/water conversions)."""
     return q_t_update(t, p, rho, q, dt, qnc)
 
 
-@jit_compile 
+@jit_compile
 def _step2_precipitation(t_mid, rho, dz, q_mid, dt):
     """Step 2: Precipitation sedimentation for all 4 species."""
     xrho = jnp.sqrt(const.rho_00 / rho)
-    
+
     # Velocity scale factors
     vc_r = props.vel_scale_factor_default(xrho)
     vc_s = props.vel_scale_factor_snow(xrho, rho, t_mid, q_mid.s)
     vc_i = props.vel_scale_factor_ice(xrho)
     vc_g = props.vel_scale_factor_default(xrho)
-    
+
     # Minimum thresholds
     kmin_r = q_mid.r > const.qmin
     kmin_s = q_mid.s > const.qmin
     kmin_i = q_mid.i > const.qmin
     kmin_g = q_mid.g > const.qmin
-    
+
     zeta = dt / (2.0 * dz)
-    
+
     # Fall speed parameters
     params_list = [
-        (14.58, 0.111, 1.0e-12),   # rain
+        (14.58, 0.111, 1.0e-12),  # rain
         (57.80, 0.16666666666666666, 1.0e-12),  # snow
-        (1.25, 0.160, 1.0e-12),    # ice
-        (12.24, 0.217, 1.0e-08),   # graupel
+        (1.25, 0.160, 1.0e-12),  # ice
+        (12.24, 0.217, 1.0e-08),  # graupel
     ]
-    
+
     results = precip_scan_batched(
-        params_list, zeta, rho,
+        params_list,
+        zeta,
+        rho,
         [q_mid.r, q_mid.s, q_mid.i, q_mid.g],
         [vc_r, vc_s, vc_i, vc_g],
-        [kmin_r, kmin_s, kmin_i, kmin_g]
+        [kmin_r, kmin_s, kmin_i, kmin_g],
     )
-    
+
     (qr, pr), (qs, ps), (qi, pi), (qg, pg) = results
     kmin_any = kmin_r | kmin_s | kmin_i | kmin_g
-    
+
     return qr, qs, qi, qg, pr, ps, pi, pg, kmin_any
 
 
 @jit_compile
-def _step3_temperature_correction(t_mid, q_mid, qr, qs, qi, qg, pr, ps, pi, pg, kmin_any, rho, dz, dt):
+def _step3_temperature_correction(
+    t_mid, q_mid, qr, qs, qi, qg, pr, ps, pi, pg, kmin_any, rho, dz, dt
+):
     """Step 3: Temperature correction due to precipitation energy flux."""
     qliq = q_mid.c + qr
     qice = qs + qi + qg
     pflx_tot = ps + pi + pg
-    
+
     # Internal energy before precipitation
     ei_old = thermo.internal_energy(t_mid, q_mid.v, qliq, qice, rho, dz)
-    
+
     ncells, nlev = t_mid.shape
-    
+
     # Shifted temperature for next level
     t_kp1 = jnp.concatenate([t_mid[:, 1:], t_mid[:, -1:]], axis=1)
-    
+
     # Temperature update scan
     result_t = temperature_update_scan(
         t_mid, t_kp1, ei_old, pr, pflx_tot, q_mid.v, qliq, qice, rho, dz, dt, kmin_any
     )
     t_out = result_t.t
     eflx = result_t.eflx
-    
+
     return t_out, eflx / dt, pr, pflx_tot + pr
 
 
@@ -413,19 +426,19 @@ def _step12_phase_and_precip(t, p, rho, dz, q, dt, qnc):
     """Combined step 1+2: Phase transitions followed by precipitation."""
     # Phase transitions
     q_mid, t_mid = q_t_update(t, p, rho, q, dt, qnc)
-    
+
     # Precipitation
     xrho = jnp.sqrt(const.rho_00 / rho)
     vc_r = props.vel_scale_factor_default(xrho)
     vc_s = props.vel_scale_factor_snow(xrho, rho, t_mid, q_mid.s)
     vc_i = props.vel_scale_factor_ice(xrho)
     vc_g = props.vel_scale_factor_default(xrho)
-    
+
     kmin_r = q_mid.r > const.qmin
     kmin_s = q_mid.s > const.qmin
     kmin_i = q_mid.i > const.qmin
     kmin_g = q_mid.g > const.qmin
-    
+
     zeta = dt / (2.0 * dz)
     params_list = [
         (14.58, 0.111, 1.0e-12),
@@ -433,24 +446,26 @@ def _step12_phase_and_precip(t, p, rho, dz, q, dt, qnc):
         (1.25, 0.160, 1.0e-12),
         (12.24, 0.217, 1.0e-08),
     ]
-    
+
     results = precip_scan_batched(
-        params_list, zeta, rho,
+        params_list,
+        zeta,
+        rho,
         [q_mid.r, q_mid.s, q_mid.i, q_mid.g],
         [vc_r, vc_s, vc_i, vc_g],
-        [kmin_r, kmin_s, kmin_i, kmin_g]
+        [kmin_r, kmin_s, kmin_i, kmin_g],
     )
-    
+
     (qr, pr), (qs, ps), (qi, pi), (qg, pg) = results
     kmin_any = kmin_r | kmin_s | kmin_i | kmin_g
-    
+
     return t_mid, q_mid, qr, qs, qi, qg, pr, ps, pi, pg, kmin_any
 
 
 def graupel_run_split(dz, te, p, rho, q_in, dt, qnc, last_level=None):
     """
     Graupel driver with split JIT boundaries for IREE CUDA compatibility.
-    
+
     Uses 2-stage split (optimized): steps 1+2 combined, step 3 separate.
     This reduces kernel launch overhead while staying within IREE limits.
     """
@@ -458,21 +473,22 @@ def graupel_run_split(dz, te, p, rho, q_in, dt, qnc, last_level=None):
     t_mid, q_mid, qr, qs, qi, qg, pr, ps, pi, pg, kmin_any = _step12_phase_and_precip(
         te, p, rho, dz, q_in, dt, qnc
     )
-    
+
     # Stage 2: Temperature correction (separate due to IREE limits)
     t_out, eflx, prr_tot, pflx_tot = _step3_temperature_correction(
         t_mid, q_mid, qr, qs, qi, qg, pr, ps, pi, pg, kmin_any, rho, dz, dt
     )
-    
+
     # Build outputs
     q_out = Q(v=q_mid.v, c=q_mid.c, r=qr, s=qs, i=qi, g=qg)
-    
+
     return t_out, q_out, pflx_tot, pr, ps, pi, pg, eflx
 
 
 # ============================================================================
 # JIT-compiled entry point (backend-switchable)
 # ============================================================================
+
 
 @jit_compile
 def graupel_run(dz, te, p, rho, q_in, dt, qnc, last_level=None):
