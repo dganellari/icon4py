@@ -19,7 +19,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <queue>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,33 +47,54 @@ namespace gpu {
 
 namespace {
 
-// Consecutive slices from the same source, joined by a concatenate.
+// A "SliceChain" is a sequence of concatenated slices from the same source
+// tensor, where each slice operates on a consecutive position along dim 0.
 struct SliceChain {
   HloInstruction* concat;
-  // source → ordered slices at positions 0..N-1
   absl::flat_hash_map<HloInstruction*, std::vector<HloInstruction*>>
       source_slices;
   int64_t num_iterations;
   int64_t slice_dim;
 };
 
-// Combined iteration body for a group of related concatenates transformed
-// into a single while loop.  Uses iteration 1 as the body template because
-// XLA's algebraic simplifier may eliminate iter-0 ops (add(0,x)->x, etc.),
-// making it structurally incomplete.  Iteration 0 is peeled out.
+// Combined iteration body for a GROUP of related concatenates.
+// Uses iteration-1 as the body template (not iter-0, which may be
+// constant-folded by XLA and have fewer instructions).
 struct IterationBody {
-  std::vector<HloInstruction*> instructions;  // iter-1, topo-sorted
-  std::vector<HloInstruction*> sliced_inputs;  // source tensors, deduped
-  absl::flat_hash_map<HloInstruction*, HloInstruction*> template_slice_to_source;
-  std::vector<HloInstruction*> carry_inputs;   // iter-0 → iter-1 boundary
-  std::vector<HloInstruction*> carry_outputs;  // iter-1 → iter-2 boundary
-  std::vector<HloInstruction*> level_outputs;  // per-concat iter-1 results
-  std::vector<HloInstruction*> iter0_level_outputs;  // for pre-filling accum
-  std::vector<HloInstruction*> concats;        // replaced concatenates
-  std::vector<HloInstruction*> invariant_inputs;  // constants, params, etc.
-  // k=1 slice → level_output for intra-group concat dependencies
+  // Iter-1 template instructions, topologically sorted
+  std::vector<HloInstruction*> instructions;
+
+  // Source tensors that get sliced (loop-invariant)
+  std::vector<HloInstruction*> sliced_inputs;
+
+  // Map from each k=1 slice to its source tensor
+  absl::flat_hash_map<HloInstruction*, HloInstruction*> k1_slice_to_source;
+
+  // Structurally matched carry pairs.
+  // carry_inputs[i]  = iter-0 value or k=0 slice (initial carry value)
+  // carry_outputs[i] = iter-1 value or k=1 slice (updated carry value)
+  // carry_is_shifted[i] = true if this is a k=0/k=1 slice pair (shifted carry)
+  std::vector<HloInstruction*> carry_inputs;
+  std::vector<HloInstruction*> carry_outputs;
+  std::vector<bool> carry_is_shifted;
+
+  // Per-chain level outputs
+  std::vector<HloInstruction*> iter0_level_outputs;  // for accumulator prefill
+  std::vector<HloInstruction*> iter1_level_outputs;  // body template outputs
+  std::vector<HloInstruction*> concats;
+
+  // Invariant inputs (constants, broadcasts, etc.)
+  std::vector<HloInstruction*> invariant_inputs;
+
+  // Intra-loop: k1_slice -> level_output for cross-chain dependencies
   absl::flat_hash_map<HloInstruction*, HloInstruction*>
       intra_loop_slice_to_level_output;
+
+  // Offset slices: slices from known sources at position k+offset instead of k.
+  // Maps iter-1 offset slice instruction -> (source tensor, offset).
+  // Example: t_kp1[k] = slice(t, [k+1:k+2]) has offset = 1.
+  absl::flat_hash_map<HloInstruction*, std::pair<HloInstruction*, int64_t>>
+      offset_slices;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +116,6 @@ std::optional<SliceChain> AnalyzeConcatenate(HloInstruction* concat,
   absl::flat_hash_map<HloInstruction*, std::vector<HloInstruction*>>
       source_slices;
 
-  // Stop backward trace at carry deps (other iterations' operands)
   absl::flat_hash_set<HloInstruction*> concat_operands;
   for (int64_t i = 0; i < num_ops; ++i) {
     concat_operands.insert(concat->mutable_operand(i));
@@ -116,24 +135,28 @@ std::optional<SliceChain> AnalyzeConcatenate(HloInstruction* concat,
       if (inst->opcode() == HloOpcode::kSlice) {
         auto& starts = inst->slice_starts();
         auto& limits = inst->slice_limits();
-        // Only record slices at the expected position for this operand
         if (limits[cat_dim] - starts[cat_dim] == 1 &&
             starts[cat_dim] == i) {
           HloInstruction* source = inst->mutable_operand(0);
           source_slices[source].push_back(inst);
         }
-        // Slices are leaf inputs — don't trace further
       } else {
         for (HloInstruction* op : inst->operands()) {
-          // Stop at other iterations' operands (carry deps)
           if (op != operand && concat_operands.contains(op)) continue;
+          bool is_other_concat_operand = false;
+          for (HloInstruction* user : op->users()) {
+            if (user->opcode() == HloOpcode::kConcatenate && user != concat) {
+              is_other_concat_operand = true;
+              break;
+            }
+          }
+          if (is_other_concat_operand) continue;
           worklist.push_back(op);
         }
       }
     }
   }
 
-  // Need at least one source with slices at all positions
   bool found_complete_source = false;
   for (auto& [source, slices] : source_slices) {
     if (static_cast<int64_t>(slices.size()) >= num_ops) {
@@ -156,7 +179,7 @@ std::optional<SliceChain> AnalyzeConcatenate(HloInstruction* concat,
   }
 
   if (!found_complete_source) {
-    VLOG(3) << "No complete slice source for " << concat->name();
+    VLOG(3) << "  No complete source found for concatenate " << concat->name();
     return std::nullopt;
   }
 
@@ -174,10 +197,12 @@ std::optional<SliceChain> AnalyzeConcatenate(HloInstruction* concat,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 2: Extract combined iteration body from a group of chains.
+// Step 2: Extract combined iteration body using iter-1 as template
+//
+// Uses STRUCTURAL MATCHING between iter-2 and iter-1 operand trees to
+// discover carry pairs (both regular and shifted), avoiding unreliable
+// DFS discovery-order pairing.
 // ─────────────────────────────────────────────────────────────────────────────
-// Iter-0 is peeled; iter-1 is the body template (iter-0 may be simplified
-// by algebraic passes, making it unsuitable as template).
 
 std::optional<IterationBody> ExtractGroupedIterationBody(
     const std::vector<SliceChain>& chains, HloComputation* computation) {
@@ -186,10 +211,10 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
   int64_t num_iters = chains[0].num_iterations;
   int64_t slice_dim = chains[0].slice_dim;
 
-  // Need ≥3 iters: 0 (peeled), 1 (template), 2 (carry detection)
+  // Need at least 3 iterations for k=0, k=1, k=2 template detection
   if (num_iters < 3) return std::nullopt;
 
-  // Collect k=0/k=1/k=2 slices across all chains
+  // ── Collect k=0, k=1, k=2 slices across all chains ──
   absl::flat_hash_set<HloInstruction*> all_k0_slices;
   absl::flat_hash_set<HloInstruction*> all_k1_slices;
   absl::flat_hash_set<HloInstruction*> all_k2_slices;
@@ -200,21 +225,19 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
       all_concat_operands.insert(chain.concat->mutable_operand(i));
     }
     for (auto& [source, slices] : chain.source_slices) {
-      if (!slices.empty() && slices[0]->slice_starts()[slice_dim] == 0) {
-        all_k0_slices.insert(slices[0]);
-      }
-      if (slices.size() > 1 && slices[1]->slice_starts()[slice_dim] == 1) {
-        all_k1_slices.insert(slices[1]);
-      }
-      if (slices.size() > 2 && slices[2]->slice_starts()[slice_dim] == 2) {
-        all_k2_slices.insert(slices[2]);
+      for (auto* s : slices) {
+        int64_t k = s->slice_starts()[slice_dim];
+        if (k == 0) all_k0_slices.insert(s);
+        if (k == 1) all_k1_slices.insert(s);
+        if (k == 2) all_k2_slices.insert(s);
       }
     }
   }
 
   if (all_k0_slices.empty() || all_k1_slices.empty()) return std::nullopt;
 
-  // ── Phase A: Build iteration_0_set for carry boundary detection ──
+  // ── Phase A: Build iteration_0_set ──
+  // Backward trace from k=0 concat operands.
   absl::flat_hash_set<HloInstruction*> iteration_0_set;
   {
     std::vector<HloInstruction*> worklist;
@@ -236,7 +259,6 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
             op->opcode() == HloOpcode::kConstant) {
           continue;
         }
-        // Stop at concat operands from other iterations
         if (all_concat_operands.contains(op) &&
             !iteration_0_set.contains(op)) {
           bool is_k0_output = false;
@@ -253,15 +275,15 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
     }
   }
 
-  // Forward-propagate k=0 slice dependency
-  absl::flat_hash_set<HloInstruction*> depends_on_k0_slice;
+  // Forward-propagate slice dependency within iter-0
+  absl::flat_hash_set<HloInstruction*> depends_on_slice;
   {
     std::vector<HloInstruction*> worklist(all_k0_slices.begin(),
                                            all_k0_slices.end());
     while (!worklist.empty()) {
       HloInstruction* inst = worklist.back();
       worklist.pop_back();
-      if (!depends_on_k0_slice.insert(inst).second) continue;
+      if (!depends_on_slice.insert(inst).second) continue;
       for (HloInstruction* user : inst->users()) {
         if (iteration_0_set.contains(user)) {
           worklist.push_back(user);
@@ -270,21 +292,38 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
     }
   }
 
-  // Prune to slice-dependent only
+  // Prune iteration_0_set to only slice-dependent instructions
   {
     absl::flat_hash_set<HloInstruction*> pruned;
     for (HloInstruction* inst : iteration_0_set) {
-      if (depends_on_k0_slice.contains(inst)) {
+      if (depends_on_slice.contains(inst)) {
         pruned.insert(inst);
       }
     }
     iteration_0_set = std::move(pruned);
   }
 
-  // ── Phase B: Find iter-0 carry outputs ──
-  // Backward trace from concat operand[1] into iter-0.
-  std::vector<HloInstruction*> iter0_carry_outputs;
-  absl::flat_hash_set<HloInstruction*> iter0_carry_output_set;
+  VLOG(2) << "Phase A: iteration_0_set=" << iteration_0_set.size()
+          << " slice-dependent instructions";
+
+  // ── Collect known source tensors (for offset slice detection) ──
+  absl::flat_hash_set<HloInstruction*> known_sources;
+  for (const auto& chain : chains) {
+    for (auto& [source, slices] : chain.source_slices) {
+      known_sources.insert(source);
+    }
+  }
+
+  // ── Phase B: Build iteration_1_set ──
+  // Backward trace from k=1 concat operands. Stops at:
+  //   - k=1 slices (regular slice inputs)
+  //   - k=0 slices along slice_dim (potential shifted carries)
+  //   - offset slices from known sources (position != 1, e.g. t_kp1[k]=t[k+1])
+  //   - iter-0 instructions (regular carry boundary)
+  //   - parameters/constants
+  absl::flat_hash_set<HloInstruction*> iteration_1_set;
+  absl::flat_hash_map<HloInstruction*, std::pair<HloInstruction*, int64_t>>
+      offset_slices;
   {
     std::vector<HloInstruction*> worklist;
     for (const auto& chain : chains) {
@@ -295,277 +334,307 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
       HloInstruction* inst = worklist.back();
       worklist.pop_back();
       if (!visited.insert(inst).second) continue;
+
+      // k=1 slice: regular sliced input leaf
       if (all_k1_slices.contains(inst)) continue;
 
+      // Any size-1 slice at position 0 along slice_dim: shifted carry leaf
+      if (inst->opcode() == HloOpcode::kSlice) {
+        int64_t start = inst->slice_starts()[slice_dim];
+        int64_t size = inst->slice_limits()[slice_dim] - start;
+        if (start == 0 && size == 1) {
+          continue;
+        }
+        // Offset slice from a known source: leaf with offset tracking.
+        // e.g. t_kp1[1] = slice(t, [2:3]) when processing iter-1 template.
+        if (size == 1 && start > 1) {
+          HloInstruction* source = inst->mutable_operand(0);
+          if (known_sources.contains(source)) {
+            int64_t offset = start - 1;  // offset relative to counter
+            offset_slices[inst] = {source, offset};
+            VLOG(2) << "Offset slice: " << inst->name()
+                    << " from " << source->name()
+                    << " at position " << start
+                    << " (offset=" << offset << ")";
+            continue;
+          }
+        }
+      }
+
+      // iter-0 instruction: regular carry boundary
       if (iteration_0_set.contains(inst) &&
-          depends_on_k0_slice.contains(inst)) {
-        // Distinguish carry outputs (e.g., or(False, mask_k0)) from
-        // shifted inputs (rho[k-1]).  Only k=0 slices feeding an OR
-        // outside iter-0 are carries.
-        if (all_k0_slices.contains(inst)) {
-          bool is_activated_carry = false;
-          for (HloInstruction* user : inst->users()) {
-            if (!iteration_0_set.contains(user) &&
-                user->opcode() == HloOpcode::kOr) {
-              is_activated_carry = true;
-              break;
-            }
-          }
-          if (!is_activated_carry) {
-            continue;  // Shifted input (rho/vc at k-1), not a carry
-          }
-        }
-        if (iter0_carry_output_set.insert(inst).second) {
-          iter0_carry_outputs.push_back(inst);
-        }
-        continue;  // Don't trace into iter-0
-      }
+          depends_on_slice.contains(inst)) continue;
 
-      for (HloInstruction* op : inst->operands()) {
-        worklist.push_back(op);
-      }
-    }
-  }
+      if (inst->opcode() == HloOpcode::kParameter ||
+          inst->opcode() == HloOpcode::kConstant) continue;
 
-  VLOG(2) << "Phase A: iteration_0_set=" << iteration_0_set.size()
-          << " iter0_carry_outputs=" << iter0_carry_outputs.size();
-
-  // ── Phase C: Build iteration_1_set (body template) ──
-  // Backward from operand[1], stop at k=1 slices / carries / constants.
-  absl::flat_hash_set<HloInstruction*> iteration_1_set;
-  {
-    std::vector<HloInstruction*> worklist;
-    for (const auto& chain : chains) {
-      worklist.push_back(chain.concat->mutable_operand(1));
-    }
-    absl::flat_hash_set<HloInstruction*> visited;
-    while (!worklist.empty()) {
-      HloInstruction* inst = worklist.back();
-      worklist.pop_back();
-      if (!visited.insert(inst).second) continue;
       iteration_1_set.insert(inst);
       for (HloInstruction* op : inst->operands()) {
-        if (all_k1_slices.contains(op)) {
-          iteration_1_set.insert(op);
-          continue;  // Stop at k=1 slices
-        }
-        if (op->opcode() == HloOpcode::kParameter ||
-            op->opcode() == HloOpcode::kConstant) {
-          continue;
-        }
-        // Stop at iter-0 carry outputs (these become carry_inputs)
-        if (iter0_carry_output_set.contains(op)) {
-          continue;
-        }
-        // Stop at concat operands from other iterations
-        if (all_concat_operands.contains(op) &&
-            !iteration_1_set.contains(op)) {
-          bool is_k1_output = false;
-          for (const auto& chain : chains) {
-            if (chain.concat->mutable_operand(1) == op) {
-              is_k1_output = true;
-              break;
-            }
-          }
-          if (!is_k1_output) continue;
-        }
         worklist.push_back(op);
       }
     }
   }
 
-  // Compute which iter-1 instructions depend on k=1 slices
-  absl::flat_hash_set<HloInstruction*> depends_on_k1_slice;
-  {
-    std::vector<HloInstruction*> worklist(all_k1_slices.begin(),
-                                           all_k1_slices.end());
-    while (!worklist.empty()) {
-      HloInstruction* inst = worklist.back();
-      worklist.pop_back();
-      if (!depends_on_k1_slice.insert(inst).second) continue;
+  // Prune iteration_1_set: only keep instructions depending on iter-1 inputs.
+  // Collect boundary inputs (k=0 slices + iter-0 instructions) for this.
+  absl::flat_hash_set<HloInstruction*> iter1_boundary;
+  for (HloInstruction* inst : computation->instructions()) {
+    // k=0 slices along slice_dim
+    if (inst->opcode() == HloOpcode::kSlice) {
+      int64_t start = inst->slice_starts()[slice_dim];
+      int64_t size = inst->slice_limits()[slice_dim] - start;
+      if (start == 0 && size == 1) {
+        // Check if any iter-1 instruction uses this
+        for (HloInstruction* user : inst->users()) {
+          if (iteration_1_set.contains(user)) {
+            iter1_boundary.insert(inst);
+            break;
+          }
+        }
+      }
+    }
+    // iter-0 instructions used by iter-1
+    if (iteration_0_set.contains(inst) && depends_on_slice.contains(inst)) {
       for (HloInstruction* user : inst->users()) {
         if (iteration_1_set.contains(user)) {
-          worklist.push_back(user);
-        }
-      }
-    }
-  }
-
-  // Also mark instructions that depend on carry inputs as slice-dependent
-  // (carries transitively depend on earlier slices through iter-0)
-  {
-    std::vector<HloInstruction*> worklist;
-    for (HloInstruction* ci : iter0_carry_outputs) {
-      for (HloInstruction* user : ci->users()) {
-        if (iteration_1_set.contains(user)) {
-          worklist.push_back(user);
-        }
-      }
-    }
-    while (!worklist.empty()) {
-      HloInstruction* inst = worklist.back();
-      worklist.pop_back();
-      if (!depends_on_k1_slice.insert(inst).second) continue;
-      for (HloInstruction* user : inst->users()) {
-        if (iteration_1_set.contains(user)) {
-          worklist.push_back(user);
-        }
-      }
-    }
-  }
-
-  // Also propagate from shifted inputs: k=0 slices from sliced sources
-  // that are not carries.  These read position k-1 each iteration, so
-  // dependent computations must stay in the loop body.
-  {
-    absl::flat_hash_set<HloInstruction*> source_set;
-    for (const auto& chain : chains) {
-      for (auto& [source, slices] : chain.source_slices) {
-        if (static_cast<int64_t>(slices.size()) >= num_iters) {
-          source_set.insert(source);
-        }
-      }
-    }
-
-    std::vector<HloInstruction*> worklist;
-    for (HloInstruction* inst : iteration_1_set) {
-      for (HloInstruction* op : inst->operands()) {
-        if (op->opcode() == HloOpcode::kSlice &&
-            op->slice_starts()[slice_dim] == 0 &&
-            (op->slice_limits()[slice_dim] -
-             op->slice_starts()[slice_dim]) == 1 &&
-            source_set.contains(op->mutable_operand(0)) &&
-            !iter0_carry_output_set.contains(op)) {
-          worklist.push_back(inst);
+          iter1_boundary.insert(inst);
           break;
         }
       }
     }
+  }
 
+  {
+    absl::flat_hash_set<HloInstruction*> depends_on_iter1_input;
+    std::vector<HloInstruction*> worklist;
+    for (auto* s : all_k1_slices) worklist.push_back(s);
+    for (auto* bi : iter1_boundary) worklist.push_back(bi);
+    // Offset slices are also iter-1 inputs
+    for (auto& [inst, src_off] : offset_slices) worklist.push_back(inst);
     while (!worklist.empty()) {
       HloInstruction* inst = worklist.back();
       worklist.pop_back();
-      if (!depends_on_k1_slice.insert(inst).second) continue;
+      if (!depends_on_iter1_input.insert(inst).second) continue;
       for (HloInstruction* user : inst->users()) {
         if (iteration_1_set.contains(user)) {
           worklist.push_back(user);
         }
       }
     }
-  }
-
-  // Prune iteration_1_set to slice/carry/shifted-input-dependent instructions
-  {
     absl::flat_hash_set<HloInstruction*> pruned;
     for (HloInstruction* inst : iteration_1_set) {
-      if (depends_on_k1_slice.contains(inst)) {
-        pruned.insert(inst);
-      }
+      if (depends_on_iter1_input.contains(inst)) pruned.insert(inst);
     }
     iteration_1_set = std::move(pruned);
   }
 
-  // ── Phase D: Find carry outputs of iter-1 (backward from operand[2]) ──
-  std::vector<HloInstruction*> iter1_carry_outputs;
-  absl::flat_hash_set<HloInstruction*> iter1_carry_output_set;
-  {
-    std::vector<HloInstruction*> worklist;
-    for (const auto& chain : chains) {
-      if (num_iters >= 3) {
-        worklist.push_back(chain.concat->mutable_operand(2));
-      }
-    }
-    absl::flat_hash_set<HloInstruction*> visited;
-    while (!worklist.empty()) {
-      HloInstruction* inst = worklist.back();
-      worklist.pop_back();
-      if (!visited.insert(inst).second) continue;
-      if (all_k2_slices.contains(inst)) continue;
+  VLOG(2) << "Phase B: iteration_1_set=" << iteration_1_set.size()
+          << " instructions (body template)";
 
-      if (iteration_1_set.contains(inst) && !all_k1_slices.contains(inst) &&
-          depends_on_k1_slice.contains(inst)) {
-        if (iter1_carry_output_set.insert(inst).second) {
-          iter1_carry_outputs.push_back(inst);
+  // ── Phase AC: Structural carry matching ──
+  // Walk backward from (k=2_concat_operand, k=1_concat_operand) pairs per
+  // chain. At each step, match operands by position. At carry boundaries
+  // (iter-1 value ↔ iter-0 value, or k=1 slice ↔ k=0 slice), record pairs.
+  //
+  // This replaces the old Phase A2 + Phase C + Phase D, fixing:
+  //   Bug 1: DFS discovery-order pairing was unreliable
+  //   Bug 2: Shifted k=0 slices not in source_slices were missed
+
+  struct CarryPairInfo {
+    HloInstruction* input;   // iter-0 value or k=0 slice
+    HloInstruction* output;  // iter-1 value or k=1 slice
+    bool is_shifted;
+  };
+
+  std::vector<CarryPairInfo> carry_pairs;
+  absl::flat_hash_set<HloInstruction*> carry_input_set;
+  absl::flat_hash_set<HloInstruction*> carry_output_set;
+  bool match_failed = false;
+
+  // Visited set for (i2, i1) pairs to avoid infinite recursion
+  absl::flat_hash_map<HloInstruction*, absl::flat_hash_set<HloInstruction*>>
+      match_visited;
+
+  // Recursive structural matcher
+  std::function<void(HloInstruction*, HloInstruction*)> match_carries;
+  match_carries = [&](HloInstruction* i2, HloInstruction* i1) {
+    if (match_failed) return;
+
+    // Same instruction → invariant (used identically by both iterations)
+    if (i2 == i1) return;
+
+    // Already visited this pair
+    if (match_visited[i2].contains(i1)) return;
+    match_visited[i2].insert(i1);
+
+    // Both are slices from the same source along slice_dim?
+    if (i2->opcode() == HloOpcode::kSlice &&
+        i1->opcode() == HloOpcode::kSlice &&
+        i2->mutable_operand(0) == i1->mutable_operand(0)) {
+      int64_t p2 = i2->slice_starts()[slice_dim];
+      int64_t p1 = i1->slice_starts()[slice_dim];
+      int64_t sz2 = i2->slice_limits()[slice_dim] - p2;
+      int64_t sz1 = i1->slice_limits()[slice_dim] - p1;
+      if (sz2 == 1 && sz1 == 1) {
+        if (p2 == 2 && p1 == 1) {
+          // Regular slice input: current-level for iter-2 and iter-1
+          return;
         }
-        continue;
-      }
-
-      for (HloInstruction* op : inst->operands()) {
-        worklist.push_back(op);
+        if (p2 == 1 && p1 == 0) {
+          // Shifted carry: previous-level for iter-2 and iter-1
+          if (!carry_input_set.contains(i1)) {
+            carry_pairs.push_back({i1, i2, /*is_shifted=*/true});
+            carry_input_set.insert(i1);
+            carry_output_set.insert(i2);
+            VLOG(2) << "Structural match: SHIFTED carry "
+                    << i1->name() << " -> " << i2->name()
+                    << " (source: " << i1->mutable_operand(0)->name() << ")";
+          }
+          return;
+        }
+        if (p2 - p1 == 1 && p1 > 1) {
+          // Offset slice input: e.g. t_kp1[k] = slice(t, [k+1:k+2])
+          // Both iter-2 and iter-1 use the same offset from their
+          // respective levels. Not a carry — just an input.
+          VLOG(3) << "Structural match: offset slice pair "
+                  << i1->name() << " (pos=" << p1 << ") / "
+                  << i2->name() << " (pos=" << p2 << ")";
+          return;
+        }
       }
     }
+
+    // Check carry boundary: i2 from iter-1, i1 from iter-0
+    bool i2_from_iter1 = iteration_1_set.contains(i2) ||
+                          all_k1_slices.contains(i2);
+    bool i1_from_iter0 = (iteration_0_set.contains(i1) &&
+                           depends_on_slice.contains(i1));
+
+    // Also check if i1 is a k=0 slice not in iteration_0_set
+    // (shifted carry from a source not tracked by AnalyzeConcatenate)
+    if (!i1_from_iter0 && i1->opcode() == HloOpcode::kSlice) {
+      int64_t start = i1->slice_starts()[slice_dim];
+      int64_t size = i1->slice_limits()[slice_dim] - start;
+      if (start == 0 && size == 1) {
+        i1_from_iter0 = true;
+      }
+    }
+
+    if (i2_from_iter1 && i1_from_iter0) {
+      // Regular carry boundary
+      if (!carry_input_set.contains(i1)) {
+        bool shifted = (i1->opcode() == HloOpcode::kSlice &&
+                        i1->slice_starts()[slice_dim] == 0 &&
+                        i2->opcode() == HloOpcode::kSlice &&
+                        i2->slice_starts()[slice_dim] == 1 &&
+                        i1->mutable_operand(0) == i2->mutable_operand(0));
+        carry_pairs.push_back({i1, i2, shifted});
+        carry_input_set.insert(i1);
+        carry_output_set.insert(i2);
+        VLOG(2) << "Structural match: " << (shifted ? "SHIFTED" : "REGULAR")
+                << " carry " << i1->name() << " -> " << i2->name();
+      }
+      return;
+    }
+
+    // If one side is a boundary but not the other, possible mismatch
+    if (i2_from_iter1 || i1_from_iter0) {
+      VLOG(1) << "WARNING: asymmetric carry boundary: i2=" << i2->name()
+              << " (from_iter1=" << i2_from_iter1 << ") i1=" << i1->name()
+              << " (from_iter0=" << i1_from_iter0 << ")";
+      // Treat as carry pair anyway (best effort)
+      if (!carry_input_set.contains(i1)) {
+        carry_pairs.push_back({i1, i2, false});
+        carry_input_set.insert(i1);
+        carry_output_set.insert(i2);
+      }
+      return;
+    }
+
+    // Both constants → invariant
+    if ((i2->opcode() == HloOpcode::kConstant ||
+         i2->opcode() == HloOpcode::kParameter) &&
+        (i1->opcode() == HloOpcode::kConstant ||
+         i1->opcode() == HloOpcode::kParameter)) {
+      return;
+    }
+
+    // Both are body instructions of their respective iterations → recurse
+    if (i2->opcode() != i1->opcode() ||
+        i2->operand_count() != i1->operand_count()) {
+      VLOG(1) << "Structural mismatch: i2=" << i2->name()
+              << " (" << HloOpcodeString(i2->opcode()) << "/"
+              << i2->operand_count() << ") vs i1=" << i1->name()
+              << " (" << HloOpcodeString(i1->opcode()) << "/"
+              << i1->operand_count() << ")";
+      match_failed = true;
+      return;
+    }
+
+    for (int64_t j = 0; j < i2->operand_count(); ++j) {
+      match_carries(i2->mutable_operand(j), i1->mutable_operand(j));
+    }
+  };
+
+  // Run structural matching from each chain's (k=2 operand, k=1 operand)
+  for (const auto& chain : chains) {
+    match_carries(chain.concat->mutable_operand(2),
+                  chain.concat->mutable_operand(1));
   }
 
-  VLOG(2) << "Phase C: iteration_1_set=" << iteration_1_set.size()
-          << " Phase D: iter1_carry_outputs=" << iter1_carry_outputs.size();
+  if (match_failed) {
+    VLOG(1) << "Structural carry matching failed — aborting";
+    return std::nullopt;
+  }
 
-  // ── Phase E: Pair carry inputs with carry outputs (forward BFS) ──
+  VLOG(2) << "Phase AC: " << carry_pairs.size()
+          << " structurally matched carry pairs";
+  for (const auto& cp : carry_pairs) {
+    VLOG(2) << "  carry: " << cp.input->name() << " -> " << cp.output->name()
+            << (cp.is_shifted ? " [SHIFTED]" : " [REGULAR]");
+  }
+
+  // ── Build IterationBody ──
   IterationBody body;
-  absl::flat_hash_set<HloInstruction*> iter1_carry_output_set_local(
-      iter1_carry_outputs.begin(), iter1_carry_outputs.end());
-  absl::flat_hash_set<HloInstruction*> claimed_carry_outputs;
 
-  for (HloInstruction* ci : iter0_carry_outputs) {
-    std::queue<HloInstruction*> q;
-    for (HloInstruction* user : ci->users()) {
-      if (iteration_1_set.contains(user)) {
-        q.push(user);
-      }
-    }
-    absl::flat_hash_set<HloInstruction*> seen;
-    HloInstruction* matched_co = nullptr;
-    while (!q.empty() && matched_co == nullptr) {
-      HloInstruction* inst = q.front();
-      q.pop();
-      if (!seen.insert(inst).second) continue;
-      if (iter1_carry_output_set_local.contains(inst) &&
-          !claimed_carry_outputs.contains(inst)) {
-        matched_co = inst;
-        break;
-      }
-      for (HloInstruction* user : inst->users()) {
-        if (iteration_1_set.contains(user)) {
-          q.push(user);
-        }
-      }
-    }
-    if (matched_co != nullptr) {
-      claimed_carry_outputs.insert(matched_co);
-      body.carry_inputs.push_back(ci);
-      body.carry_outputs.push_back(matched_co);
-      VLOG(2) << "carry pair: " << ci->name() << " -> " << matched_co->name();
-    } else {
-      VLOG(2) << "carry_in=" << ci->name() << " has no matching carry output";
-    }
+  for (const auto& cp : carry_pairs) {
+    body.carry_inputs.push_back(cp.input);
+    body.carry_outputs.push_back(cp.output);
+    body.carry_is_shifted.push_back(cp.is_shifted);
   }
 
-  // Topo-sort iteration-1 instructions
+  // Transfer offset slices
+  body.offset_slices = std::move(offset_slices);
+
+  // Topologically sort iter-1 instructions
   for (HloInstruction* inst : computation->MakeInstructionPostOrder()) {
     if (iteration_1_set.contains(inst)) {
       body.instructions.push_back(inst);
     }
   }
 
+  // Concats, level outputs, and intra-loop dependencies
   absl::flat_hash_set<HloInstruction*> concat_set;
-  absl::flat_hash_map<HloInstruction*, HloInstruction*> concat_to_level_output;
+  absl::flat_hash_map<HloInstruction*, HloInstruction*> concat_to_k1_output;
   for (const auto& chain : chains) {
     concat_set.insert(chain.concat);
-    concat_to_level_output[chain.concat] = chain.concat->mutable_operand(1);
+    concat_to_k1_output[chain.concat] = chain.concat->mutable_operand(1);
   }
 
+  // Collect sliced inputs from k=1 slices in chain.source_slices
   absl::flat_hash_set<HloInstruction*> seen_sources;
   for (const auto& chain : chains) {
     for (auto& [source, slices] : chain.source_slices) {
+      // Intra-loop: source is a concat of another chain
       if (concat_set.contains(source)) {
-        // Intra-loop dep: use level_output instead of slicing the concat
-        if (slices.size() > 1 && slices[1]->slice_starts()[slice_dim] == 1) {
-          auto level_it = concat_to_level_output.find(source);
-          if (level_it != concat_to_level_output.end()) {
-            body.intra_loop_slice_to_level_output[slices[1]] =
-                level_it->second;
-            VLOG(2) << "Intra-loop slice: " << slices[1]->name()
-                    << " -> level_output " << level_it->second->name()
-                    << " (source concat: " << source->name() << ")";
+        for (auto* s : slices) {
+          if (s->slice_starts()[slice_dim] == 1) {
+            auto level_it = concat_to_k1_output.find(source);
+            if (level_it != concat_to_k1_output.end()) {
+              body.intra_loop_slice_to_level_output[s] = level_it->second;
+              VLOG(2) << "Intra-loop k1_slice: " << s->name()
+                      << " -> level_output " << level_it->second->name();
+            }
           }
         }
         continue;
@@ -573,39 +642,65 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
       if (seen_sources.insert(source).second) {
         body.sliced_inputs.push_back(source);
       }
-      if (slices.size() > 1 && slices[1]->slice_starts()[slice_dim] == 1) {
-        body.template_slice_to_source[slices[1]] = source;
+      // Record k=1 slice → source
+      for (auto* s : slices) {
+        if (s->slice_starts()[slice_dim] == 1) {
+          body.k1_slice_to_source[s] = source;
+        }
       }
     }
   }
 
+  // Add offset slice sources to sliced_inputs if not already present
+  for (auto& [inst, src_off] : body.offset_slices) {
+    auto [source, offset] = src_off;
+    if (!concat_set.contains(source) &&
+        seen_sources.insert(source).second) {
+      body.sliced_inputs.push_back(source);
+      VLOG(2) << "Added offset slice source: " << source->name();
+    }
+  }
+
+  // Add shifted carry sources to sliced_inputs (they may not be in
+  // chain.source_slices because AnalyzeConcatenate only tracks slices
+  // whose position matches the concat operand index)
+  for (size_t i = 0; i < body.carry_inputs.size(); ++i) {
+    if (body.carry_is_shifted[i]) {
+      HloInstruction* k0_slice = body.carry_inputs[i];
+      HloInstruction* k1_slice = body.carry_outputs[i];
+      HloInstruction* source = k0_slice->mutable_operand(0);
+      if (!concat_set.contains(source) &&
+          seen_sources.insert(source).second) {
+        body.sliced_inputs.push_back(source);
+        VLOG(2) << "Added shifted carry source: " << source->name();
+      }
+      // Also record k=1 slice → source for the shifted carry
+      body.k1_slice_to_source[k1_slice] = k1_slice->mutable_operand(0);
+    }
+  }
+
+  // Level outputs
   for (const auto& chain : chains) {
-    body.level_outputs.push_back(chain.concat->mutable_operand(1));
     body.iter0_level_outputs.push_back(chain.concat->mutable_operand(0));
+    body.iter1_level_outputs.push_back(chain.concat->mutable_operand(1));
     body.concats.push_back(chain.concat);
   }
 
-  // Find invariant inputs (outside iter_1_set, not carries/sources/concats).
-  // Exclude k=0 slices from sliced sources — those are shifted inputs
-  // (e.g., rho[k-1]) handled via dynamic_slice(source, counter-1).
-  absl::flat_hash_set<HloInstruction*> carry_input_set(
-      body.carry_inputs.begin(), body.carry_inputs.end());
-  absl::flat_hash_set<HloInstruction*> sliced_input_set(
+  // Invariant inputs: operands of iter-1 instructions that are not
+  // in iter-1 set, not carry inputs, not k=1 slices, not sliced sources,
+  // not offset slices.
+  absl::flat_hash_set<HloInstruction*> sliced_set(
       body.sliced_inputs.begin(), body.sliced_inputs.end());
+  absl::flat_hash_set<HloInstruction*> offset_slice_set;
+  for (auto& [inst, src_off] : body.offset_slices) {
+    offset_slice_set.insert(inst);
+  }
   absl::flat_hash_set<HloInstruction*> invariant_set;
   for (HloInstruction* inst : body.instructions) {
     for (HloInstruction* op : inst->operands()) {
       if (!iteration_1_set.contains(op) && !carry_input_set.contains(op) &&
-          !concat_set.contains(op) && !sliced_input_set.contains(op)) {
-        // Shifted inputs (k=0 slices from sliced sources) are handled
-        // separately in BuildWhileLoop as dynamic_slice(source, counter-1).
-        if (op->opcode() == HloOpcode::kSlice &&
-            op->slice_starts()[slice_dim] == 0 &&
-            (op->slice_limits()[slice_dim] -
-             op->slice_starts()[slice_dim]) == 1 &&
-            sliced_input_set.contains(op->mutable_operand(0))) {
-          continue;
-        }
+          !all_k1_slices.contains(op) && !concat_set.contains(op) &&
+          !sliced_set.contains(op) && !offset_slice_set.contains(op)) {
         if (invariant_set.insert(op).second) {
           body.invariant_inputs.push_back(op);
         }
@@ -613,17 +708,20 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
     }
   }
 
-  VLOG(1) << "Body: " << body.instructions.size() << " insts, "
-          << body.sliced_inputs.size() << " sliced, "
-          << body.carry_inputs.size() << " carry, "
-          << body.level_outputs.size() << " outputs, "
-          << body.invariant_inputs.size() << " invariant";
+  VLOG(2) << "Combined body (iter-1 template): " << body.instructions.size()
+          << " instructions, " << body.sliced_inputs.size() << " sliced inputs, "
+          << body.carry_inputs.size() << " carry pairs ("
+          << [&]() { int n = 0; for (auto s : body.carry_is_shifted) if (s) n++; return n; }()
+          << " shifted), "
+          << body.offset_slices.size() << " offset slices, "
+          << body.iter1_level_outputs.size() << " level outputs, "
+          << body.invariant_inputs.size() << " invariant inputs";
 
   return body;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step 3: Build the while loop for a group of concatenates
+// Step 3: Build the while loop (iter-0 peeled, iter-1 as body template)
 // ─────────────────────────────────────────────────────────────────────────────
 
 absl::StatusOr<bool> BuildWhileLoop(
@@ -635,34 +733,48 @@ absl::StatusOr<bool> BuildWhileLoop(
   int64_t slice_dim = chains[0].slice_dim;
 
   VLOG(1) << "Building while loop for " << chains.size() << " concatenates"
-          << " (" << num_iters << " iterations, peeling iter-0)";
+          << " (" << num_iters << " iterations, iter-0 peeled)";
 
   int num_carry = body.carry_outputs.size();
-  int num_accum = body.level_outputs.size();
-  int num_invariant = body.sliced_inputs.size() + body.invariant_inputs.size();
-  int tuple_size = 1 + num_carry + num_accum + num_invariant;
+  int num_accum = body.iter1_level_outputs.size();
+  int num_sliced = body.sliced_inputs.size();
+  int num_invariant = body.invariant_inputs.size();
 
-  VLOG(2) << "While tuple: 1 counter + " << num_carry << " carry + "
-          << num_accum << " accumulators + " << num_invariant << " invariant = "
-          << tuple_size;
+  // Tuple layout:
+  // [0]                                  : counter (starts at 1)
+  // [1 .. 1+num_carry)                   : carries
+  // [1+num_carry .. 1+num_carry+num_accum) : accumulators
+  // [+num_sliced .. )                    : sliced inputs
+  // [+num_invariant .. )                 : invariant inputs
+  int carry_off = 1;
+  int accum_off = carry_off + num_carry;
+  int sliced_off = accum_off + num_accum;
+  int inv_off = sliced_off + num_sliced;
+  int tuple_size = inv_off + num_invariant;
 
+  VLOG(2) << "Tuple: 1 counter + " << num_carry << " carry + "
+          << num_accum << " accum + " << num_sliced << " sliced + "
+          << num_invariant << " invariant = " << tuple_size;
+
+  // ── Tuple shapes ──
   std::vector<Shape> tuple_shapes;
   tuple_shapes.push_back(ShapeUtil::MakeShape(S64, {}));  // counter
-  for (HloInstruction* carry : body.carry_outputs) {
-    tuple_shapes.push_back(carry->shape());
+  for (int i = 0; i < num_carry; ++i) {
+    // Carry shape: use carry_output shape (must match carry_input shape)
+    tuple_shapes.push_back(body.carry_outputs[i]->shape());
   }
-  for (int i = 0; i < num_accum; ++i) {
-    tuple_shapes.push_back(body.concats[i]->shape());
+  for (auto* concat : body.concats) {
+    tuple_shapes.push_back(concat->shape());  // accumulator shape
   }
-  for (HloInstruction* src : body.sliced_inputs) {
+  for (auto* src : body.sliced_inputs) {
     tuple_shapes.push_back(src->shape());
   }
-  for (HloInstruction* inv : body.invariant_inputs) {
+  for (auto* inv : body.invariant_inputs) {
     tuple_shapes.push_back(inv->shape());
   }
-
   Shape tuple_shape = ShapeUtil::MakeTupleShape(tuple_shapes);
 
+  // ── Initial values ──
   // Counter starts at 1 (iter-0 is peeled)
   HloInstruction* one_init = computation->AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(1)));
@@ -670,50 +782,45 @@ absl::StatusOr<bool> BuildWhileLoop(
   std::vector<HloInstruction*> init_values;
   init_values.push_back(one_init);
 
-  // Carry initial values = peeled iter-0 carry outputs
-  for (HloInstruction* carry_in : body.carry_inputs) {
-    init_values.push_back(carry_in);
+  // Carry initial values = iter-0 outputs (already computed in original graph)
+  for (auto* ci : body.carry_inputs) {
+    init_values.push_back(ci);
+    VLOG(2) << "carry init: " << ci->name()
+            << " (opcode=" << HloOpcodeString(ci->opcode()) << ")";
   }
 
-  // Accumulators: zeros + iter-0 result at position 0
+  // Accumulators: zero-filled, then prefill position 0 with iter-0 outputs
   HloInstruction* zero_idx = computation->AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(0)));
-
   for (int i = 0; i < num_accum; ++i) {
-    const Shape& accum_shape = body.concats[i]->shape();
-    PrimitiveType elem_type = accum_shape.element_type();
-
-    HloInstruction* zero_const = computation->AddInstruction(
+    PrimitiveType elem_type = body.concats[i]->shape().element_type();
+    HloInstruction* zero_elem = computation->AddInstruction(
         HloInstruction::CreateConstant(LiteralUtil::Zero(elem_type)));
-    HloInstruction* zeros_accum = computation->AddInstruction(
-        HloInstruction::CreateBroadcast(accum_shape, zero_const, {}));
+    HloInstruction* zero_accum = computation->AddInstruction(
+        HloInstruction::CreateBroadcast(body.concats[i]->shape(),
+                                         zero_elem, {}));
 
+    // DUS iter-0 level output at position 0
     HloInstruction* iter0_out = body.iter0_level_outputs[i];
-
-    int64_t rank = accum_shape.dimensions_size();
-    std::vector<HloInstruction*> dus_indices;
+    int64_t rank = zero_accum->shape().dimensions_size();
+    std::vector<HloInstruction*> update_indices;
     for (int64_t d = 0; d < rank; ++d) {
-      dus_indices.push_back(zero_idx);  // All start at 0 for iter-0
+      update_indices.push_back(zero_idx);
     }
-
-    HloInstruction* accum_with_iter0 = computation->AddInstruction(
+    HloInstruction* prefilled = computation->AddInstruction(
         HloInstruction::CreateDynamicUpdateSlice(
-            accum_shape, zeros_accum, iter0_out, dus_indices));
-
-    init_values.push_back(accum_with_iter0);
+            zero_accum->shape(), zero_accum, iter0_out, update_indices));
+    init_values.push_back(prefilled);
   }
 
-  for (HloInstruction* src : body.sliced_inputs) {
-    init_values.push_back(src);
-  }
-  for (HloInstruction* inv : body.invariant_inputs) {
-    init_values.push_back(inv);
-  }
+  // Sliced inputs and invariants (pass-through)
+  for (auto* src : body.sliced_inputs) init_values.push_back(src);
+  for (auto* inv : body.invariant_inputs) init_values.push_back(inv);
 
   HloInstruction* init_tuple = computation->AddInstruction(
       HloInstruction::CreateTuple(init_values));
 
-  // Condition: counter < num_iters
+  // ── Condition computation: counter < num_iters ──
   HloComputation::Builder cond_builder("while_cond");
   HloInstruction* cond_param = cond_builder.AddInstruction(
       HloInstruction::CreateParameter(0, tuple_shape, "param"));
@@ -728,58 +835,66 @@ absl::StatusOr<bool> BuildWhileLoop(
   HloComputation* cond_comp =
       computation->parent()->AddEmbeddedComputation(cond_builder.Build());
 
-  // Body computation
+  // ── Body computation ──
   HloComputation::Builder body_builder("while_body");
   HloInstruction* body_param = body_builder.AddInstruction(
       HloInstruction::CreateParameter(0, tuple_shape, "param"));
 
+  // Extract tuple elements
   HloInstruction* counter = body_builder.AddInstruction(
       HloInstruction::CreateGetTupleElement(body_param, 0));
 
   std::vector<HloInstruction*> carry_values;
   for (int i = 0; i < num_carry; ++i) {
     carry_values.push_back(body_builder.AddInstruction(
-        HloInstruction::CreateGetTupleElement(body_param, 1 + i)));
+        HloInstruction::CreateGetTupleElement(body_param, carry_off + i)));
   }
 
   std::vector<HloInstruction*> accumulators;
   for (int i = 0; i < num_accum; ++i) {
     accumulators.push_back(body_builder.AddInstruction(
-        HloInstruction::CreateGetTupleElement(body_param,
-                                               1 + num_carry + i)));
+        HloInstruction::CreateGetTupleElement(body_param, accum_off + i)));
   }
 
-  int inv_offset = 1 + num_carry + num_accum;
   std::vector<HloInstruction*> sliced_inputs_in_body;
-  for (int i = 0; i < static_cast<int>(body.sliced_inputs.size()); ++i) {
+  for (int i = 0; i < num_sliced; ++i) {
     sliced_inputs_in_body.push_back(body_builder.AddInstruction(
-        HloInstruction::CreateGetTupleElement(body_param, inv_offset + i)));
+        HloInstruction::CreateGetTupleElement(body_param, sliced_off + i)));
   }
 
   std::vector<HloInstruction*> invariant_in_body;
-  int other_inv_offset = inv_offset + body.sliced_inputs.size();
-  for (int i = 0; i < static_cast<int>(body.invariant_inputs.size()); ++i) {
+  for (int i = 0; i < num_invariant; ++i) {
     invariant_in_body.push_back(body_builder.AddInstruction(
-        HloInstruction::CreateGetTupleElement(body_param,
-                                               other_inv_offset + i)));
+        HloInstruction::CreateGetTupleElement(body_param, inv_off + i)));
   }
 
+  // ── Dynamic-slice at counter for k=1 slices ──
   HloInstruction* zero_body = body_builder.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(0)));
 
   absl::flat_hash_map<HloInstruction*, int> source_to_idx;
-  for (int i = 0; i < static_cast<int>(body.sliced_inputs.size()); ++i) {
+  for (int i = 0; i < num_sliced; ++i) {
     source_to_idx[body.sliced_inputs[i]] = i;
   }
 
-  // Replace k=1 template slices with dynamic_slice(source, counter)
   absl::flat_hash_map<HloInstruction*, HloInstruction*> slice_replacement;
+  // Track source → dynamic_slice in body for reuse by shifted carry outputs
+  absl::flat_hash_map<HloInstruction*, HloInstruction*> source_to_dyn_slice;
+
   for (const auto& chain : chains) {
     for (auto& [source, slices] : chain.source_slices) {
-      if (slices.size() < 2) continue;
-      HloInstruction* k1_slice = slices[1];
+      // Find k=1 slice for this source in this chain
+      HloInstruction* k1_slice = nullptr;
+      for (auto* s : slices) {
+        if (s->slice_starts()[slice_dim] == 1) {
+          k1_slice = s;
+          break;
+        }
+      }
+      if (!k1_slice) continue;
       if (slice_replacement.contains(k1_slice)) continue;
 
+      // Skip intra-loop slices (mapped to level_outputs during cloning)
       if (body.intra_loop_slice_to_level_output.contains(k1_slice)) continue;
 
       auto src_it = source_to_idx.find(source);
@@ -789,11 +904,7 @@ absl::StatusOr<bool> BuildWhileLoop(
       int64_t rank = source->shape().dimensions_size();
       std::vector<HloInstruction*> start_indices;
       for (int64_t d = 0; d < rank; ++d) {
-        if (d == slice_dim) {
-          start_indices.push_back(counter);
-        } else {
-          start_indices.push_back(zero_body);
-        }
+        start_indices.push_back(d == slice_dim ? counter : zero_body);
       }
 
       std::vector<int64_t> slice_sizes;
@@ -807,93 +918,138 @@ absl::StatusOr<bool> BuildWhileLoop(
               k1_slice->shape(), source_in_body, start_indices, slice_sizes));
 
       slice_replacement[k1_slice] = dyn_slice;
+      source_to_dyn_slice[source] = dyn_slice;
     }
   }
 
-  // Clone the iteration body
-  absl::flat_hash_map<HloInstruction*, HloInstruction*> cloned;
-  for (auto& [orig, replacement] : slice_replacement) {
-    cloned[orig] = replacement;
+  // ── Dynamic-slice at counter+offset for offset slices ──
+  for (auto& [k1_slice, src_off] : body.offset_slices) {
+    auto [source, offset] = src_off;
+    if (slice_replacement.contains(k1_slice)) continue;
+
+    auto src_it = source_to_idx.find(source);
+    if (src_it == source_to_idx.end()) {
+      VLOG(1) << "ERROR: offset slice source " << source->name()
+              << " not in sliced_inputs";
+      return false;
+    }
+    HloInstruction* source_in_body = sliced_inputs_in_body[src_it->second];
+
+    // counter + offset
+    HloInstruction* offset_val = body_builder.AddInstruction(
+        HloInstruction::CreateConstant(
+            LiteralUtil::CreateR0<int64_t>(offset)));
+    HloInstruction* counter_plus_offset = body_builder.AddInstruction(
+        HloInstruction::CreateBinary(
+            ShapeUtil::MakeShape(S64, {}), HloOpcode::kAdd,
+            counter, offset_val));
+
+    int64_t rank = source->shape().dimensions_size();
+    std::vector<HloInstruction*> start_indices;
+    for (int64_t d = 0; d < rank; ++d) {
+      start_indices.push_back(d == slice_dim ? counter_plus_offset : zero_body);
+    }
+
+    std::vector<int64_t> slice_sizes;
+    for (int64_t d = 0; d < rank; ++d) {
+      slice_sizes.push_back(
+          k1_slice->slice_limits()[d] - k1_slice->slice_starts()[d]);
+    }
+
+    HloInstruction* dyn_slice = body_builder.AddInstruction(
+        HloInstruction::CreateDynamicSlice(
+            k1_slice->shape(), source_in_body, start_indices, slice_sizes));
+
+    slice_replacement[k1_slice] = dyn_slice;
+    VLOG(2) << "Created offset dynamic_slice for " << k1_slice->name()
+            << " from " << source->name() << " at counter+" << offset;
   }
 
-  for (int i = 0; i < static_cast<int>(body.invariant_inputs.size()); ++i) {
+  // Also create dynamic_slices for shifted carry sources not already handled
+  for (int i = 0; i < num_carry; ++i) {
+    if (!body.carry_is_shifted[i]) continue;
+    HloInstruction* k1_slice = body.carry_outputs[i];
+    if (slice_replacement.contains(k1_slice)) continue;
+
+    HloInstruction* source = k1_slice->mutable_operand(0);
+    // Check if we already have a dynamic_slice for this source
+    auto ds_it = source_to_dyn_slice.find(source);
+    if (ds_it != source_to_dyn_slice.end()) {
+      slice_replacement[k1_slice] = ds_it->second;
+      continue;
+    }
+
+    auto src_it = source_to_idx.find(source);
+    if (src_it == source_to_idx.end()) {
+      VLOG(1) << "ERROR: shifted carry source " << source->name()
+              << " not in sliced_inputs";
+      return false;
+    }
+    HloInstruction* source_in_body = sliced_inputs_in_body[src_it->second];
+
+    int64_t rank = source->shape().dimensions_size();
+    std::vector<HloInstruction*> start_indices;
+    for (int64_t d = 0; d < rank; ++d) {
+      start_indices.push_back(d == slice_dim ? counter : zero_body);
+    }
+
+    std::vector<int64_t> slice_sizes;
+    for (int64_t d = 0; d < rank; ++d) {
+      slice_sizes.push_back(
+          k1_slice->slice_limits()[d] - k1_slice->slice_starts()[d]);
+    }
+
+    HloInstruction* dyn_slice = body_builder.AddInstruction(
+        HloInstruction::CreateDynamicSlice(
+            k1_slice->shape(), source_in_body, start_indices, slice_sizes));
+
+    slice_replacement[k1_slice] = dyn_slice;
+    source_to_dyn_slice[source] = dyn_slice;
+    VLOG(2) << "Created dynamic_slice for shifted carry output from "
+            << source->name();
+  }
+
+  // ── Build clone map ──
+  absl::flat_hash_map<HloInstruction*, HloInstruction*> cloned;
+
+  // k=1 slices → dynamic_slice at counter
+  for (auto& [orig, repl] : slice_replacement) {
+    cloned[orig] = repl;
+  }
+
+  // Carry inputs → carry tuple values
+  for (int i = 0; i < num_carry; ++i) {
+    cloned[body.carry_inputs[i]] = carry_values[i];
+    VLOG(2) << "pre-seed carry: " << body.carry_inputs[i]->name()
+            << " -> carry_values[" << i << "]";
+  }
+
+  // Invariant inputs
+  for (int i = 0; i < num_invariant; ++i) {
     cloned[body.invariant_inputs[i]] = invariant_in_body[i];
   }
 
-  for (int i = 0; i < num_carry; ++i) {
-    cloned[body.carry_inputs[i]] = carry_values[i];
-  }
-
-  // Shifted inputs: k=0 slices → dynamic_slice(source, counter-1)
-  HloInstruction* one_shift = body_builder.AddInstruction(
-      HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(1)));
-  HloInstruction* counter_minus_1 = body_builder.AddInstruction(
-      HloInstruction::CreateBinary(
-          ShapeUtil::MakeShape(S64, {}), HloOpcode::kSubtract,
-          counter, one_shift));
-
-  for (HloInstruction* inst : body.instructions) {
-    for (int oi = 0; oi < inst->operand_count(); ++oi) {
-      HloInstruction* op = inst->mutable_operand(oi);
-      if (cloned.contains(op)) continue;
-      if (op->opcode() != HloOpcode::kSlice) continue;
-
-      if (op->slice_starts()[slice_dim] != 0) continue;
-      if (op->slice_limits()[slice_dim] - op->slice_starts()[slice_dim] != 1)
-        continue;
-
-      HloInstruction* source = op->mutable_operand(0);
-      auto src_it = source_to_idx.find(source);
-      if (src_it == source_to_idx.end()) continue;
-
-      HloInstruction* source_in_body = sliced_inputs_in_body[src_it->second];
-      int64_t rank = source->shape().dimensions_size();
-      std::vector<HloInstruction*> start_indices;
-      for (int64_t d = 0; d < rank; ++d) {
-        start_indices.push_back(d == slice_dim ? counter_minus_1 : zero_body);
-      }
-      std::vector<int64_t> ss;
-      for (int64_t d = 0; d < rank; ++d) {
-        ss.push_back(op->slice_limits()[d] - op->slice_starts()[d]);
-      }
-
-      HloInstruction* dyn_slice = body_builder.AddInstruction(
-          HloInstruction::CreateDynamicSlice(
-              op->shape(), source_in_body, start_indices, ss));
-      cloned[op] = dyn_slice;
-      VLOG(2) << "shifted input: " << op->name() << " from " << source->name();
-    }
-  }
-
-  // Intra-loop slices: map level_output → template slices that read it
+  // Intra-loop: level_output → list of k1_slices to map after cloning
   absl::flat_hash_map<HloInstruction*, std::vector<HloInstruction*>>
-      level_output_to_template_slices;
-  for (auto& [template_slice, level_out] :
+      level_output_to_k1_slices;
+  for (auto& [k1_slice, level_out] :
        body.intra_loop_slice_to_level_output) {
-    level_output_to_template_slices[level_out].push_back(template_slice);
+    level_output_to_k1_slices[level_out].push_back(k1_slice);
   }
 
+  // ── Clone iter-1 body instructions ──
   for (HloInstruction* inst : body.instructions) {
     if (cloned.contains(inst)) continue;
 
     std::vector<HloInstruction*> new_operands;
-    for (int oi = 0; oi < inst->operand_count(); ++oi) {
-      HloInstruction* op = inst->mutable_operand(oi);
+    for (HloInstruction* op : inst->operands()) {
       auto it = cloned.find(op);
       if (it != cloned.end()) {
         new_operands.push_back(it->second);
-      } else if (op->opcode() == HloOpcode::kConstant ||
-                 (op->opcode() == HloOpcode::kBroadcast &&
-                  op->operand_count() > 0 &&
-                  op->mutable_operand(0)->opcode() == HloOpcode::kConstant)) {
-        HloInstruction* cloned_const =
-            body_builder.AddInstruction(op->Clone());
-        cloned[op] = cloned_const;
-        new_operands.push_back(cloned_const);
       } else {
-        LOG(ERROR) << "BuildWhileLoop: unmapped operand " << op->name()
-                   << " (" << HloOpcodeString(op->opcode()) << ")"
-                   << " for " << inst->name();
+        VLOG(1) << "WARNING: unmapped operand " << op->name()
+                << " (opcode=" << HloOpcodeString(op->opcode()) << ")"
+                << " for instruction " << inst->name();
         return false;
       }
     }
@@ -901,30 +1057,27 @@ absl::StatusOr<bool> BuildWhileLoop(
     cloned[inst] = body_builder.AddInstruction(
         inst->CloneWithNewOperands(inst->shape(), new_operands));
 
-    auto lo_it = level_output_to_template_slices.find(inst);
-    if (lo_it != level_output_to_template_slices.end()) {
-      for (HloInstruction* template_slice : lo_it->second) {
-        cloned[template_slice] = cloned[inst];
-        VLOG(2) << "Mapped intra-loop template_slice " << template_slice->name()
-                << " -> cloned level_output " << cloned[inst]->name();
+    // Map intra-loop k1_slices after their level_output is cloned
+    auto lo_it = level_output_to_k1_slices.find(inst);
+    if (lo_it != level_output_to_k1_slices.end()) {
+      for (HloInstruction* k1_slice : lo_it->second) {
+        cloned[k1_slice] = cloned[inst];
+        VLOG(2) << "Mapped intra-loop k1_slice " << k1_slice->name()
+                << " -> cloned " << cloned[inst]->name();
       }
     }
   }
 
-  // Write results into accumulators
+  // ── DUS level outputs into accumulators ──
   std::vector<HloInstruction*> new_accumulators;
   for (int i = 0; i < num_accum; ++i) {
-    HloInstruction* level_out = cloned[body.level_outputs[i]];
+    HloInstruction* level_out = cloned[body.iter1_level_outputs[i]];
     HloInstruction* accum = accumulators[i];
 
     int64_t rank = accum->shape().dimensions_size();
     std::vector<HloInstruction*> update_indices;
     for (int64_t d = 0; d < rank; ++d) {
-      if (d == slice_dim) {
-        update_indices.push_back(counter);
-      } else {
-        update_indices.push_back(zero_body);
-      }
+      update_indices.push_back(d == slice_dim ? counter : zero_body);
     }
 
     HloInstruction* updated = body_builder.AddInstruction(
@@ -933,20 +1086,54 @@ absl::StatusOr<bool> BuildWhileLoop(
     new_accumulators.push_back(updated);
   }
 
-  // k++
+  // ── Increment counter ──
   HloInstruction* one = body_builder.AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(1)));
   HloInstruction* next_counter = body_builder.AddInstruction(
       HloInstruction::CreateBinary(
           ShapeUtil::MakeShape(S64, {}), HloOpcode::kAdd, counter, one));
 
-  // Output tuple
+  // ── Output tuple ──
   std::vector<HloInstruction*> output_values;
   output_values.push_back(next_counter);
 
+  // Carry outputs:
+  // - Regular carry: cloned iter-1 body instruction
+  // - Shifted carry: dynamic_slice(source, counter) = current-level value
   for (int i = 0; i < num_carry; ++i) {
-    output_values.push_back(cloned[body.carry_outputs[i]]);
+    if (body.carry_is_shifted[i]) {
+      // For shifted carries, the carry output is the current-level slice
+      // (becomes next iteration's "previous level" carry input).
+      // This is the dynamic_slice at counter from the source.
+      auto it = cloned.find(body.carry_outputs[i]);
+      if (it != cloned.end()) {
+        output_values.push_back(it->second);
+      } else {
+        // Try source_to_dyn_slice
+        HloInstruction* source = body.carry_outputs[i]->mutable_operand(0);
+        auto ds_it = source_to_dyn_slice.find(source);
+        if (ds_it != source_to_dyn_slice.end()) {
+          output_values.push_back(ds_it->second);
+        } else {
+          VLOG(1) << "ERROR: shifted carry output "
+                  << body.carry_outputs[i]->name()
+                  << " has no dynamic_slice";
+          return false;
+        }
+      }
+    } else {
+      // Regular carry: use cloned iter-1 instruction
+      auto it = cloned.find(body.carry_outputs[i]);
+      if (it != cloned.end()) {
+        output_values.push_back(it->second);
+      } else {
+        VLOG(1) << "ERROR: carry output " << body.carry_outputs[i]->name()
+                << " not in cloned map";
+        return false;
+      }
+    }
   }
+
   for (auto* accum : new_accumulators) {
     output_values.push_back(accum);
   }
@@ -962,23 +1149,23 @@ absl::StatusOr<bool> BuildWhileLoop(
   HloComputation* body_comp =
       computation->parent()->AddEmbeddedComputation(body_builder.Build());
 
-  // Create while and extract results
+  // ── Create the while instruction ──
   HloInstruction* while_inst = computation->AddInstruction(
       HloInstruction::CreateWhile(tuple_shape, cond_comp, body_comp,
                                    init_tuple));
 
-  // Replace concatenates with GTE from while loop
+  // ── Extract accumulators and replace concatenates ──
   for (int i = 0; i < num_accum; ++i) {
-    int accum_idx = 1 + num_carry + i;
+    int idx = accum_off + i;
     HloInstruction* result = computation->AddInstruction(
-        HloInstruction::CreateGetTupleElement(while_inst, accum_idx));
+        HloInstruction::CreateGetTupleElement(while_inst, idx));
 
     TF_RETURN_IF_ERROR(body.concats[i]->ReplaceAllUsesWith(result));
     VLOG(2) << "Replaced " << body.concats[i]->name()
-            << " with GTE(" << accum_idx << ") from while loop";
+            << " with GTE(" << idx << ") from while loop";
   }
 
-  // Remove dead concat trees
+  // ── Remove dead concatenates and cascade ──
   for (HloInstruction* concat : body.concats) {
     TF_RETURN_IF_ERROR(
         computation->RemoveInstructionAndUnusedOperands(concat));
@@ -1002,7 +1189,6 @@ absl::StatusOr<bool> LoopifyUnrolledSlices::Run(
   bool changed = false;
 
   for (HloComputation* computation : module->computations(execution_threads)) {
-    // Only transform the entry computation.
     if (!computation->IsEntryComputation()) {
       continue;
     }
@@ -1020,8 +1206,7 @@ absl::StatusOr<bool> LoopifyUnrolledSlices::Run(
 
     if (all_chains.empty()) continue;
 
-    VLOG(1) << "Found " << all_chains.size() << " slice chains in "
-            << computation->name();
+    VLOG(1) << "Found " << all_chains.size() << " slice chains";
 
     // Step 2: Group chains by (num_iterations, slice_dim)
     absl::flat_hash_map<std::string, std::vector<int>> groups;
