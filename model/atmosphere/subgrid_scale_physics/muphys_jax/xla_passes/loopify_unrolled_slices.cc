@@ -686,6 +686,34 @@ std::optional<IterationBody> ExtractGroupedIterationBody(
     body.concats.push_back(chain.concat);
   }
 
+  // ── Find derived concatenates ──
+  // Some concatenates have operands that are computed inside the iteration body
+  // but were not found by AnalyzeConcatenate (because their operands are computed
+  // values, not slices from a source tensor).  Example: pflx_tot = concat(
+  //   ps[0]+pi[0]+pg[0], ..., ps[89]+pi[89]+pg[89]).
+  // If their k=1 operand is in the iteration body, we add them as accumulators
+  // so the original per-level computations can be removed.
+  for (HloInstruction* inst : computation->MakeInstructionPostOrder()) {
+    if (inst->opcode() != HloOpcode::kConcatenate) continue;
+    if (concat_set.contains(inst)) continue;
+    if (inst->operand_count() != num_iters) continue;
+    if (inst->concatenate_dimension() != slice_dim) continue;
+
+    HloInstruction* k1_op = inst->mutable_operand(1);
+    if (!iteration_1_set.contains(k1_op)) continue;
+
+    HloInstruction* k0_op = inst->mutable_operand(0);
+    if (k0_op->shape() != k1_op->shape()) continue;
+
+    body.iter0_level_outputs.push_back(k0_op);
+    body.iter1_level_outputs.push_back(k1_op);
+    body.concats.push_back(inst);
+    concat_set.insert(inst);
+
+    VLOG(1) << "Found derived concatenate: " << inst->name()
+            << " (k1_op=" << k1_op->name() << ")";
+  }
+
   // Invariant inputs: operands of iter-1 instructions that are not
   // in iter-1 set, not carry inputs, not k=1 slices, not sliced sources,
   // not offset slices.
@@ -740,36 +768,112 @@ absl::StatusOr<bool> BuildWhileLoop(
   int num_sliced = body.sliced_inputs.size();
   int num_invariant = body.invariant_inputs.size();
 
+  // ── Classify carries: regular vs shifted ──
+  // Shifted carries are just input[k-1]; compute via dynamic_slice(source,
+  // counter-1) instead of carrying through the tuple.
+  std::vector<int> regular_carry_indices;
+  std::vector<int> shifted_carry_indices;
+  for (int i = 0; i < num_carry; ++i) {
+    if (body.carry_is_shifted[i]) {
+      shifted_carry_indices.push_back(i);
+    } else {
+      regular_carry_indices.push_back(i);
+    }
+  }
+  int num_regular_carry = regular_carry_indices.size();
+
+  // ── Classify invariants: constants (recreated in body) vs tuple ──
+  std::vector<HloInstruction*> const_invariants;
+  std::vector<HloInstruction*> tuple_invariants;
+  for (auto* inv : body.invariant_inputs) {
+    if (inv->opcode() == HloOpcode::kConstant ||
+        (inv->opcode() == HloOpcode::kBroadcast &&
+         inv->operand(0)->opcode() == HloOpcode::kConstant)) {
+      const_invariants.push_back(inv);
+    } else {
+      tuple_invariants.push_back(inv);
+    }
+  }
+  int num_tuple_inv = tuple_invariants.size();
+
+  VLOG(1) << "Carries: " << num_regular_carry << " regular + "
+          << shifted_carry_indices.size() << " shifted (eliminated from tuple)";
+  VLOG(1) << "Invariants: " << const_invariants.size()
+          << " constant (recreated in body) + " << num_tuple_inv << " in tuple";
+
+  // ── Check if accumulators can be stacked into a single tensor ──
+  // Stacking reduces N dynamic-update-slice ops per iteration to 1.
+  bool use_stacked = (num_accum > 1);
+  int64_t stack_dim = -1;
+  std::vector<int64_t> accum_widths;
+  std::vector<int64_t> accum_cum_offsets;
+  int64_t total_stacked_width = 0;
+
+  if (use_stacked) {
+    PrimitiveType first_type = body.concats[0]->shape().element_type();
+    int64_t first_rank = body.concats[0]->shape().dimensions_size();
+    if (first_rank == 2) {
+      stack_dim = (slice_dim == 0) ? 1 : 0;
+      for (int i = 0; i < num_accum; ++i) {
+        const Shape& s = body.concats[i]->shape();
+        if (s.element_type() != first_type ||
+            s.dimensions_size() != first_rank ||
+            s.dimensions(slice_dim) !=
+                body.concats[0]->shape().dimensions(slice_dim)) {
+          use_stacked = false;
+          break;
+        }
+        accum_cum_offsets.push_back(total_stacked_width);
+        accum_widths.push_back(s.dimensions(stack_dim));
+        total_stacked_width += s.dimensions(stack_dim);
+      }
+    } else {
+      use_stacked = false;
+    }
+  }
+
+  int num_accum_slots = use_stacked ? 1 : num_accum;
+
+  VLOG(1) << "Stacked accumulators: " << (use_stacked ? "YES" : "NO")
+          << " (" << num_accum << " accums, " << num_accum_slots << " slots)";
+
   // Tuple layout:
   // [0]                                  : counter (starts at 1)
-  // [1 .. 1+num_carry)                   : carries
-  // [1+num_carry .. 1+num_carry+num_accum) : accumulators
+  // [1 .. 1+num_regular_carry)           : regular carries only
+  // [+num_accum_slots)                   : accumulators (1 if stacked)
   // [+num_sliced .. )                    : sliced inputs
-  // [+num_invariant .. )                 : invariant inputs
+  // [+num_tuple_inv .. )                 : non-constant invariant inputs
   int carry_off = 1;
-  int accum_off = carry_off + num_carry;
-  int sliced_off = accum_off + num_accum;
+  int accum_off = carry_off + num_regular_carry;
+  int sliced_off = accum_off + num_accum_slots;
   int inv_off = sliced_off + num_sliced;
-  int tuple_size = inv_off + num_invariant;
+  int tuple_size = inv_off + num_tuple_inv;
 
-  VLOG(2) << "Tuple: 1 counter + " << num_carry << " carry + "
-          << num_accum << " accum + " << num_sliced << " sliced + "
-          << num_invariant << " invariant = " << tuple_size;
+  VLOG(2) << "Tuple: 1 counter + " << num_regular_carry << " carry + "
+          << num_accum_slots << " accum_slots + " << num_sliced << " sliced + "
+          << num_tuple_inv << " invariant = " << tuple_size;
 
   // ── Tuple shapes ──
   std::vector<Shape> tuple_shapes;
   tuple_shapes.push_back(ShapeUtil::MakeShape(S64, {}));  // counter
-  for (int i = 0; i < num_carry; ++i) {
-    // Carry shape: use carry_output shape (must match carry_input shape)
-    tuple_shapes.push_back(body.carry_outputs[i]->shape());
+  for (int idx : regular_carry_indices) {
+    tuple_shapes.push_back(body.carry_outputs[idx]->shape());
   }
-  for (auto* concat : body.concats) {
-    tuple_shapes.push_back(concat->shape());  // accumulator shape
+  if (use_stacked) {
+    PrimitiveType accum_type = body.concats[0]->shape().element_type();
+    std::vector<int64_t> stacked_dims(2);
+    stacked_dims[slice_dim] = num_iters;
+    stacked_dims[stack_dim] = total_stacked_width;
+    tuple_shapes.push_back(ShapeUtil::MakeShape(accum_type, stacked_dims));
+  } else {
+    for (auto* concat : body.concats) {
+      tuple_shapes.push_back(concat->shape());
+    }
   }
   for (auto* src : body.sliced_inputs) {
     tuple_shapes.push_back(src->shape());
   }
-  for (auto* inv : body.invariant_inputs) {
+  for (auto* inv : tuple_invariants) {
     tuple_shapes.push_back(inv->shape());
   }
   Shape tuple_shape = ShapeUtil::MakeTupleShape(tuple_shapes);
@@ -782,40 +886,60 @@ absl::StatusOr<bool> BuildWhileLoop(
   std::vector<HloInstruction*> init_values;
   init_values.push_back(one_init);
 
-  // Carry initial values = iter-0 outputs (already computed in original graph)
-  for (auto* ci : body.carry_inputs) {
-    init_values.push_back(ci);
-    VLOG(2) << "carry init: " << ci->name()
-            << " (opcode=" << HloOpcodeString(ci->opcode()) << ")";
+  // Carry initial values = iter-0 outputs (only regular carries in tuple)
+  for (int idx : regular_carry_indices) {
+    init_values.push_back(body.carry_inputs[idx]);
+    VLOG(2) << "carry init: " << body.carry_inputs[idx]->name()
+            << " (opcode=" << HloOpcodeString(body.carry_inputs[idx]->opcode()) << ")";
   }
 
   // Accumulators: zero-filled, then prefill position 0 with iter-0 outputs
   HloInstruction* zero_idx = computation->AddInstruction(
       HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(0)));
-  for (int i = 0; i < num_accum; ++i) {
-    PrimitiveType elem_type = body.concats[i]->shape().element_type();
+  if (use_stacked) {
+    const Shape& stacked_shape_ref = tuple_shapes[accum_off];
+    PrimitiveType elem_type = stacked_shape_ref.element_type();
     HloInstruction* zero_elem = computation->AddInstruction(
         HloInstruction::CreateConstant(LiteralUtil::Zero(elem_type)));
-    HloInstruction* zero_accum = computation->AddInstruction(
-        HloInstruction::CreateBroadcast(body.concats[i]->shape(),
-                                         zero_elem, {}));
-
-    // DUS iter-0 level output at position 0
-    HloInstruction* iter0_out = body.iter0_level_outputs[i];
-    int64_t rank = zero_accum->shape().dimensions_size();
-    std::vector<HloInstruction*> update_indices;
-    for (int64_t d = 0; d < rank; ++d) {
-      update_indices.push_back(zero_idx);
+    HloInstruction* stacked_accum = computation->AddInstruction(
+        HloInstruction::CreateBroadcast(stacked_shape_ref, zero_elem, {}));
+    for (int i = 0; i < num_accum; ++i) {
+      HloInstruction* iter0_out = body.iter0_level_outputs[i];
+      HloInstruction* offset_val = computation->AddInstruction(
+          HloInstruction::CreateConstant(
+              LiteralUtil::CreateR0<int64_t>(accum_cum_offsets[i])));
+      std::vector<HloInstruction*> update_indices(2);
+      update_indices[slice_dim] = zero_idx;
+      update_indices[stack_dim] = offset_val;
+      stacked_accum = computation->AddInstruction(
+          HloInstruction::CreateDynamicUpdateSlice(
+              stacked_shape_ref, stacked_accum, iter0_out, update_indices));
     }
-    HloInstruction* prefilled = computation->AddInstruction(
-        HloInstruction::CreateDynamicUpdateSlice(
-            zero_accum->shape(), zero_accum, iter0_out, update_indices));
-    init_values.push_back(prefilled);
+    init_values.push_back(stacked_accum);
+  } else {
+    for (int i = 0; i < num_accum; ++i) {
+      PrimitiveType elem_type = body.concats[i]->shape().element_type();
+      HloInstruction* zero_elem = computation->AddInstruction(
+          HloInstruction::CreateConstant(LiteralUtil::Zero(elem_type)));
+      HloInstruction* zero_accum = computation->AddInstruction(
+          HloInstruction::CreateBroadcast(body.concats[i]->shape(),
+                                           zero_elem, {}));
+      HloInstruction* iter0_out = body.iter0_level_outputs[i];
+      int64_t rank = zero_accum->shape().dimensions_size();
+      std::vector<HloInstruction*> update_indices;
+      for (int64_t d = 0; d < rank; ++d) {
+        update_indices.push_back(zero_idx);
+      }
+      HloInstruction* prefilled = computation->AddInstruction(
+          HloInstruction::CreateDynamicUpdateSlice(
+              zero_accum->shape(), zero_accum, iter0_out, update_indices));
+      init_values.push_back(prefilled);
+    }
   }
 
-  // Sliced inputs and invariants (pass-through)
+  // Sliced inputs and non-constant invariants (pass-through)
   for (auto* src : body.sliced_inputs) init_values.push_back(src);
-  for (auto* inv : body.invariant_inputs) init_values.push_back(inv);
+  for (auto* inv : tuple_invariants) init_values.push_back(inv);
 
   HloInstruction* init_tuple = computation->AddInstruction(
       HloInstruction::CreateTuple(init_values));
@@ -844,14 +968,14 @@ absl::StatusOr<bool> BuildWhileLoop(
   HloInstruction* counter = body_builder.AddInstruction(
       HloInstruction::CreateGetTupleElement(body_param, 0));
 
-  std::vector<HloInstruction*> carry_values;
-  for (int i = 0; i < num_carry; ++i) {
+  std::vector<HloInstruction*> carry_values;  // indexed by regular carry index
+  for (int i = 0; i < num_regular_carry; ++i) {
     carry_values.push_back(body_builder.AddInstruction(
         HloInstruction::CreateGetTupleElement(body_param, carry_off + i)));
   }
 
   std::vector<HloInstruction*> accumulators;
-  for (int i = 0; i < num_accum; ++i) {
+  for (int i = 0; i < num_accum_slots; ++i) {
     accumulators.push_back(body_builder.AddInstruction(
         HloInstruction::CreateGetTupleElement(body_param, accum_off + i)));
   }
@@ -862,9 +986,9 @@ absl::StatusOr<bool> BuildWhileLoop(
         HloInstruction::CreateGetTupleElement(body_param, sliced_off + i)));
   }
 
-  std::vector<HloInstruction*> invariant_in_body;
-  for (int i = 0; i < num_invariant; ++i) {
-    invariant_in_body.push_back(body_builder.AddInstruction(
+  std::vector<HloInstruction*> tuple_inv_in_body;
+  for (int i = 0; i < num_tuple_inv; ++i) {
+    tuple_inv_in_body.push_back(body_builder.AddInstruction(
         HloInstruction::CreateGetTupleElement(body_param, inv_off + i)));
   }
 
@@ -1009,24 +1133,81 @@ absl::StatusOr<bool> BuildWhileLoop(
             << source->name();
   }
 
+  // ── Shifted carry inputs: dynamic_slice(source, counter-1) ──
+  HloInstruction* counter_minus_1 = nullptr;
+  if (!shifted_carry_indices.empty()) {
+    HloInstruction* one_sc = body_builder.AddInstruction(
+        HloInstruction::CreateConstant(LiteralUtil::CreateR0<int64_t>(1)));
+    counter_minus_1 = body_builder.AddInstruction(
+        HloInstruction::CreateBinary(
+            ShapeUtil::MakeShape(S64, {}), HloOpcode::kSubtract,
+            counter, one_sc));
+  }
+
+  for (int idx : shifted_carry_indices) {
+    HloInstruction* carry_in = body.carry_inputs[idx];  // k=0 slice
+    HloInstruction* source = carry_in->mutable_operand(0);
+
+    auto src_it = source_to_idx.find(source);
+    if (src_it == source_to_idx.end()) {
+      VLOG(1) << "ERROR: shifted carry input source " << source->name()
+              << " not in sliced_inputs";
+      return false;
+    }
+    HloInstruction* source_in_body = sliced_inputs_in_body[src_it->second];
+
+    int64_t rank = source->shape().dimensions_size();
+    std::vector<HloInstruction*> start_indices;
+    for (int64_t d = 0; d < rank; ++d) {
+      start_indices.push_back(d == slice_dim ? counter_minus_1 : zero_body);
+    }
+
+    std::vector<int64_t> slice_sizes;
+    for (int64_t d = 0; d < rank; ++d) {
+      slice_sizes.push_back(carry_in->shape().dimensions(d));
+    }
+
+    HloInstruction* prev_level = body_builder.AddInstruction(
+        HloInstruction::CreateDynamicSlice(
+            carry_in->shape(), source_in_body, start_indices, slice_sizes));
+
+    slice_replacement[carry_in] = prev_level;
+    VLOG(2) << "Shifted carry input " << carry_in->name()
+            << " -> dynamic_slice(source, counter-1)";
+  }
+
   // ── Build clone map ──
   absl::flat_hash_map<HloInstruction*, HloInstruction*> cloned;
 
-  // k=1 slices → dynamic_slice at counter
+  // k=1 slices and shifted carry inputs → dynamic_slice replacements
   for (auto& [orig, repl] : slice_replacement) {
     cloned[orig] = repl;
   }
 
-  // Carry inputs → carry tuple values
-  for (int i = 0; i < num_carry; ++i) {
-    cloned[body.carry_inputs[i]] = carry_values[i];
-    VLOG(2) << "pre-seed carry: " << body.carry_inputs[i]->name()
+  // Regular carry inputs → carry tuple values
+  for (int i = 0; i < num_regular_carry; ++i) {
+    int idx = regular_carry_indices[i];
+    cloned[body.carry_inputs[idx]] = carry_values[i];
+    VLOG(2) << "pre-seed carry: " << body.carry_inputs[idx]->name()
             << " -> carry_values[" << i << "]";
   }
 
-  // Invariant inputs
-  for (int i = 0; i < num_invariant; ++i) {
-    cloned[body.invariant_inputs[i]] = invariant_in_body[i];
+  // Non-constant invariants → GTE from tuple
+  for (int i = 0; i < num_tuple_inv; ++i) {
+    cloned[tuple_invariants[i]] = tuple_inv_in_body[i];
+  }
+
+  // Constant invariants → recreated in body
+  for (auto* inv : const_invariants) {
+    if (inv->opcode() == HloOpcode::kConstant) {
+      cloned[inv] = body_builder.AddInstruction(inv->Clone());
+    } else {
+      // Broadcast of constant
+      HloInstruction* const_clone = body_builder.AddInstruction(
+          inv->operand(0)->Clone());
+      cloned[inv] = body_builder.AddInstruction(
+          inv->CloneWithNewOperands(inv->shape(), {const_clone}));
+    }
   }
 
   // Intra-loop: level_output → list of k1_slices to map after cloning
@@ -1070,20 +1251,45 @@ absl::StatusOr<bool> BuildWhileLoop(
 
   // ── DUS level outputs into accumulators ──
   std::vector<HloInstruction*> new_accumulators;
-  for (int i = 0; i < num_accum; ++i) {
-    HloInstruction* level_out = cloned[body.iter1_level_outputs[i]];
-    HloInstruction* accum = accumulators[i];
-
-    int64_t rank = accum->shape().dimensions_size();
-    std::vector<HloInstruction*> update_indices;
-    for (int64_t d = 0; d < rank; ++d) {
-      update_indices.push_back(d == slice_dim ? counter : zero_body);
+  HloInstruction* new_stacked_accum = nullptr;
+  if (use_stacked) {
+    // Concatenate all level outputs along stack_dim → [1, total_width]
+    std::vector<HloInstruction*> level_outs;
+    for (int i = 0; i < num_accum; ++i) {
+      level_outs.push_back(cloned[body.iter1_level_outputs[i]]);
     }
+    PrimitiveType elem_type = body.concats[0]->shape().element_type();
+    std::vector<int64_t> cat_dims(2);
+    cat_dims[slice_dim] = 1;
+    cat_dims[stack_dim] = total_stacked_width;
+    Shape cat_shape = ShapeUtil::MakeShape(elem_type, cat_dims);
+    HloInstruction* cat_level = body_builder.AddInstruction(
+        HloInstruction::CreateConcatenate(cat_shape, level_outs, stack_dim));
 
-    HloInstruction* updated = body_builder.AddInstruction(
+    // Single DUS into stacked accumulator
+    HloInstruction* stacked_accum = accumulators[0];
+    std::vector<HloInstruction*> update_indices(2);
+    update_indices[slice_dim] = counter;
+    update_indices[stack_dim] = zero_body;
+    new_stacked_accum = body_builder.AddInstruction(
         HloInstruction::CreateDynamicUpdateSlice(
-            accum->shape(), accum, level_out, update_indices));
-    new_accumulators.push_back(updated);
+            stacked_accum->shape(), stacked_accum, cat_level, update_indices));
+  } else {
+    for (int i = 0; i < num_accum; ++i) {
+      HloInstruction* level_out = cloned[body.iter1_level_outputs[i]];
+      HloInstruction* accum = accumulators[i];
+
+      int64_t rank = accum->shape().dimensions_size();
+      std::vector<HloInstruction*> update_indices;
+      for (int64_t d = 0; d < rank; ++d) {
+        update_indices.push_back(d == slice_dim ? counter : zero_body);
+      }
+
+      HloInstruction* updated = body_builder.AddInstruction(
+          HloInstruction::CreateDynamicUpdateSlice(
+              accum->shape(), accum, level_out, update_indices));
+      new_accumulators.push_back(updated);
+    }
   }
 
   // ── Increment counter ──
@@ -1097,50 +1303,30 @@ absl::StatusOr<bool> BuildWhileLoop(
   std::vector<HloInstruction*> output_values;
   output_values.push_back(next_counter);
 
-  // Carry outputs:
-  // - Regular carry: cloned iter-1 body instruction
-  // - Shifted carry: dynamic_slice(source, counter) = current-level value
-  for (int i = 0; i < num_carry; ++i) {
-    if (body.carry_is_shifted[i]) {
-      // For shifted carries, the carry output is the current-level slice
-      // (becomes next iteration's "previous level" carry input).
-      // This is the dynamic_slice at counter from the source.
-      auto it = cloned.find(body.carry_outputs[i]);
-      if (it != cloned.end()) {
-        output_values.push_back(it->second);
-      } else {
-        // Try source_to_dyn_slice
-        HloInstruction* source = body.carry_outputs[i]->mutable_operand(0);
-        auto ds_it = source_to_dyn_slice.find(source);
-        if (ds_it != source_to_dyn_slice.end()) {
-          output_values.push_back(ds_it->second);
-        } else {
-          VLOG(1) << "ERROR: shifted carry output "
-                  << body.carry_outputs[i]->name()
-                  << " has no dynamic_slice";
-          return false;
-        }
-      }
+  // Carry outputs: only regular carries are in the tuple
+  for (int i = 0; i < num_regular_carry; ++i) {
+    int idx = regular_carry_indices[i];
+    auto it = cloned.find(body.carry_outputs[idx]);
+    if (it != cloned.end()) {
+      output_values.push_back(it->second);
     } else {
-      // Regular carry: use cloned iter-1 instruction
-      auto it = cloned.find(body.carry_outputs[i]);
-      if (it != cloned.end()) {
-        output_values.push_back(it->second);
-      } else {
-        VLOG(1) << "ERROR: carry output " << body.carry_outputs[i]->name()
-                << " not in cloned map";
-        return false;
-      }
+      VLOG(1) << "ERROR: carry output " << body.carry_outputs[idx]->name()
+              << " not in cloned map";
+      return false;
     }
   }
 
-  for (auto* accum : new_accumulators) {
-    output_values.push_back(accum);
+  if (use_stacked) {
+    output_values.push_back(new_stacked_accum);
+  } else {
+    for (auto* accum : new_accumulators) {
+      output_values.push_back(accum);
+    }
   }
   for (auto* src : sliced_inputs_in_body) {
     output_values.push_back(src);
   }
-  for (auto* inv : invariant_in_body) {
+  for (auto* inv : tuple_inv_in_body) {
     output_values.push_back(inv);
   }
 
@@ -1155,14 +1341,33 @@ absl::StatusOr<bool> BuildWhileLoop(
                                    init_tuple));
 
   // ── Extract accumulators and replace concatenates ──
-  for (int i = 0; i < num_accum; ++i) {
-    int idx = accum_off + i;
-    HloInstruction* result = computation->AddInstruction(
-        HloInstruction::CreateGetTupleElement(while_inst, idx));
-
-    TF_RETURN_IF_ERROR(body.concats[i]->ReplaceAllUsesWith(result));
-    VLOG(2) << "Replaced " << body.concats[i]->name()
-            << " with GTE(" << idx << ") from while loop";
+  if (use_stacked) {
+    HloInstruction* stacked_result = computation->AddInstruction(
+        HloInstruction::CreateGetTupleElement(while_inst, accum_off));
+    for (int i = 0; i < num_accum; ++i) {
+      std::vector<int64_t> starts(2, 0);
+      starts[stack_dim] = accum_cum_offsets[i];
+      std::vector<int64_t> limits(2);
+      limits[slice_dim] = num_iters;
+      limits[stack_dim] = accum_cum_offsets[i] + accum_widths[i];
+      std::vector<int64_t> strides(2, 1);
+      HloInstruction* result = computation->AddInstruction(
+          HloInstruction::CreateSlice(body.concats[i]->shape(),
+                                       stacked_result, starts, limits, strides));
+      TF_RETURN_IF_ERROR(body.concats[i]->ReplaceAllUsesWith(result));
+      VLOG(2) << "Replaced " << body.concats[i]->name()
+              << " with stacked slice [" << starts[stack_dim]
+              << ":" << limits[stack_dim] << "]";
+    }
+  } else {
+    for (int i = 0; i < num_accum; ++i) {
+      int idx = accum_off + i;
+      HloInstruction* result = computation->AddInstruction(
+          HloInstruction::CreateGetTupleElement(while_inst, idx));
+      TF_RETURN_IF_ERROR(body.concats[i]->ReplaceAllUsesWith(result));
+      VLOG(2) << "Replaced " << body.concats[i]->name()
+              << " with GTE(" << idx << ") from while loop";
+    }
   }
 
   // ── Remove dead concatenates and cascade ──
