@@ -38,8 +38,12 @@ class LoopifyUnrolledSlices : public HloModulePass {
  public:
   // min_iterations: minimum number of consecutive slices to trigger
   //                 transformation (default 4, set to 2 for testing)
-  explicit LoopifyUnrolledSlices(int min_iterations = 4)
-      : min_iterations_(min_iterations) {}
+  // unroll_factor:  number of levels processed per while iteration
+  //                 (default 1; use e.g. 10 to reduce loop overhead 10×)
+  explicit LoopifyUnrolledSlices(int min_iterations = 4,
+                                  int unroll_factor = 10)
+      : min_iterations_(min_iterations),
+        unroll_factor_(unroll_factor) {}
 
   absl::string_view name() const override {
     return "loopify-unrolled-slices";
@@ -53,6 +57,7 @@ class LoopifyUnrolledSlices : public HloModulePass {
 
  private:
   int min_iterations_;
+  int unroll_factor_;
 };
 
 }  // namespace gpu
