@@ -1,7 +1,8 @@
-# Muphys Graupel GPU Optimization Logbook (JAX / XLA / IREE)
+# Muphys Graupel GPU Optimization Logbook (JAX → XLA / IREE vs DaCe-GPU)
 
-> Optimizing JAX graupel microphysics towards DaCe-GPU performance on NVIDIA GH200 and AMD MI300A.
+> Optimizing JAX-compiled graupel microphysics via XLA and IREE compiler backends towards DaCe-GPU performance on NVIDIA GH200 and AMD MI300A.
 > Target: reduce per-iteration time from ~51ms to <10ms (DaCe-GPU baseline).
+> JAX alone cannot reach the target; the strategy relies on custom XLA and IREE compiler passes to re-roll unrolled loops into efficient GPU kernels.
 
 ---
 
@@ -11,7 +12,7 @@
 
 After extensive exploration across multiple optimization strategies, the current best results are:
 
-- **29ms** on GH200 (Santis) — StableHLO injection + transposed memory layout + fused q_t_update
+- **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed memory layout
 - **33ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (SerialScan mode, single GPU kernel for precipitation scan)
 - **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
 
@@ -75,7 +76,7 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 
 - Rewrote all phase transitions using `lax.select`/`lax.pow` to encourage XLA kernel fusion
 - Reduced from ~80 kernels to 2 fused large kernels (confirmed via nsys)
-- **Result:** Major kernel count reduction. Plan to apply StableHLO injection here as well.
+- **Result:** Major kernel count reduction. Now part of the combined StableHLO module (see Track 2).
 
 ---
 
@@ -183,11 +184,6 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - Initially tried codegen-level pass (`GPULoopifyUnrolledSliceChain`) running before tiling in `addGPUTileAndFusePassPipeline()` — blocked by downstream dispatch creation/tiling issues
 - Moved to preprocessing level to avoid codegen pipeline conflicts
 
-### MLIR Exploration
-
-- Exploring writing graupel code directly with MLIR core dialects (no stencils involved)
-- Writing/exploring MLIR examples as preparation for a potential pure-MLIR implementation path
-
 ---
 
 ## Summary of Approaches Explored
@@ -198,14 +194,14 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 | Tiling | GH200 | No improvement | Abandoned |
 | Triton-JAX | GH200 | Kernel improvement, but DLPack overhead negates gains | Abandoned |
 | Memory transpose (nlev, ncells) | GH200 | Significant improvement | **Adopted** |
-| StableHLO injection (precip) | GH200 | 51ms to 35ms | **Adopted** |
-| Fused q_t_update | GH200 | ~80 kernels to 2 | **Adopted** |
+| StableHLO injection (precip only) | GH200 | 51ms to 35ms | **Adopted** |
+| Combined StableHLO (q_t_update + precip) | GH200 | 35ms to 29ms | **Adopted** |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
-| IREE CUDA | GH200 | Functional but slower | Needs investigation |
+| IREE CUDA | GH200 | Functional but slower | Low priority |
 | IREE HIP baseline | MI300A | 47ms | Baseline established |
 | IREE preprocessing pass | MI300A | Correct structure, temperature bug (80ms) | In progress |
-| Pure MLIR | — | Exploratory | Early stage |
+| Pure MLIR | — | Exploratory | Future idea |
 
 ---
 
@@ -213,7 +209,11 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 
 1. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
 2. **XLA SerialScan performance:** close the 4ms gap vs StableHLO injection baseline (33ms vs 29ms) — investigate body optimization
-3. **q_t_update:** apply StableHLO injection or XLA pass to further reduce kernel count
-4. **Investigate overhead:** profile remaining kernel launch overhead and small kernels
-5. **IREE CUDA:** investigate memory errors when JIT-compiling the full fused function
-6. **Transpose elimination:** remove pre-transpose step entirely (currently not measured, but desirable)
+3. **Investigate overhead:** profile remaining kernel launch overhead and small kernels
+4. **Transpose elimination:** remove pre-transpose step entirely (currently not measured, but desirable)
+
+---
+
+## Future Ideas
+
+- **Pure MLIR rewrite:** write graupel code directly with MLIR core dialects (no stencils), bypassing JAX entirely. Exploratory; not currently active.
