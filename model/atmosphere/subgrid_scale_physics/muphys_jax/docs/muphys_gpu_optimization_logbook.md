@@ -23,7 +23,7 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 |:---|:---:|:---:|:---:|:---|
 | JAX baseline (original) | GH200 | Santis | ~51 | ~186 kernels for precip scan |
 | + transposed layout + StableHLO injection | GH200 | Santis | ~35 | Unrolled but coalesced |
-| + further fusion (fused q_t_update) | GH200 | Santis | ~29 | Best current result on GH200 |
+| + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Single HLO module, best current result on GH200 |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | 1 kernel for precip scan (replaces StableHLO injection) |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Correctness bug, not yet optimized |
