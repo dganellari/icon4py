@@ -9,7 +9,7 @@
 
 ### Summary
 
-After extensive exploration across multiple optimization strategies (buffer donation, tiling, Triton, StableHLO injection, XLA/IREE compiler passes, memory layout transposition), the current best result is **29ms per iteration** on GH200 using StableHLO injection + transposed memory layout. Work continues on XLA compiler pass development and IREE backend investigation.
+After extensive exploration across multiple optimization strategies (buffer donation, tiling, Triton, StableHLO injection, XLA/IREE compiler passes, memory layout transposition), the current best result is **29ms per iteration** on GH200 using StableHLO injection + transposed memory layout, and **33ms** using the custom XLA `LoopifyUnrolledSlices` pass in SerialScan mode (single GPU kernel for the entire precipitation scan). Work continues on the IREE preprocessing pass to achieve the same on AMD MI300A.
 
 ### Current Performance (R2B06, GH200)
 
@@ -18,6 +18,7 @@ After extensive exploration across multiple optimization strategies (buffer dona
 | JAX baseline (original) | ~51 | 1.0x |
 | + transposed layout + StableHLO injection | ~35 | 1.46x |
 | + further fusion (fused q_t_update) | ~29 | 1.76x |
+| + XLA LoopifyUnrolledSlices (SerialScan) | ~33 | 1.55x |
 | DaCe-GPU target | ~10-13 | ~4-5x |
 
 ### Performance Breakdown (nsys, 35ms state)
@@ -92,24 +93,39 @@ After extensive exploration across multiple optimization strategies (buffer dona
 
 ### Goal
 
-Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll it into a `while` loop. When XLA sees a loop body instead of 186 separate operations, its fusion pass can collapse everything into ~6 kernels per iteration.
+Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll it into a loop or single-kernel serial scan. Eliminates ~186 separate GPU kernel launches by fusing the entire precipitation scan into 1-2 kernels.
 
 ### Approach
 
 - Custom XLA compiler pass: `LoopifyUnrolledSlices`
 - Built JAX and XLA from source to integrate the pass
 - Attempted StableHLO-level re-rolling first, but XLA overrides things during lowering, making it slower
+- Two modes:
+  - `kWhileLoop` — emits an HLO while loop; XLA fuses the body into ~6 kernels
+  - `kSerialScan` — emits a custom fusion with a single GPU kernel containing `scf.forall` (parallel over cells) + `scf.for` (serial over levels)
 
-### Status
+### Algorithm
+
+1. **Chain detection**: Find sequences of `slice → compute → concat` at consecutive offsets along the vertical dimension
+2. **Chain grouping**: Group all 11 output concatenates sharing the same 90-level computation into a single loop with 11 accumulators
+3. **Slice-dependency propagation**: Forward-propagate from k=0 level slices through iter0 body to identify which ops depend on the level index vs. shared precomputation
+4. **Carry detection**: Walk (iter2, iter1) structurally to find inter-iteration dependencies (19 carry pairs including shifted carries for previous-level values)
+5. **Body construction**: Use iter1 as the loop body template (avoids IRMapping override issues); iter0 output is used as carry initial values
+6. **Scalarization (SerialScan mode)**: Convert tensor-level ops to scalar arithmetic inside the kernel; each workgroup processes one cell, looping over 90 levels
+
+### Status: Working
 
 - Pass compiles and is integrated into JAX (built from source within modified XLA)
-- First benchmark (GH200):
-  - 29.63ms -- baseline (unrolled, with StableHLO injection)
-  - 42.96ms -- with loopify pass (slower, correctness issue)
-- **Root cause identified:** pass only loopified 1 out of 11 output concatenates. The precipitation scan produces 11 outputs (temperature, etc.) that share the same 90-level computation. The pass should group all 11 into a single `while` loop with 11 accumulators.
-- Remaining 10 unrolled concatenates cause: while loop overhead + unrolled concat overhead
-- **Current bug:** wrong temperature update; chain detection/grouping logic does not capture all 11 concatenates
-- **Blocked:** debugging chain detection/grouping logic
+- All 11 output concatenates correctly grouped into a single loop
+- Correctness verified: all output fields match reference data
+- **Benchmark progression (GH200, R2B06)**:
+  - 29.63ms — baseline (unrolled, with StableHLO injection + fused q_t_update)
+  - 42.96ms — first attempt (only 1 of 11 chains loopified)
+  - 35ms — after fixing chain grouping (all 11 chains, while-loop mode)
+  - **33ms** — SerialScan mode (single GPU kernel)
+- SerialScan mode eliminates ~186 kernel launches → 1 kernel for the precipitation scan
+- Still ~4ms slower than the StableHLO injection baseline (29ms); the gap is likely due to the scan body being less optimized than XLA's hand-fused kernels
+- See [INTEGRATION.md](../xla_passes/INTEGRATION.md) for build/integration instructions
 
 ---
 
@@ -128,20 +144,35 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - Runtime: **47ms** for 1 iteration (slower than XLA JAX on GH200 at 29ms)
 - AMD backend is more complete than CUDA backend
 
-### IREE Compiler Pass (Codegen Level)
+### IREE Compiler Pass (Preprocessing Level)
 
-- Writing a custom pass at the linalg level to restructure the computation
-- **Current (wrong):** `scf.for(90 levels){ compute(all 327680 cells) }` -- serial at function level
-- **Target (correct):** `dispatch(327680 cells){ scf.for(90 levels){ compute(one cell) } }` -- per-cell parallelism with vertical loop inside
-- Target structure would be comparable to DaCe's approach (~10ms expected)
+- Custom preprocessing pass `LoopifyInsertSliceChain` at the linalg/tensor level
+- Detects unrolled `tensor.insert_slice` chains (from StableHLO concatenate lowering) and converts them to `scf.forall + scf.for` loops inside a `flow.dispatch.region`
+- **Target structure:** `flow.dispatch.region { scf.forall(%cell in 0..327680) { scf.for(%k in 0..90) { scalar_compute } } }`
+- Uses `WorkgroupMappingAttr` so IREE's codegen distributes forall to GPU workgroups (one thread per cell)
 
-#### Pass Details
+#### Algorithm (mirrors XLA pass)
 
-- Two passes developed: preprocessing level and codegen level (see separate IREE pass notes)
-- Preprocessing pass blocked by downstream dispatch creation/tiling issues
-- Codegen-level pass (`GPULoopifyUnrolledSliceChain`) runs before tiling in `addGPUTileAndFusePassPipeline()`
-- Same chain detection + carry analysis as XLA pass, adapted for MLIR tensor.insert_slice chains
-- **Status:** in progress; blocked by reported IREE bug
+1. Chain detection: find `tensor.insert_slice` chains at consecutive offsets
+2. Chain grouping: group all 11 output chains into one loop with 11 column accumulators
+3. Slice-dependency propagation: forward-propagate from k=0 level slices to identify level-dependent vs. shared ops
+4. Carry detection: structural (iter2, iter1) walk for 19 carry pairs
+5. Body construction: iter1 as template, scalarization of `linalg.generic` ops
+6. Pre-computation pull-in: traces backward from level-slice sources to include intermediate ops in the loop body
+
+#### Status: Structurally correct, correctness bug in progress
+
+- Generates correct dispatch structure: `forall(327680) + for(90)` inside `flow.dispatch.region`
+- All 11 chains grouped, 19 carries detected, scalarization works
+- **Correctness bug:** temperature field has error 5.59e+01 (other 10 fields match reference)
+- **Root cause identified:** iter1 boundary construction uses ALL iter0 values as boundaries, but should only use SLICE-DEPENDENT iter0 values (matching XLA's `depends_on_slice` filtering). This makes iter1's body too small (202 ops vs ~784), missing shared precomputed ops.
+- **Fix planned:** port XLA's slice-dependency forward propagation to IREE pass
+- Runtime: ~80ms on AMD MI300A (vs 45.7ms IREE baseline without pass); performance optimization deferred until correctness is achieved
+
+#### Earlier attempts
+
+- Initially tried codegen-level pass (`GPULoopifyUnrolledSliceChain`) running before tiling in `addGPUTileAndFusePassPipeline()` — blocked by downstream dispatch creation/tiling issues
+- Moved to preprocessing level to avoid codegen pipeline conflicts
 
 ### MLIR Exploration
 
@@ -160,19 +191,20 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 | Memory transpose (nlev, ncells) | Significant improvement | **Adopted** |
 | StableHLO injection (precip) | 51ms to 35ms | **Adopted** |
 | Fused q_t_update | ~80 kernels to 2 | **Adopted** |
-| XLA LoopifyUnrolledSlices pass | Slower + correctness bug | In progress |
+| XLA LoopifyUnrolledSlices (WhileLoop) | 35ms, correct, ~6 kernels | **Working** |
+| XLA LoopifyUnrolledSlices (SerialScan) | 33ms, correct, 1 kernel | **Working** |
 | IREE CUDA | Functional but slower | Needs investigation |
-| IREE HIP (MI300) | 47ms | Baseline established |
-| IREE codegen-level pass | Wrong dispatch structure | In progress |
+| IREE HIP (MI300) | 47ms baseline | Baseline established |
+| IREE preprocessing pass | Correct structure, temperature bug | In progress |
 | Pure MLIR | Exploratory | Early stage |
 
 ---
 
 ## Next Steps
 
-1. **XLA pass:** fix chain detection/grouping to capture all 11 concatenates in a single while loop
-2. **q_t_update:** apply StableHLO injection (like precipitation scans) to further reduce kernel count
-3. **Investigate 13ms overhead:** profile kernel launch overhead and remaining small kernels
-4. **IREE codegen pass:** achieve correct dispatch structure `dispatch(cells){ scf.for(levels){ compute } }`
+1. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
+2. **XLA SerialScan performance:** close the 4ms gap vs StableHLO injection baseline (33ms vs 29ms) — investigate body optimization
+3. **q_t_update:** apply StableHLO injection or XLA pass to further reduce kernel count
+4. **Investigate overhead:** profile remaining kernel launch overhead and small kernels
 5. **IREE CUDA:** investigate memory errors when JIT-compiling the full fused function
 6. **Transpose elimination:** remove pre-transpose step entirely (currently not measured, but desirable)
