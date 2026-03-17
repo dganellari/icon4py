@@ -1,7 +1,7 @@
-# Muphys Graupel GPU Optimization Logbook
+# Muphys Graupel GPU Optimization Logbook (JAX / XLA / IREE)
 
-> Optimizing JAX graupel microphysics towards DaCe-GPU performance on NVIDIA GH200 and AMD MI300.
-> Target: reduce per-iteration time from ~51ms to ~10-13ms (DaCe-GPU baseline).
+> Optimizing JAX graupel microphysics towards DaCe-GPU performance on NVIDIA GH200 and AMD MI300A.
+> Target: reduce per-iteration time from ~51ms to <10ms (DaCe-GPU baseline).
 
 ---
 
@@ -9,19 +9,27 @@
 
 ### Summary
 
-After extensive exploration across multiple optimization strategies (buffer donation, tiling, Triton, StableHLO injection, XLA/IREE compiler passes, memory layout transposition), the current best result is **29ms per iteration** on GH200 using StableHLO injection + transposed memory layout, and **33ms** using the custom XLA `LoopifyUnrolledSlices` pass in SerialScan mode (single GPU kernel for the entire precipitation scan). Work continues on the IREE preprocessing pass to achieve the same on AMD MI300A.
+After extensive exploration across multiple optimization strategies, the current best results are:
 
-### Current Performance (R2B06, GH200)
+- **29ms** on GH200 (Santis) — StableHLO injection + transposed memory layout + fused q_t_update
+- **33ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (SerialScan mode, single GPU kernel for precipitation scan)
+- **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
 
-| Configuration | Time (ms) | Speedup vs Baseline |
-|:---|:---:|:---:|
-| JAX baseline (original) | ~51 | 1.0x |
-| + transposed layout + StableHLO injection | ~35 | 1.46x |
-| + further fusion (fused q_t_update) | ~29 | 1.76x |
-| + XLA LoopifyUnrolledSlices (SerialScan) | ~33 | 1.55x |
-| DaCe-GPU target | ~10-13 | ~4-5x |
+The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA unrolls this into ~186 separate GPU kernels, spending most time on kernel launch overhead. The optimization work focuses on re-rolling these into 1-2 kernels via custom compiler passes or StableHLO injection.
 
-### Performance Breakdown (nsys, 35ms state)
+### Current Performance (R2B06)
+
+| Configuration | GPU | Cluster | Time (ms) | Notes |
+|:---|:---:|:---:|:---:|:---|
+| JAX baseline (original) | GH200 | Santis | ~51 | ~186 kernels for precip scan |
+| + transposed layout + StableHLO injection | GH200 | Santis | ~35 | Unrolled but coalesced |
+| + further fusion (fused q_t_update) | GH200 | Santis | ~29 | Best current result on GH200 |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | 1 kernel for precip scan (replaces StableHLO injection) |
+| IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | ~186 dispatches for precip scan |
+| IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Correctness bug, not yet optimized |
+| DaCe-GPU target | GH200 | Santis | <10 | — |
+
+### Performance Breakdown (nsys profile, GH200, at the 35ms configuration stage)
 
 | Component | Time (ms) | Notes |
 |:---|:---:|:---|
@@ -110,7 +118,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 2. **Chain grouping**: Group all 11 output concatenates sharing the same 90-level computation into a single loop with 11 accumulators
 3. **Slice-dependency propagation**: Forward-propagate from k=0 level slices through iter0 body to identify which ops depend on the level index vs. shared precomputation
 4. **Carry detection**: Walk (iter2, iter1) structurally to find inter-iteration dependencies (19 carry pairs including shifted carries for previous-level values)
-5. **Body construction**: Use iter1 as the loop body template (avoids IRMapping override issues); iter0 output is used as carry initial values
+5. **Body construction**: Use iter1 as the loop body template; iter0 output is used as carry initial values
 6. **Scalarization (SerialScan mode)**: Convert tensor-level ops to scalar arithmetic inside the kernel; each workgroup processes one cell, looping over 90 levels
 
 ### Status: Working
@@ -118,7 +126,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - Pass compiles and is integrated into JAX (built from source within modified XLA)
 - All 11 output concatenates correctly grouped into a single loop
 - Correctness verified: all output fields match reference data
-- **Benchmark progression (GH200, R2B06)**:
+- **Benchmark progression (all on NVIDIA GH200, R2B06)**:
   - 29.63ms — baseline (unrolled, with StableHLO injection + fused q_t_update)
   - 42.96ms — first attempt (only 1 of 11 chains loopified)
   - 35ms — after fixing chain grouping (all 11 chains, while-loop mode)
@@ -138,10 +146,11 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - This adds overhead; result is slightly slower than XLA
 - **Status:** functional but slower; further investigation needed. CUDA backend receives limited upstream attention.
 
-### IREE HIP/ROCm Backend (AMD MI300)
+### IREE HIP/ROCm Backend (AMD MI300A, Beverin)
 
-- Successfully running IREE on Beverin (MI300)
-- Runtime: **47ms** for 1 iteration (slower than XLA JAX on GH200 at 29ms)
+- Successfully running IREE on Beverin cluster (AMD MI300A, gfx942)
+- Baseline runtime (no custom pass): **47ms** for 1 iteration
+- Not directly comparable to GH200/Santis numbers (different GPU architecture)
 - AMD backend is more complete than CUDA backend
 
 ### IREE Compiler Pass (Preprocessing Level)
@@ -167,7 +176,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - **Correctness bug:** temperature field has error 5.59e+01 (other 10 fields match reference)
 - **Root cause identified:** iter1 boundary construction uses ALL iter0 values as boundaries, but should only use SLICE-DEPENDENT iter0 values (matching XLA's `depends_on_slice` filtering). This makes iter1's body too small (202 ops vs ~784), missing shared precomputed ops.
 - **Fix planned:** port XLA's slice-dependency forward propagation to IREE pass
-- Runtime: ~80ms on AMD MI300A (vs 45.7ms IREE baseline without pass); performance optimization deferred until correctness is achieved
+- Runtime on AMD MI300A (Beverin, gfx942): ~80ms (vs 45.7ms IREE baseline without pass); performance optimization deferred until correctness is achieved
 
 #### Earlier attempts
 
@@ -183,20 +192,20 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 
 ## Summary of Approaches Explored
 
-| Approach | Outcome | Status |
-|:---|:---|:---|
-| Buffer donation | No improvement | Abandoned |
-| Tiling | No improvement | Abandoned |
-| Triton-JAX | Kernel improvement, but DLPack overhead negates gains | Abandoned |
-| Memory transpose (nlev, ncells) | Significant improvement | **Adopted** |
-| StableHLO injection (precip) | 51ms to 35ms | **Adopted** |
-| Fused q_t_update | ~80 kernels to 2 | **Adopted** |
-| XLA LoopifyUnrolledSlices (WhileLoop) | 35ms, correct, ~6 kernels | **Working** |
-| XLA LoopifyUnrolledSlices (SerialScan) | 33ms, correct, 1 kernel | **Working** |
-| IREE CUDA | Functional but slower | Needs investigation |
-| IREE HIP (MI300) | 47ms baseline | Baseline established |
-| IREE preprocessing pass | Correct structure, temperature bug | In progress |
-| Pure MLIR | Exploratory | Early stage |
+| Approach | GPU | Outcome | Status |
+|:---|:---:|:---|:---|
+| Buffer donation | GH200 | No improvement | Abandoned |
+| Tiling | GH200 | No improvement | Abandoned |
+| Triton-JAX | GH200 | Kernel improvement, but DLPack overhead negates gains | Abandoned |
+| Memory transpose (nlev, ncells) | GH200 | Significant improvement | **Adopted** |
+| StableHLO injection (precip) | GH200 | 51ms to 35ms | **Adopted** |
+| Fused q_t_update | GH200 | ~80 kernels to 2 | **Adopted** |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
+| IREE CUDA | GH200 | Functional but slower | Needs investigation |
+| IREE HIP baseline | MI300A | 47ms | Baseline established |
+| IREE preprocessing pass | MI300A | Correct structure, temperature bug (80ms) | In progress |
+| Pure MLIR | — | Exploratory | Early stage |
 
 ---
 
