@@ -1,7 +1,7 @@
-# Muphys Graupel GPU Optimization Logbook (JAX → XLA / IREE vs DaCe-GPU)
+# Muphys Graupel GPU Optimization Logbook (JAX → XLA / IREE)
 
-> Optimizing JAX-compiled graupel microphysics via XLA and IREE compiler backends towards DaCe-GPU performance on NVIDIA GH200 and AMD MI300A.
-> Target: reduce per-iteration time from ~51ms to <10ms (DaCe-GPU baseline).
+> Optimizing JAX-compiled graupel microphysics via XLA and IREE compiler backends towards GT4Py DaCe GPU performance on NVIDIA GH200 and AMD MI300A.
+> Target: reduce per-iteration time from ~51ms to <10ms (GT4Py DaCe GPU baseline).
 > JAX alone cannot reach the target; the strategy relies on custom XLA and IREE compiler passes to re-roll unrolled loops into efficient GPU kernels.
 
 ---
@@ -28,7 +28,7 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | 1 kernel for precip scan (replaces StableHLO injection) |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Correctness bug, not yet optimized |
-| DaCe-GPU target | GH200 | Santis | <10 | — |
+| GT4Py DaCe GPU target | GH200 | Santis | <10 | — |
 
 ### Performance Breakdown (nsys profile, GH200, at the 35ms configuration stage)
 
