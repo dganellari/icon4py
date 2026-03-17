@@ -82,13 +82,15 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 
 ## Optimization Track 2: StableHLO Injection
 
-### Precipitation Scan Injection
+### Custom Primitive + StableHLO Injection
 
-- Hand-generated / script-generated unrolled StableHLO for precipitation scans
-- Eliminates `while` loops and `dynamic_slice`/`dynamic_update_slice` operations (D2D copies)
-- Injected via `mlir.merge_mlir_modules()` during JAX's MLIR lowering
+- Defined a JAX custom primitive (`jax.extend.core.Primitive`) with a custom MLIR lowering (`mlir.register_lowering`)
+- The lowering loads pre-generated StableHLO and merges it into the JAX compilation module via `mlir.merge_mlir_modules()`
+- This allows replacing arbitrary parts of the JAX-traced computation with hand-optimized or script-generated StableHLO, transparently within JAX's normal JIT pipeline
+- First applied to precipitation scans: eliminates `while` loops and `dynamic_slice`/`dynamic_update_slice` operations (D2D copies)
 - Benefits were not visible until the transpose issue (Track 1) was fixed
-- **Result:** Combined with transpose, brought runtime from ~51ms to ~35ms
+- Later extended to a combined module covering both q_t_update and precipitation scans
+- **Result:** Precip-only injection brought runtime from ~51ms to ~35ms; combined module brought it to ~29ms
 
 ### Bottleneck Analysis
 
