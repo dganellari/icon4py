@@ -13,7 +13,6 @@
 After extensive exploration across multiple optimization strategies, the current best results are:
 
 - **12.97ms** on MI300A (Beverin) — combined StableHLO injection + transposed layout, XLA ROCm, JAX 0.6.0 (best overall, approaching <10ms target)
-- **23.32ms** on MI300A (Beverin) — same config but JAX 0.9.2 (~79% regression from JAX version change)
 - **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA CUDA
 - **32.99ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (WhileLoop mode, correct results, slower due to host-device sync)
 - **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
@@ -28,7 +27,6 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 | + transposed layout + StableHLO injection | GH200 | Santis | ~35 | early Feb 2026 | Unrolled but coalesced |
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | mid Feb 2026 | Single HLO module, best current result on GH200 |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
-| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | 23.32 | Mar 2026 | ~79% slower due to JAX version regression |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 32.99 | mid Mar 2026 | Correct, but slower than baseline (host-device sync, 90 round-trips) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | mid Mar 2026 | Blocked: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
@@ -209,7 +207,6 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 | StableHLO injection (precip only) | GH200 | 51ms to 35ms | **Adopted** |
 | Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **12.97ms**, best overall | **Adopted** |
-| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23.32ms (JAX version regression) | **Adopted** |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 32.99ms, correct, host-device sync overhead | Working (not useful — slower than baseline) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Blocked by XLA MLIR lowering | Blocked |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
@@ -224,8 +221,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 1. **XLA SerialScan emitter:** unblock by implementing support for sequential scans using `xla_gpu` dialect ops (requires deep XLA codegen work)
 2. **StableHLO optimization:** analyze and optimize the combined StableHLO to push below 12.97ms
 3. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
-4. **JAX version regression:** investigate why JAX 0.9.2 regresses to 23.32ms (vs 12.97ms on JAX 0.6.0)
-5. **Transpose elimination:** remove pre-transpose step entirely
+4. **Transpose elimination:** remove pre-transpose step entirely
 
 ---
 
