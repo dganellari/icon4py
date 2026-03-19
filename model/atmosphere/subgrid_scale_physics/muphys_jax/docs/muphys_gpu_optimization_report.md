@@ -33,10 +33,13 @@ The GT4Py DaCe GPU backend achieves **<10ms** on GH200 for the same physics beca
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Feb 2026 | Single HLO module, best on GH200 |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | 23.32 | Mar 2026 | Same config, ~79% slower due to JAX version regression |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | ~35 | Mar 2026 | ~6 kernels for precip scan |
-| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | Mar 2026 | 1 kernel for precip scan |
-| IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
-| IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Mar 2026 | Correctness bug, not yet optimized |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 32.99 | Mar 2026 | Correct results, slower due to host-device sync (90 round-trips) |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | Mar 2026 | **Blocked**: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
+| IREE HIP baseline (no custom pass) | MI300A | Beverin | 45 | Mar 2026 | Best IREE result, 37+ dispatches with transpose overhead |
+| IREE HIP + LoopifyInsertSliceChain | MI300A | Beverin | 80 | Mar 2026 | **Worse than baseline** — pass prevents IREE's own fusion |
+| IREE HIP + full scalarization | MI300A | Beverin | 295-340 | Mar 2026 | Register pressure from 807 ops in loop body |
+| IREE HIP + transpose pass disabling | MI300A | Beverin | 80 | Mar 2026 | No effect — transposes from stablehlo_xla pipeline |
+| IREE HIP + FusePrecompIntoDispatch | MI300A | Beverin | fail | Mar 2026 | Codegen chokes on 18K ops in 1 dispatch |
 | GT4Py DaCe GPU target | GH200 | Santis | <10 | — | — |
 
 ---
@@ -91,11 +94,26 @@ A reusable technique for replacing arbitrary parts of JAX-traced computation wit
 Custom XLA HLO pass that detects the unrolled 90-level `slice → compute → concat` pattern and re-rolls it into a loop or single-kernel serial scan.
 
 - Built JAX and XLA from source to integrate the pass
-- Two modes: `kWhileLoop` (~6 kernels, 35ms) and `kSerialScan` (1 kernel, 33ms)
-- All 11 output concatenates grouped into one loop with 11 accumulators + 19 carry pairs
-- Correctness verified against reference data
-- Still ~4ms slower than StableHLO injection baseline
+- Two modes: `kWhileLoop` and `kSerialScan`
+- All 10 output concatenates grouped into one loop with 10 accumulators
+- Carry analysis identifies shifted carries, invariants, sliced inputs, and offset slices
+- Body computation serialized into backend config metadata string (avoids HLO computation pruning)
 - See [INTEGRATION.md](../xla_passes/INTEGRATION.md) for build/integration details
+
+**kWhileLoop mode (working):**
+- Creates a while loop with all accumulators as iter_args
+- Result: **32.99ms** on GH200 (correct, validated against baseline, max diff 2.17e-06)
+- Slower than 29ms baseline due to WhileThunk host-device synchronization per iteration (90 round-trips)
+- This overhead is fundamental to XLA's while-loop execution model
+
+**kSerialScan mode (blocked):**
+- Creates a kCustom fusion with `__serial_scan` kind and `SerialScanFusion` emitter
+- Pass side works: successfully creates fusion, inline DCE cleans up dead ops (18420 → 1068 instructions)
+- Emitter generates MLIR from serialized body ops (~20 HLO opcodes supported)
+- **Blocked**: XLA's GPU MLIR lowering pipeline does not support standard `scf.for`/`tensor.extract`/`tensor.insert`
+- XLA emitters use custom `EmitXlaLoopOp` → `xla_gpu.loop` ops with special bufferization support
+- A sequential scan (level k depends on level k-1) doesn't fit the per-element `EmitXlaLoopOp` model
+- Unblocking requires either: (a) writing a custom `xla_gpu` dialect op for sequential scans, or (b) finding a way to express carries within `EmitXlaLoopOp`
 
 ### Track 4: IREE (Mar 2026)
 
@@ -103,10 +121,35 @@ Custom XLA HLO pass that detects the unrolled 90-level `slice → compute → co
 - Patched IREE CUDA bug; functional but slower than XLA due to JIT memory errors requiring function splitting
 
 **IREE HIP/ROCm Backend (AMD MI300A):**
-- Baseline: 47ms (no custom pass)
+- Baseline (no custom pass): **45ms** (correct results, 37+ dispatches with transpose overhead)
 - Custom preprocessing pass `LoopifyInsertSliceChain` at tensor/linalg level
 - Generates `flow.dispatch.region { scf.forall(327680) + scf.for(90) }` with WorkgroupMappingAttr
-- **Status:** structurally correct, correctness bug in temperature field (root cause identified, fix planned)
+
+**IREE optimization attempts and results (Mar 2026):**
+
+| Approach | Time (ms) | Correct? | Outcome |
+|:---|:---:|:---:|:---|
+| IREE HIP baseline (no custom pass) | 45 | yes | Best IREE result — IREE's own dispatch fusion |
+| LoopifyInsertSliceChain (iter0 template, 80ms version) | 80 | max diff 6.9e-02 | Loopify pass makes it WORSE — prevents IREE's fusion |
+| Full scalarization (807 ops in loop body) | 295-340 | max diff 217 | Register pressure kills GPU perf |
+| Direct write to shared_outs (full tensor carries) | 563 | — | IREE can't optimize 200MB tensor carries |
+| Disable PropagateLinalgTranspose + TransposeGenericOps | 80 | — | No effect — transposes come from stablehlo_xla pipeline |
+| FusePrecompIntoDispatch (18K ops in 1 dispatch) | fail | — | IREE codegen chokes, workgroup_size=[1,1,1] |
+| iree-compile --iree-input-type=stablehlo (0 transposes) | ~1000 | — | 20x slower — stablehlo path lacks XLA layout optimizations |
+
+**Key findings:**
+1. **IREE's transpose overhead is ~85% of runtime** (confirmed via nsys profiling on CUDA): 22 `elementwise_transpose` kernels + 11 output transposes consume ~85ms out of ~104ms on H100
+2. **The transposes originate in the `stablehlo_xla` input pipeline**, not in `PropagateLinalgTranspose` or `TransposeGenericOps` passes — disabling those passes had zero effect
+3. **`iree-compile` with `--iree-input-type=stablehlo` produces 0 transpose dispatches** (37 total), but the generated code is 20x slower because it lacks XLA's detupling/layout optimizations
+4. **The PJRT plugin rejects `--iree-global-opt-propagate-transposes=false`** even though the flag exists in `iree-compile` — the PJRT `libIREECompiler.so` doesn't register it as a command-line option
+5. **The loopify pass is counterproductive** — IREE at 45ms without loopify is faster than 80ms with it
+
+**Conclusion:** The 45ms→13ms gap cannot be closed from outside IREE without modifying the `stablehlo_xla` input pipeline internals. IREE optimization is **on hold** — focus shifted to XLA path where 12.97ms is already achieved.
+
+**Files created during IREE investigation:**
+- `iree-jax/compiler/src/iree/compiler/Preprocessing/Common/LoopifyInsertSliceChain.cpp` — main loopify pass
+- `iree-jax/compiler/src/iree/compiler/Preprocessing/Common/FusePrecompIntoDispatch.cpp` — dead end, can delete
+- `model/.../muphys_jax/tests/bench_iree_vmfb.py` — direct IREE vmfb benchmark (bypasses JAX/PJRT)
 
 ---
 
@@ -132,36 +175,38 @@ Based on nsys profiling at the 35ms stage on GH200 (MI300A breakdown not yet pro
 | Track | Pros | Cons | Recommendation |
 |:---|:---|:---|:---|
 | StableHLO injection | Best current result (12.97ms on JAX 0.6.0), no C++ needed, works with stock JAX/XLA | Still unrolled (~186 kernels), limited by kernel launch overhead, requires pre-generated HLO, sensitive to JAX version | **Keep as baseline** — it works and is easy to maintain |
-| XLA LoopifyUnrolledSlices | 1 kernel for precip scan, principled solution, correctness proven | Requires building JAX/XLA from source, 4ms slower than injection | **Invest** — this is the path to <10ms on GH200; needs body optimization |
-| IREE HIP preprocessing pass | Targets MI300A directly, single kernel, IREE has better AMD support | Correctness bug (fix identified), requires building IREE from source | **Invest** — this is the path to <10ms on MI300A; fix is straightforward |
+| XLA LoopifyUnrolledSlices | Principled solution, correctness proven (WhileLoop mode) | WhileLoop slower than baseline (host-device sync); SerialScan blocked by XLA MLIR lowering (needs custom xla_gpu ops) | **Invest cautiously** — SerialScan is the path to <10ms but requires deep XLA codegen work |
+| IREE HIP preprocessing pass | Targets MI300A directly, IREE has better AMD support | 45ms baseline can't be improved without modifying IREE's stablehlo_xla internals; all optimization attempts made it worse | **On hold** — 45ms is IREE's floor for this workload |
 | Pure MLIR rewrite | Maximum control, no JAX overhead | Requires rewriting all physics in MLIR, large effort | **Future idea** — only if other tracks plateau |
 
 **Short-term (next 2 weeks):**
-1. Fix IREE preprocessing pass correctness (port `depends_on_slice` from XLA pass)
-2. Profile the 12.97ms MI300A result with nsys to understand breakdown
-3. Run XLA SerialScan on MI300A for comparison
+1. Profile the 12.97ms MI300A XLA result to understand remaining overhead
+2. Analyze and optimize the combined StableHLO to push below 12.97ms
+3. Investigate JAX 0.6.0 → 0.9.2 regression root cause
 
 **Medium-term (next 1-2 months):**
-1. Optimize XLA SerialScan body to close the 4ms gap vs StableHLO injection
-2. Optimize IREE pass performance after correctness is achieved
-3. Investigate transpose elimination for production integration
+1. Unblock XLA SerialScan emitter by implementing support for sequential scans using `xla_gpu` dialect ops (requires deep XLA codegen work)
+2. Investigate transpose elimination for production integration
+3. If IREE upstream fixes stablehlo_xla transpose issue, revisit IREE path
 
 ---
 
 ## Risks and Open Questions
 
-### Transpose overhead (45ms on MI300A)
+### Transpose overhead (~19ms on MI300A)
 
 The 12.97ms result assumes pre-transposed `(nlev, ncells)` layout. Adding transposes at runtime costs ~19ms (total 32.42ms on JAX 0.6.0), significantly degrading end-to-end performance. In production, the data must either:
 - Be stored in `(nlev, ncells)` layout natively (requires upstream changes)
 - Be transposed once at initialization (amortized over many timesteps)
 - Be eliminated by a compiler pass (XLA does not do this automatically; investigated, not promising)
 
-### IREE pass correctness bug
+### IREE optimization ceiling (45ms on MI300A)
 
-- **Root cause identified:** iter1 boundary construction uses all iter0 values instead of only slice-dependent ones
-- **Fix:** port XLA's `depends_on_slice` forward propagation — the algorithm is understood and the code change is localized (~50 lines)
-- **Timeline:** days, not weeks
+- IREE's baseline (no custom pass) is 45ms — all custom pass attempts made it worse
+- **Root cause:** ~85% of IREE runtime is transpose dispatch overhead, originating in the `stablehlo_xla` input pipeline (not in GlobalOptimization passes)
+- Disabling `PropagateLinalgTranspose` and `TransposeGenericOps` had zero effect
+- `iree-compile --iree-input-type=stablehlo` eliminates transposes but produces 20x slower code
+- **Status:** on hold — would require modifying IREE's `stablehlo_xla` internals or filing an upstream issue
 
 ### XLA pass requires building from source
 
@@ -245,11 +290,11 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 
 ### Software versions
 
-- JAX: 0.9.1 (Santis GH200), 0.6.0 and 0.9.2 (Beverin MI300A — significant performance difference, see Risks)
+- JAX: 0.6.0 (Beverin MI300A, best result), 0.9.2 (Beverin MI300A, regression)
+- JAX/XLA custom build: from source, pinned to jax-v0.6.2 tag (Santis GH200, for LoopifyUnrolledSlices pass)
 - CUDA: 12.6.0 (Santis)
 - ROCm: 6.x (Beverin)
 - IREE: built from source (main branch, Mar 2026)
-- XLA: built from source (pinned to jax-v0.6.2 tag for custom pass)
 
 ---
 
@@ -266,9 +311,12 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 | Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **12.97ms**, best overall | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23.32ms (JAX version regression) | **Adopted** |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
-| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 32.99ms, correct, host-device sync overhead | **Working** (not useful — slower than baseline) |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Blocked by XLA MLIR lowering | **Blocked** |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
-| IREE HIP baseline | MI300A | 47ms | Baseline established |
-| IREE preprocessing pass | MI300A | Correct structure, temperature bug (80ms) | In progress |
+| IREE HIP baseline (no pass) | MI300A | 45ms, correct | Best IREE result |
+| IREE HIP + LoopifyInsertSliceChain | MI300A | 80ms — worse than baseline | **On hold** |
+| IREE HIP + full scalarization | MI300A | 295-340ms, register pressure | **Abandoned** |
+| IREE HIP + transpose pass disabling | MI300A | No effect (80ms) | **Abandoned** |
+| IREE HIP + FusePrecompIntoDispatch | MI300A | Codegen failure | **Abandoned** |
 | Pure MLIR rewrite | — | Exploratory | Future idea |

@@ -6,7 +6,7 @@
 
 ---
 
-## State: March 2025
+## State: March 2026
 
 ### Summary
 
@@ -15,7 +15,7 @@ After extensive exploration across multiple optimization strategies, the current
 - **12.97ms** on MI300A (Beverin) — combined StableHLO injection + transposed layout, XLA ROCm, JAX 0.6.0 (best overall, approaching <10ms target)
 - **23.32ms** on MI300A (Beverin) — same config but JAX 0.9.2 (~79% regression from JAX version change)
 - **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA CUDA
-- **33ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (SerialScan mode, single GPU kernel for precipitation scan)
+- **32.99ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (WhileLoop mode, correct results, slower due to host-device sync)
 - **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
 
 The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA unrolls this into ~186 separate GPU kernels, spending most time on kernel launch overhead. The optimization work focuses on re-rolling these into 1-2 kernels via custom compiler passes or StableHLO injection.
@@ -29,7 +29,8 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | mid Feb 2026 | Single HLO module, best current result on GH200 |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | 23.32 | Mar 2026 | ~79% slower due to JAX version regression |
-| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | mid Mar 2026 | 1 kernel for precip scan (replaces StableHLO injection) |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 32.99 | mid Mar 2026 | Correct, but slower than baseline (host-device sync, 90 round-trips) |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | mid Mar 2026 | Blocked: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Mar 2026 | Correctness bug, not yet optimized |
 | GT4Py DaCe GPU target | GH200 | Santis | <10 | — | — |
@@ -117,7 +118,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - Attempted StableHLO-level re-rolling first, but XLA overrides things during lowering, making it slower
 - Two modes:
   - `kWhileLoop` — emits an HLO while loop; XLA fuses the body into ~6 kernels
-  - `kSerialScan` — emits a custom fusion with a single GPU kernel containing `scf.forall` (parallel over cells) + `scf.for` (serial over levels)
+  - `kSerialScan` — emits a custom fusion intended to produce a single GPU kernel with `scf.forall` (parallel over cells) + `scf.for` (serial over levels). Currently blocked by XLA's MLIR lowering pipeline (see below).
 
 ### Algorithm
 
@@ -128,19 +129,24 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 5. **Body construction**: Use iter1 as the loop body template; iter0 output is used as carry initial values
 6. **Scalarization (SerialScan mode)**: Convert tensor-level ops to scalar arithmetic inside the kernel; each workgroup processes one cell, looping over 90 levels
 
-### Status: Working
+### Status
 
+**kWhileLoop mode — working, correct, but not useful:**
 - Pass compiles and is integrated into JAX (built from source within modified XLA)
-- All 11 output concatenates correctly grouped into a single loop
-- Correctness verified: all output fields match reference data
-- **Benchmark progression (all on NVIDIA GH200, R2B06)**:
+- All 10 output concatenates correctly grouped into a single while loop
+- Correctness verified: all output fields match reference data (max diff 2.17e-06)
+- Result: **32.99ms** on GH200 — slower than 29ms baseline due to WhileThunk host-device synchronization per iteration (90 round-trips). This overhead is fundamental to XLA's while-loop execution model.
+- Benchmark progression (all on NVIDIA GH200, R2B06):
   - 29.63ms — baseline (unrolled, with StableHLO injection + fused q_t_update)
   - 42.96ms — first attempt (only 1 of 11 chains loopified)
-  - 35ms — after fixing chain grouping (all 11 chains, while-loop mode)
-  - **33ms** — SerialScan mode (single GPU kernel)
-- SerialScan mode eliminates ~186 kernel launches → 1 kernel for the precipitation scan
-- Still ~4ms slower than the StableHLO injection baseline (29ms); the gap is likely due to the scan body being less optimized than XLA's hand-fused kernels
+  - 32.99ms — after fixing chain grouping (all chains, while-loop mode)
 - See [INTEGRATION.md](../xla_passes/INTEGRATION.md) for build/integration instructions
+
+**kSerialScan mode — blocked by XLA MLIR lowering:**
+- Pass side works: creates a kCustom fusion with `__serial_scan` kind, inline DCE cleans up dead ops (18420 → 1068 instructions), body ops serialized into metadata string
+- Emitter generates MLIR from serialized body ops (~20 HLO opcodes supported)
+- **Blocked:** XLA's GPU MLIR lowering pipeline does not support standard `scf.for`/`tensor.extract`/`tensor.insert`. XLA emitters use custom `EmitXlaLoopOp` → `xla_gpu.loop` ops with special bufferization support. A sequential scan (level k depends on level k-1) does not fit the per-element `EmitXlaLoopOp` model.
+- Unblocking requires either: (a) writing a custom `xla_gpu` dialect op for sequential scans, or (b) finding a way to express carries within `EmitXlaLoopOp`
 
 ---
 
@@ -204,8 +210,8 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 | Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **12.97ms**, best overall | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23.32ms (JAX version regression) | **Adopted** |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
-| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 32.99ms, correct, host-device sync overhead | Working (not useful — slower than baseline) |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Blocked by XLA MLIR lowering | Blocked |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
 | IREE HIP baseline | MI300A | 47ms | Baseline established |
 | IREE preprocessing pass | MI300A | Correct structure, temperature bug (80ms) | In progress |
@@ -215,10 +221,11 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 
 ## Next Steps
 
-1. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
-2. **XLA SerialScan performance:** close the 4ms gap vs StableHLO injection baseline (33ms vs 29ms) — investigate body optimization
-3. **Investigate overhead:** profile remaining kernel launch overhead and small kernels
-4. **Transpose elimination:** remove pre-transpose step entirely (currently not measured, but desirable)
+1. **XLA SerialScan emitter:** unblock by implementing support for sequential scans using `xla_gpu` dialect ops (requires deep XLA codegen work)
+2. **StableHLO optimization:** analyze and optimize the combined StableHLO to push below 12.97ms
+3. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
+4. **JAX version regression:** investigate why JAX 0.9.2 regresses to 23.32ms (vs 12.97ms on JAX 0.6.0)
+5. **Transpose elimination:** remove pre-transpose step entirely
 
 ---
 
