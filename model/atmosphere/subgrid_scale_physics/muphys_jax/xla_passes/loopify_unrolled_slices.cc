@@ -39,6 +39,7 @@
 #include "xla/literal_util.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -1454,6 +1455,619 @@ absl::StatusOr<bool> BuildWhileLoop(
   return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 4: Build serial scan fusion (alternative to BuildWhileLoop)
+//
+// Creates a kFusion with kind="__serial_scan" and an embedded per-level body
+// computation. The SerialScanFusion emitter generates a single GPU kernel
+// with an internal serial loop (scf.forall + scf.for).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Forward declarations for serialization helpers.
+std::string SerializeBodyComputation(const HloComputation* comp);
+
+absl::StatusOr<bool> BuildSerialScanFusion(
+    HloComputation* computation,
+    const std::vector<SliceChain>& chains,
+    const IterationBody& body) {
+
+  int64_t num_iters = chains[0].num_iterations;
+  int64_t slice_dim = chains[0].slice_dim;
+
+  VLOG(1) << "Building serial scan fusion for " << chains.size()
+          << " concatenates (" << num_iters << " iterations)";
+
+  int num_carry = body.carry_outputs.size();
+  int num_accum = body.iter1_level_outputs.size();
+  int num_sliced = body.sliced_inputs.size();
+  int num_invariant = body.invariant_inputs.size();
+
+  // Classify carries: only regular carries become fusion carries.
+  // Shifted carries are recomputed via offset slices.
+  std::vector<int> regular_carry_indices;
+  for (int i = 0; i < num_carry; ++i) {
+    if (!body.carry_is_shifted[i]) {
+      regular_carry_indices.push_back(i);
+    }
+  }
+  int nc = regular_carry_indices.size();
+
+  // Classify offset slices. Track both instruction and source tensor.
+  struct OffsetEntry {
+    HloInstruction* inst;
+    HloInstruction* source;
+    int64_t offset;
+  };
+  std::vector<OffsetEntry> offset_entries;
+  std::vector<HloInstruction*> offset_slice_insts;
+  std::vector<int64_t> offset_values;
+  for (auto& [inst, src_off] : body.offset_slices) {
+    offset_entries.push_back({inst, src_off.first, src_off.second});
+    offset_slice_insts.push_back(inst);
+    offset_values.push_back(src_off.second);
+  }
+  int noff = offset_slice_insts.size();
+
+  // ── Step A: Create per-level scalar body computation ──
+  // Parameters: [carries, sliced, offsets, invariants] — all scalar f64[]
+  // Root: tuple(new_carries..., level_outputs...)
+  HloComputation::Builder scalar_builder("serial_scan_body");
+
+  // Track mapping: original instruction → scalar body instruction
+  absl::flat_hash_map<HloInstruction*, HloInstruction*> to_scalar;
+
+  // Scalar parameters for carries.
+  for (int i = 0; i < nc; ++i) {
+    int idx = regular_carry_indices[i];
+    PrimitiveType type = body.carry_outputs[idx]->shape().element_type();
+    to_scalar[body.carry_inputs[idx]] =
+        scalar_builder.AddInstruction(HloInstruction::CreateParameter(
+            i, ShapeUtil::MakeShape(type, {}),
+            absl::StrCat("carry_", i)));
+  }
+
+  // Scalar parameters for sliced inputs: one per unique source in
+  // body.sliced_inputs. All k=1 slices from the same source share one param.
+  absl::flat_hash_map<HloInstruction*, int> source_to_idx;
+  absl::flat_hash_map<HloInstruction*, HloInstruction*> source_to_param;
+  for (int i = 0; i < num_sliced; ++i) {
+    HloInstruction* source = body.sliced_inputs[i];
+    source_to_idx[source] = i;
+    PrimitiveType type = source->shape().element_type();
+    auto* param = scalar_builder.AddInstruction(
+        HloInstruction::CreateParameter(
+            nc + i, ShapeUtil::MakeShape(type, {}),
+            absl::StrCat("sliced_", i)));
+    source_to_param[source] = param;
+  }
+  int param_idx = nc + num_sliced;
+
+  // Map all k=1 slices across chains to their source's parameter.
+  for (const auto& chain : chains) {
+    for (auto& [source, slices] : chain.source_slices) {
+      auto param_it = source_to_param.find(source);
+      if (param_it == source_to_param.end()) continue;
+      for (auto* s : slices) {
+        if (s->slice_starts()[slice_dim] != 1) continue;
+        if (to_scalar.contains(s)) continue;
+        if (body.intra_loop_slice_to_level_output.contains(s)) continue;
+        to_scalar[s] = param_it->second;
+      }
+    }
+  }
+
+  // Scalar parameters for offset slices.
+  for (int i = 0; i < noff; ++i) {
+    PrimitiveType type = offset_slice_insts[i]->shape().element_type();
+    to_scalar[offset_slice_insts[i]] =
+        scalar_builder.AddInstruction(HloInstruction::CreateParameter(
+            param_idx++, ShapeUtil::MakeShape(type, {}),
+            absl::StrCat("offset_", i)));
+  }
+
+  // Handle shifted carries: convert inputs to offset slices (k + (-1)),
+  // and map outputs to the corresponding sliced param (at current level k).
+  for (int i = 0; i < num_carry; ++i) {
+    if (!body.carry_is_shifted[i]) continue;
+
+    // Shifted carry input reads source[k-1] → offset slice with offset = -1.
+    HloInstruction* carry_in = body.carry_inputs[i];
+    if (!to_scalar.contains(carry_in)) {
+      HloInstruction* source = carry_in->mutable_operand(0);
+      offset_entries.push_back({carry_in, source, -1});
+      offset_slice_insts.push_back(carry_in);
+      offset_values.push_back(-1);
+
+      PrimitiveType type = carry_in->shape().element_type();
+      to_scalar[carry_in] = scalar_builder.AddInstruction(
+          HloInstruction::CreateParameter(
+              param_idx++, ShapeUtil::MakeShape(type, {}),
+              absl::StrCat("shifted_carry_in_", i)));
+    }
+
+    // Shifted carry output reads source[k] → reuse sliced param if available.
+    HloInstruction* carry_out = body.carry_outputs[i];
+    if (!to_scalar.contains(carry_out)) {
+      HloInstruction* source = carry_out->mutable_operand(0);
+      auto param_it = source_to_param.find(source);
+      if (param_it != source_to_param.end()) {
+        to_scalar[carry_out] = param_it->second;
+      } else {
+        VLOG(1) << "serial_scan: shifted carry output source "
+                << source->name() << " not in sliced_inputs";
+        return false;
+      }
+    }
+  }
+  noff = offset_slice_insts.size();  // Update after adding shifted carry offsets
+
+  // Scalar parameters for invariants.
+  // All invariants must get a param — if already mapped, the emitter's
+  // param count would mismatch. Check and bail out if this happens.
+  for (int i = 0; i < num_invariant; ++i) {
+    HloInstruction* inv = body.invariant_inputs[i];
+    if (to_scalar.contains(inv)) {
+      VLOG(1) << "serial_scan: invariant " << inv->name()
+              << " already mapped to another category; not supported";
+      return false;
+    }
+    PrimitiveType type = inv->shape().element_type();
+    to_scalar[inv] = scalar_builder.AddInstruction(
+        HloInstruction::CreateParameter(
+            param_idx++, ShapeUtil::MakeShape(type, {}),
+            absl::StrCat("invariant_", i)));
+  }
+  // Clone body instructions as scalar ops.
+  for (HloInstruction* inst : body.instructions) {
+    if (to_scalar.contains(inst)) continue;
+
+    std::vector<HloInstruction*> new_operands;
+    bool all_mapped = true;
+    for (HloInstruction* op : inst->operands()) {
+      auto it = to_scalar.find(op);
+      if (it != to_scalar.end()) {
+        new_operands.push_back(it->second);
+      } else {
+        VLOG(2) << "serial_scan: unmapped operand " << op->name()
+                << " for " << inst->name();
+        all_mapped = false;
+        break;
+      }
+    }
+    if (!all_mapped) {
+      LOG(WARNING) << "serial_scan: cannot scalarize " << inst->name();
+      return false;
+    }
+
+    // Compute scalar shape: same element type, rank 0.
+    Shape scalar_shape =
+        ShapeUtil::MakeShape(inst->shape().element_type(), {});
+    to_scalar[inst] = scalar_builder.AddInstruction(
+        inst->CloneWithNewOperands(scalar_shape, new_operands));
+
+    // Handle intra-loop: if this instruction is a level_output that maps to
+    // k1_slices, propagate the mapping.
+    for (auto& [k1_slice, level_out] :
+         body.intra_loop_slice_to_level_output) {
+      if (level_out == inst && !to_scalar.contains(k1_slice)) {
+        to_scalar[k1_slice] = to_scalar[inst];
+      }
+    }
+  }
+
+  // Build root tuple: [new_carries..., level_outputs...]
+  std::vector<HloInstruction*> root_operands;
+  for (int i = 0; i < nc; ++i) {
+    int idx = regular_carry_indices[i];
+    auto it = to_scalar.find(body.carry_outputs[idx]);
+    if (it == to_scalar.end()) {
+      LOG(WARNING) << "serial_scan: carry output " << body.carry_outputs[idx]->name()
+                   << " not in scalar map";
+      return false;
+    }
+    root_operands.push_back(it->second);
+  }
+  for (int i = 0; i < num_accum; ++i) {
+    auto it = to_scalar.find(body.iter1_level_outputs[i]);
+    if (it == to_scalar.end()) {
+      LOG(WARNING) << "serial_scan: level output " << body.iter1_level_outputs[i]->name()
+                   << " not in scalar map";
+      return false;
+    }
+    root_operands.push_back(it->second);
+  }
+
+  std::vector<Shape> root_shapes;
+  for (auto* op : root_operands) root_shapes.push_back(op->shape());
+  scalar_builder.AddInstruction(
+      HloInstruction::CreateTuple(root_operands));
+
+  HloComputation* body_comp =
+      computation->parent()->AddEmbeddedComputation(scalar_builder.Build());
+
+  VLOG(1) << "Created scalar body computation: " << body_comp->name()
+          << " with " << param_idx << " parameters, "
+          << root_operands.size() << " outputs";
+
+  // ── Step B: Collect fusion operands ──
+  // Order: carry_inits, iter0_level_outs, sliced_inputs, offset_sources,
+  //        invariants
+  std::vector<HloInstruction*> fusion_operands;
+
+  // Carry inits (iter-0 carry outputs).
+  for (int i = 0; i < nc; ++i) {
+    int idx = regular_carry_indices[i];
+    fusion_operands.push_back(body.carry_inputs[idx]);
+  }
+
+  // iter0 level outputs (for prefilling k=0 in accumulators).
+  for (int i = 0; i < num_accum; ++i) {
+    fusion_operands.push_back(body.iter0_level_outputs[i]);
+  }
+
+  // Sliced inputs.
+  for (auto* src : body.sliced_inputs) {
+    fusion_operands.push_back(src);
+  }
+
+  // Offset sources (includes original offsets + shifted carry offsets).
+  for (int i = 0; i < noff; ++i) {
+    fusion_operands.push_back(offset_entries[i].source);
+  }
+
+  // Invariants.
+  for (auto* inv : body.invariant_inputs) {
+    fusion_operands.push_back(inv);
+  }
+
+  // ── Step C: Build fusion body ──
+  // The body must reference all parameters (XLA requires no dead params).
+  // The emitter ignores the body and generates MLIR from the metadata string.
+  // We create: output_i = broadcast(zero) + slice(param_i)*0 (trivially zero
+  // but references each param to keep them alive).
+  HloComputation::Builder fused_builder("serial_scan_fused");
+
+  std::vector<HloInstruction*> params_vec;
+  for (int i = 0; i < static_cast<int>(fusion_operands.size()); ++i) {
+    params_vec.push_back(fused_builder.AddInstruction(
+        HloInstruction::CreateParameter(
+            i, fusion_operands[i]->shape(),
+            absl::StrCat("p", i))));
+  }
+
+  // Create output accumulators (zero-filled tensors matching concat shapes).
+  // Each accumulator trivially references one parameter to keep it alive.
+  std::vector<HloInstruction*> accum_results;
+  for (int i = 0; i < num_accum; ++i) {
+    const Shape& concat_shape = body.concats[i]->shape();
+    PrimitiveType elem_type = concat_shape.element_type();
+    HloInstruction* zero = fused_builder.AddInstruction(
+        HloInstruction::CreateConstant(LiteralUtil::Zero(elem_type)));
+    accum_results.push_back(fused_builder.AddInstruction(
+        HloInstruction::CreateBroadcast(concat_shape, zero, {})));
+  }
+
+  // Keep ALL parameters alive by chaining them through trivial ops.
+  // For each param: slice first element -> reshape to scalar -> multiply by 0
+  // -> add to a running scalar -> eventually add to first accumulator.
+  HloInstruction* keep_alive = fused_builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::Zero(F32)));
+  for (auto* param : params_vec) {
+    // Extract first element as scalar
+    std::vector<int64_t> starts(param->shape().dimensions_size(), 0);
+    std::vector<int64_t> limits(param->shape().dimensions_size(), 0);
+    std::vector<int64_t> strides(param->shape().dimensions_size(), 1);
+    for (int d = 0; d < param->shape().dimensions_size(); ++d) {
+      limits[d] = 1;
+    }
+    Shape slice_shape = ShapeUtil::MakeShape(
+        param->shape().element_type(),
+        std::vector<int64_t>(param->shape().dimensions_size(), 1));
+    auto* sliced = fused_builder.AddInstruction(
+        HloInstruction::CreateSlice(slice_shape, param, starts, limits,
+                                     strides));
+    auto* reshaped = fused_builder.AddInstruction(
+        HloInstruction::CreateReshape(
+            ShapeUtil::MakeShape(param->shape().element_type(), {}),
+            sliced));
+    // Convert to F32 if needed, multiply by 0, add to chain
+    HloInstruction* as_f32 = reshaped;
+    if (param->shape().element_type() != F32) {
+      as_f32 = fused_builder.AddInstruction(
+          HloInstruction::CreateConvert(ShapeUtil::MakeShape(F32, {}),
+                                         reshaped));
+    }
+    auto* zeroed = fused_builder.AddInstruction(
+        HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}),
+                                      HloOpcode::kMultiply, as_f32,
+                                      fused_builder.AddInstruction(
+                                          HloInstruction::CreateConstant(
+                                              LiteralUtil::Zero(F32)))));
+    keep_alive = fused_builder.AddInstruction(
+        HloInstruction::CreateBinary(ShapeUtil::MakeShape(F32, {}),
+                                      HloOpcode::kAdd, keep_alive, zeroed));
+  }
+
+  // Add the keep_alive scalar (always 0) broadcast to the first accumulator
+  // so all params are transitively reachable from the root.
+  if (!accum_results.empty()) {
+    const Shape& first_shape = accum_results[0]->shape();
+    auto* ka_bcast = fused_builder.AddInstruction(
+        HloInstruction::CreateBroadcast(first_shape, keep_alive, {}));
+    accum_results[0] = fused_builder.AddInstruction(
+        HloInstruction::CreateBinary(first_shape, HloOpcode::kAdd,
+                                      accum_results[0], ka_bcast));
+  }
+
+  HloInstruction* root = fused_builder.AddInstruction(
+      HloInstruction::CreateTuple(accum_results));
+
+  HloComputation* fused_comp =
+      computation->parent()->AddEmbeddedComputation(
+          fused_builder.Build(root));
+
+  // ── Step D: Create the fusion instruction ──
+  std::vector<Shape> output_shapes;
+  for (int i = 0; i < num_accum; ++i) {
+    output_shapes.push_back(body.concats[i]->shape());
+  }
+  Shape fusion_shape = ShapeUtil::MakeTupleShape(output_shapes);
+
+  HloInstruction* fusion_inst = computation->AddInstruction(
+      HloInstruction::CreateFusion(fusion_shape,
+                                    HloInstruction::FusionKind::kCustom,
+                                    fusion_operands, fused_comp));
+
+  // Set backend config: kind = "__serial_scan", metadata in name.
+  // Must wrap in GpuBackendConfig since that's what XLA expects.
+  GpuBackendConfig gpu_backend_config;
+  FusionBackendConfig* fusion_config =
+      gpu_backend_config.mutable_fusion_backend_config();
+  fusion_config->set_kind("__serial_scan");
+
+  std::string metadata = absl::StrCat(
+      "serial_scan;nlev=", num_iters,
+      ";sd=", slice_dim,
+      ";nc=", nc,
+      ";no=", num_accum,
+      ";ns=", num_sliced,
+      ";noff=", noff,
+      ";ni=", num_invariant);
+  if (!offset_values.empty()) {
+    metadata += ";offvals=";
+    for (int i = 0; i < noff; ++i) {
+      if (i > 0) metadata += ",";
+      absl::StrAppend(&metadata, offset_values[i]);
+    }
+  }
+  // body_ops must be last because its value is long and uses | as delimiter
+  absl::StrAppend(&metadata, ";body_ops=",
+                   SerializeBodyComputation(body_comp));
+  fusion_config->mutable_custom_fusion_config()->set_name(metadata);
+
+  TF_RETURN_IF_ERROR(fusion_inst->set_backend_config(gpu_backend_config));
+
+  VLOG(1) << "Created serial scan fusion: " << fusion_inst->name()
+          << " with " << fusion_operands.size() << " operands, "
+          << num_accum << " outputs";
+  VLOG(2) << "  metadata: " << metadata;
+
+  // ── Step E: Replace concatenates with fusion outputs ──
+  for (int i = 0; i < num_accum; ++i) {
+    HloInstruction* gte = computation->AddInstruction(
+        HloInstruction::CreateGetTupleElement(fusion_inst, i));
+    TF_RETURN_IF_ERROR(body.concats[i]->ReplaceAllUsesWith(gte));
+    VLOG(2) << "Replaced " << body.concats[i]->name()
+            << " with GTE(" << i << ") from serial scan fusion";
+  }
+
+  // Remove dead concatenates.
+  for (HloInstruction* concat : body.concats) {
+    TF_RETURN_IF_ERROR(computation->RemoveInstruction(concat));
+  }
+
+  // Inline DCE: remove dead instructions left behind (the ~90*N per-level
+  // slice/compute chains). We repeatedly scan for instructions with 0 users
+  // that are not the root, parameters, or have control successors.
+  bool removed = true;
+  while (removed) {
+    removed = false;
+    std::vector<HloInstruction*> dead;
+    for (HloInstruction* inst : computation->instructions()) {
+      if (inst->user_count() == 0 &&
+          inst->control_successors().empty() &&
+          inst != computation->root_instruction() &&
+          inst->opcode() != HloOpcode::kParameter) {
+        dead.push_back(inst);
+      }
+    }
+    for (HloInstruction* inst : dead) {
+      TF_RETURN_IF_ERROR(computation->RemoveInstruction(inst));
+      removed = true;
+    }
+  }
+
+  LOG(ERROR) << "LoopifyUnrolledSlices: after inline DCE, "
+             << computation->instruction_count() << " instructions remain";
+
+  VLOG(1) << "Successfully created serial scan fusion replacing "
+          << chains.size() << " concatenates";
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serialize a scalar HLO body computation into a metadata string.
+//
+// Format: instructions separated by '|', each instruction gets an implicit
+// index (0, 1, 2, ...) in MakeInstructionPostOrder() order.
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::string PrimitiveTypeName(PrimitiveType type) {
+  switch (type) {
+    case F16: return "F16";
+    case F32: return "F32";
+    case F64: return "F64";
+    case BF16: return "BF16";
+    case PRED: return "PRED";
+    case S8: return "S8";
+    case S16: return "S16";
+    case S32: return "S32";
+    case S64: return "S64";
+    case U8: return "U8";
+    case U16: return "U16";
+    case U32: return "U32";
+    case U64: return "U64";
+    default: return "UNKNOWN";
+  }
+}
+
+std::string LowercaseOpcode(HloOpcode opcode) {
+  switch (opcode) {
+    case HloOpcode::kAdd: return "add";
+    case HloOpcode::kSubtract: return "subtract";
+    case HloOpcode::kMultiply: return "multiply";
+    case HloOpcode::kDivide: return "divide";
+    case HloOpcode::kRemainder: return "remainder";
+    case HloOpcode::kNegate: return "negate";
+    case HloOpcode::kAbs: return "abs";
+    case HloOpcode::kSqrt: return "sqrt";
+    case HloOpcode::kCbrt: return "cbrt";
+    case HloOpcode::kRsqrt: return "rsqrt";
+    case HloOpcode::kExp: return "exp";
+    case HloOpcode::kLog: return "log";
+    case HloOpcode::kCeil: return "ceil";
+    case HloOpcode::kFloor: return "floor";
+    case HloOpcode::kTanh: return "tanh";
+    case HloOpcode::kMaximum: return "maximum";
+    case HloOpcode::kMinimum: return "minimum";
+    case HloOpcode::kPower: return "power";
+    case HloOpcode::kAnd: return "and";
+    case HloOpcode::kOr: return "or";
+    case HloOpcode::kXor: return "xor";
+    case HloOpcode::kNot: return "not";
+    case HloOpcode::kSelect: return "select";
+    case HloOpcode::kClamp: return "clamp";
+    default: return std::string(HloOpcodeString(opcode));
+  }
+}
+
+std::string ComparisonDirectionName(ComparisonDirection dir) {
+  switch (dir) {
+    case ComparisonDirection::kEq: return "EQ";
+    case ComparisonDirection::kNe: return "NE";
+    case ComparisonDirection::kLt: return "LT";
+    case ComparisonDirection::kLe: return "LE";
+    case ComparisonDirection::kGt: return "GT";
+    case ComparisonDirection::kGe: return "GE";
+  }
+}
+
+std::string SerializeBodyComputation(const HloComputation* comp) {
+  // Build instruction index map.
+  auto ordered = comp->MakeInstructionPostOrder();
+  absl::flat_hash_map<const HloInstruction*, int> inst_to_idx;
+  for (int i = 0; i < static_cast<int>(ordered.size()); ++i) {
+    inst_to_idx[ordered[i]] = i;
+  }
+
+  std::string result;
+  for (int i = 0; i < static_cast<int>(ordered.size()); ++i) {
+    if (i > 0) result += "|";
+    const HloInstruction* inst = ordered[i];
+    PrimitiveType type = inst->shape().element_type();
+    std::string type_str = PrimitiveTypeName(type);
+
+    switch (inst->opcode()) {
+      case HloOpcode::kParameter:
+        absl::StrAppend(&result, "P", inst->parameter_number(), "/", type_str);
+        break;
+
+      case HloOpcode::kConstant: {
+        double val = 0.0;
+        if (type == F64) val = inst->literal().GetFirstElement<double>();
+        else if (type == F32) val = inst->literal().GetFirstElement<float>();
+        else if (type == PRED) val = inst->literal().GetFirstElement<bool>() ? 1.0 : 0.0;
+        else if (type == S8) val = inst->literal().GetFirstElement<int8_t>();
+        else if (type == S16) val = inst->literal().GetFirstElement<int16_t>();
+        else if (type == S32) val = inst->literal().GetFirstElement<int32_t>();
+        else if (type == S64) val = inst->literal().GetFirstElement<int64_t>();
+        else if (type == U8) val = inst->literal().GetFirstElement<uint8_t>();
+        else if (type == U16) val = inst->literal().GetFirstElement<uint16_t>();
+        else if (type == U32) val = inst->literal().GetFirstElement<uint32_t>();
+        else if (type == U64) val = inst->literal().GetFirstElement<uint64_t>();
+        else if (type == F16) val = static_cast<float>(inst->literal().GetFirstElement<Eigen::half>());
+        else if (type == BF16) val = static_cast<float>(inst->literal().GetFirstElement<bfloat16>());
+        absl::StrAppend(&result, "K/", type_str, "/", val);
+        break;
+      }
+
+      case HloOpcode::kCompare: {
+        std::string dir = ComparisonDirectionName(inst->comparison_direction());
+        absl::StrAppend(&result, "CMP/", dir, "/",
+                         inst_to_idx[inst->operand(0)], ",",
+                         inst_to_idx[inst->operand(1)], "/", type_str);
+        break;
+      }
+
+      case HloOpcode::kConvert: {
+        absl::StrAppend(&result, "CVT/",
+                         inst_to_idx[inst->operand(0)], "/", type_str);
+        break;
+      }
+
+      case HloOpcode::kTuple: {
+        absl::StrAppend(&result, "T/");
+        for (int j = 0; j < inst->operand_count(); ++j) {
+          if (j > 0) result += ",";
+          absl::StrAppend(&result, inst_to_idx[inst->operand(j)]);
+        }
+        break;
+      }
+
+      case HloOpcode::kBroadcast:
+      case HloOpcode::kReshape:
+      case HloOpcode::kBitcast:
+      case HloOpcode::kCopy:
+        absl::StrAppend(&result, "pass/",
+                         inst_to_idx[inst->operand(0)], "/", type_str);
+        break;
+
+      case HloOpcode::kSelect:
+      case HloOpcode::kClamp: {
+        std::string op_name = LowercaseOpcode(inst->opcode());
+        absl::StrAppend(&result, op_name, "/",
+                         inst_to_idx[inst->operand(0)], ",",
+                         inst_to_idx[inst->operand(1)], ",",
+                         inst_to_idx[inst->operand(2)], "/", type_str);
+        break;
+      }
+
+      default: {
+        std::string op_name = LowercaseOpcode(inst->opcode());
+        if (inst->operand_count() == 1) {
+          absl::StrAppend(&result, op_name, "/",
+                           inst_to_idx[inst->operand(0)], "/", type_str);
+        } else if (inst->operand_count() == 2) {
+          absl::StrAppend(&result, op_name, "/",
+                           inst_to_idx[inst->operand(0)], ",",
+                           inst_to_idx[inst->operand(1)], "/", type_str);
+        } else {
+          // Fallback for unknown arity
+          absl::StrAppend(&result, op_name, "/");
+          for (int j = 0; j < inst->operand_count(); ++j) {
+            if (j > 0) result += ",";
+            absl::StrAppend(&result, inst_to_idx[inst->operand(j)]);
+          }
+          absl::StrAppend(&result, "/", type_str);
+        }
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1466,10 +2080,14 @@ absl::StatusOr<bool> LoopifyUnrolledSlices::Run(
 
   bool changed = false;
 
+  LOG(ERROR) << "LoopifyUnrolledSlices::Run ENTERED, mode="
+             << (mode_ == Mode::kSerialScan ? "kSerialScan" : "kWhileLoop");
+
   for (HloComputation* computation : module->computations(execution_threads)) {
     if (!computation->IsEntryComputation()) {
       continue;
     }
+    LOG(ERROR) << "LoopifyUnrolledSlices: processing entry computation";
 
     // Step 1: Find all matching slice chains
     std::vector<SliceChain> all_chains;
@@ -1482,9 +2100,10 @@ absl::StatusOr<bool> LoopifyUnrolledSlices::Run(
       }
     }
 
+    LOG(ERROR) << "LoopifyUnrolledSlices: found " << all_chains.size()
+               << " chains out of " << computation->instruction_count()
+               << " instructions";
     if (all_chains.empty()) continue;
-
-    VLOG(1) << "Found " << all_chains.size() << " slice chains";
 
     // Step 2: Group chains by (num_iterations, slice_dim)
     absl::flat_hash_map<std::string, std::vector<int>> groups;
@@ -1509,18 +2128,33 @@ absl::StatusOr<bool> LoopifyUnrolledSlices::Run(
         continue;
       }
 
-      TF_ASSIGN_OR_RETURN(bool transformed,
-                           BuildWhileLoop(computation, group_chains, *body,
-                                          unroll_factor_));
-      if (!transformed && unroll_factor_ > 1) {
-        VLOG(1) << "Unroll factor " << unroll_factor_
-                << " failed, retrying with unroll_factor=1";
-        // Re-extract body since BuildWhileLoop may have partially modified state
-        auto body2 = ExtractGroupedIterationBody(group_chains, computation);
-        if (body2.has_value()) {
-          TF_ASSIGN_OR_RETURN(transformed,
-                               BuildWhileLoop(computation, group_chains, *body2,
-                                              1));
+      bool transformed = false;
+      if (mode_ == Mode::kSerialScan) {
+        LOG(ERROR) << "LoopifyUnrolledSlices: attempting BuildSerialScanFusion";
+        TF_ASSIGN_OR_RETURN(transformed,
+                             BuildSerialScanFusion(computation, group_chains,
+                                                    *body));
+        LOG(ERROR) << "LoopifyUnrolledSlices: BuildSerialScanFusion returned "
+                   << transformed;
+        if (!transformed) {
+          LOG(ERROR) << "Serial scan fusion failed, falling back to while loop";
+        }
+      }
+
+      if (!transformed) {
+        LOG(ERROR) << "LoopifyUnrolledSlices: attempting BuildWhileLoop";
+        TF_ASSIGN_OR_RETURN(transformed,
+                             BuildWhileLoop(computation, group_chains, *body,
+                                            unroll_factor_));
+        if (!transformed && unroll_factor_ > 1) {
+          VLOG(1) << "Unroll factor " << unroll_factor_
+                  << " failed, retrying with unroll_factor=1";
+          auto body2 = ExtractGroupedIterationBody(group_chains, computation);
+          if (body2.has_value()) {
+            TF_ASSIGN_OR_RETURN(transformed,
+                                 BuildWhileLoop(computation, group_chains,
+                                                *body2, 1));
+          }
         }
       }
       if (transformed) {
@@ -1529,6 +2163,7 @@ absl::StatusOr<bool> LoopifyUnrolledSlices::Run(
     }
   }
 
+  LOG(ERROR) << "LoopifyUnrolledSlices::Run DONE, changed=" << changed;
   return changed;
 }
 

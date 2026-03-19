@@ -25,25 +25,33 @@
 namespace xla {
 namespace gpu {
 
-// Rewrites unrolled slice→compute→concat chains into while loops.
+// Rewrites unrolled slice→compute→concat chains into while loops or
+// serial scan fusions.
 //
 // Matches:
 //   slice(input,[k:k+1]) → f(slice_k, carry) → concat(r0,r1,...,r89)
-// Emits:
+// Emits (mode=kWhileLoop):
 //   while(k < N) { dynamic-slice → f → dynamic-update-slice }
+// Emits (mode=kSerialScan):
+//   kFusion with kind="__serial_scan" → single GPU kernel with internal loop
 //
 // Runs before PriorityFusion so the loop body gets fused into few kernels
 // (~6 instead of ~186 for 90-level precipitation scans).
 class LoopifyUnrolledSlices : public HloModulePass {
  public:
+  enum class Mode { kWhileLoop, kSerialScan };
+
   // min_iterations: minimum number of consecutive slices to trigger
   //                 transformation (default 4, set to 2 for testing)
   // unroll_factor:  number of levels processed per while iteration
   //                 (default 1; use e.g. 10 to reduce loop overhead 10×)
+  // mode:           kWhileLoop (default) or kSerialScan (single kernel)
   explicit LoopifyUnrolledSlices(int min_iterations = 4,
-                                  int unroll_factor = 10)
+                                  int unroll_factor = 10,
+                                  Mode mode = Mode::kWhileLoop)
       : min_iterations_(min_iterations),
-        unroll_factor_(unroll_factor) {}
+        unroll_factor_(unroll_factor),
+        mode_(mode) {}
 
   absl::string_view name() const override {
     return "loopify-unrolled-slices";
@@ -58,6 +66,7 @@ class LoopifyUnrolledSlices : public HloModulePass {
  private:
   int min_iterations_;
   int unroll_factor_;
+  Mode mode_;
 };
 
 }  // namespace gpu
