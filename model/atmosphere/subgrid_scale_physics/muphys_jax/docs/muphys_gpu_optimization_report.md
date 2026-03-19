@@ -31,8 +31,10 @@ The GT4Py DaCe GPU backend achieves **<10ms** on GH200 for the same physics beca
 | + transposed layout (nlev, ncells) | GH200 | Santis | ~45 | Jan 2026 | Coalesced memory access |
 | + StableHLO injection (precip only) | GH200 | Santis | ~35 | Feb 2026 | Custom primitive + merged HLO |
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Feb 2026 | Single HLO module, best on GH200 |
-| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | Default XLA flags |
+| + fast_pow + XLA flag tuning | MI300A | Beverin | 11.15 | Mar 2026 | **Best overall**, within DaCe target range |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | 23.32 | Mar 2026 | Same config, ~79% slower due to JAX version regression |
+| StableHLO while loop (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 25.25 | Mar 2026 | WhileThunk host-device sync overhead, not useful |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 32.99 | Mar 2026 | Correct results, slower due to host-device sync (90 round-trips) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | Mar 2026 | **Blocked**: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | 45 | Mar 2026 | Best IREE result, 37+ dispatches with transpose overhead |
@@ -271,12 +273,27 @@ CUDA_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 srun -n1 \
 ### Running benchmarks on Beverin (MI300A)
 
 ```bash
-# Combined StableHLO injection (XLA ROCm)
+# Combined StableHLO injection — default flags (12.97ms)
 HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 XLA_FLAGS="--xla_gpu_autotune_level=0" \
   srun -n1 -p mi300 \
   python model/atmosphere/subgrid_scale_physics/muphys_jax/tests/test_graupel_native_transposed.py \
   --input /capstor/store/cscs/userlab/d126/muphys_grids/inputs/atm_R2B06.nc \
   --graupel-hlo stablehlo/graupel_combined.stablehlo \
+  --num-runs 10
+
+# Best result: fast_pow + optimized XLA flags (11.15ms)
+# Requires: re-exported qt_update with _fast_pow (exp/log replacing lax.pow)
+#   1. python tools/generate_qt_update_stablehlo.py -o stablehlo/qt_update_fast.stablehlo
+#   2. python tools/generate_combined_graupel.py \
+#        --qt-update stablehlo/qt_update_fast.stablehlo \
+#        --precip stablehlo/precip_transposed.stablehlo \
+#        -o stablehlo/graupel_combined_fast.stablehlo
+HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
+  XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_graph_level=0 --xla_backend_optimization_level=3 --xla_llvm_force_inline_before_split=true" \
+  srun -n1 -p mi300 \
+  python model/atmosphere/subgrid_scale_physics/muphys_jax/tests/test_graupel_native_transposed.py \
+  --input /capstor/store/cscs/userlab/d126/muphys_grids/inputs/atm_R2B06.nc \
+  --graupel-hlo stablehlo/graupel_combined_fast.stablehlo \
   --num-runs 10
 
 # IREE HIP (requires custom-built IREE with LoopifyInsertSliceChain pass)
@@ -286,6 +303,15 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
   --input /capstor/store/cscs/userlab/d126/muphys_grids/inputs/atm_R2B06.nc \
   --graupel-hlo stablehlo/graupel_combined.stablehlo \
   --num-runs 10
+```
+
+### XLA flags reference (best configuration for MI300A)
+
+```
+--xla_gpu_autotune_level=0      # Disable autotuning (faster compilation, stable results)
+--xla_gpu_graph_level=0         # Disable CUDA/HIP graph capture (avoids graph overhead for many small kernels)
+--xla_backend_optimization_level=3  # Max LLVM optimization
+--xla_llvm_force_inline_before_split=true  # Inline all functions before LLVM module split (better cross-function optimization)
 ```
 
 ### Software versions
@@ -309,8 +335,10 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 | Fused q_t_update (lax.select/lax.pow) | GH200 | ~80 kernels → 2 | **Adopted** |
 | StableHLO injection (precip only) | GH200 | 51ms → 35ms | **Adopted** |
 | Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
-| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **12.97ms**, best overall | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | 12.97ms (default flags) | **Adopted** |
+| + fast_pow + XLA flag tuning | MI300A | **11.15ms**, best overall | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23.32ms (JAX version regression) | **Adopted** |
+| StableHLO while loop (XLA ROCm) | MI300A | 25.25ms (host-device sync) | Not useful |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 32.99ms, correct, host-device sync overhead | **Working** (not useful — slower than baseline) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Blocked by XLA MLIR lowering | **Blocked** |
 | IREE CUDA | GH200 | Functional but slower | Low priority |

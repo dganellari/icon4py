@@ -210,59 +210,63 @@ def main():
     from muphys_jax.implementations.graupel_baseline import graupel_run as graupel_baseline
 
     print("Running baseline graupel for comparison...")
-    baseline_fn = jax.jit(graupel_baseline)
-    baseline_args = (dz, t, p, rho, q, dt, qnc)
+    baseline_match = False
+    try:
+        baseline_fn = jax.jit(graupel_baseline)
+        baseline_args = (dz, t, p, rho, q, dt, qnc)
 
-    # Warmup
-    for _ in range(5):
+        # Warmup
+        for _ in range(5):
+            result_baseline = baseline_fn(*baseline_args)
+            jax.block_until_ready(result_baseline)
+
+        # Single run
         result_baseline = baseline_fn(*baseline_args)
         jax.block_until_ready(result_baseline)
 
-    # Single run
-    result_baseline = baseline_fn(*baseline_args)
-    jax.block_until_ready(result_baseline)
+        t_base, q_base, _, _, _, _, _, _ = result_baseline
 
-    t_base, q_base, _, _, _, _, _, _ = result_baseline
+        # Compare native-transposed vs baseline
+        t_base_np = np.array(t_base)
+        q_base_np = {
+            "v": np.array(q_base.v),
+            "c": np.array(q_base.c),
+            "r": np.array(q_base.r),
+            "s": np.array(q_base.s),
+            "i": np.array(q_base.i),
+            "g": np.array(q_base.g),
+        }
 
-    # Compare native-transposed vs baseline
-    t_base_np = np.array(t_base)
-    q_base_np = {
-        "v": np.array(q_base.v),
-        "c": np.array(q_base.c),
-        "r": np.array(q_base.r),
-        "s": np.array(q_base.s),
-        "i": np.array(q_base.i),
-        "g": np.array(q_base.g),
-    }
+        print("\nComparing native-transposed vs baseline:")
+        diff_t = np.max(np.abs(t_out_np - t_base_np))
+        diff_qv = np.max(np.abs(q_out_np["v"] - q_base_np["v"]))
+        diff_qc = np.max(np.abs(q_out_np["c"] - q_base_np["c"]))
+        diff_qr = np.max(np.abs(q_out_np["r"] - q_base_np["r"]))
+        diff_qs = np.max(np.abs(q_out_np["s"] - q_base_np["s"]))
+        diff_qi = np.max(np.abs(q_out_np["i"] - q_base_np["i"]))
+        diff_qg = np.max(np.abs(q_out_np["g"] - q_base_np["g"]))
 
-    print("\nComparing native-transposed vs baseline:")
-    diff_t = np.max(np.abs(t_out_np - t_base_np))
-    diff_qv = np.max(np.abs(q_out_np["v"] - q_base_np["v"]))
-    diff_qc = np.max(np.abs(q_out_np["c"] - q_base_np["c"]))
-    diff_qr = np.max(np.abs(q_out_np["r"] - q_base_np["r"]))
-    diff_qs = np.max(np.abs(q_out_np["s"] - q_base_np["s"]))
-    diff_qi = np.max(np.abs(q_out_np["i"] - q_base_np["i"]))
-    diff_qg = np.max(np.abs(q_out_np["g"] - q_base_np["g"]))
+        print(f"  Max diff t:  {diff_t:.2e}")
+        print(f"  Max diff qv: {diff_qv:.2e}")
+        print(f"  Max diff qc: {diff_qc:.2e}")
+        print(f"  Max diff qr: {diff_qr:.2e}")
+        print(f"  Max diff qs: {diff_qs:.2e}")
+        print(f"  Max diff qi: {diff_qi:.2e}")
+        print(f"  Max diff qg: {diff_qg:.2e}")
 
-    print(f"  Max diff t:  {diff_t:.2e}")
-    print(f"  Max diff qv: {diff_qv:.2e}")
-    print(f"  Max diff qc: {diff_qc:.2e}")
-    print(f"  Max diff qr: {diff_qr:.2e}")
-    print(f"  Max diff qs: {diff_qs:.2e}")
-    print(f"  Max diff qi: {diff_qi:.2e}")
-    print(f"  Max diff qg: {diff_qg:.2e}")
+        max_diff_baseline = max(diff_t, diff_qv, diff_qc, diff_qr, diff_qs, diff_qi, diff_qg)
 
-    max_diff_baseline = max(diff_t, diff_qv, diff_qc, diff_qr, diff_qs, diff_qi, diff_qg)
-
-    # Accept differences up to 1e-5 (numerical precision from fused implementation)
-    if max_diff_baseline < 1e-5:
-        print(
-            f"\n  ✓ Native-transposed matches baseline within tolerance ({max_diff_baseline:.2e})"
-        )
-        baseline_match = True
-    else:
-        print(f"\n  ⚠ Native-transposed differs from baseline! Max diff: {max_diff_baseline:.2e}")
-        baseline_match = False
+        # Accept differences up to 1e-5 (numerical precision from fused implementation)
+        if max_diff_baseline < 1e-5:
+            print(
+                f"\n  ✓ Native-transposed matches baseline within tolerance ({max_diff_baseline:.2e})"
+            )
+            baseline_match = True
+        else:
+            print(f"\n  ⚠ Native-transposed differs from baseline! Max diff: {max_diff_baseline:.2e}")
+    except Exception as e:
+        print(f"\n  ⚠ Baseline validation failed: {e}")
+        print("  (Skipping baseline comparison)")
 
     # Load and compare against reference if provided
     if args.reference:

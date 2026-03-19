@@ -20,11 +20,19 @@ from ..core.common import constants as const
 from ..core.definitions import Q
 
 
+def _fast_pow(x, c):
+    """Replace lax.pow with exp(c*log(x)) for better GPU kernel fusion.
+
+    stablehlo.power blocks XLA fusion; exp+multiply+log fuse into elementwise kernels.
+    """
+    return jnp.exp(c * jnp.log(x))
+
+
 def q_t_update_fused(t, p, rho, q, dt, qnc):
     """
     Fused q_t_update with optimizations for GPU kernel fusion.
 
-    Uses lax.select and lax.pow for potentially better XLA lowering.
+    Uses lax.select and exp(c*log(x)) instead of lax.pow for better fusion.
     """
     # Precompute commonly used values
     tmelt = const.tmelt
@@ -89,11 +97,11 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     N0S7 = 1.0e9
 
     tc_sn = jnp.maximum(jnp.minimum(t, TMAX_SN), TMIN_SN) - tmelt
-    alf_sn = lax.pow(10.0, XA1 + tc_sn * (XA2 + tc_sn * XA3))
+    alf_sn = _fast_pow(10.0, XA1 + tc_sn * (XA2 + tc_sn * XA3))
     bet_sn = XB1 + tc_sn * (XB2 + tc_sn * XB3)
 
     qs_ratio = (q.s + QSMIN_SN) * rho / const.ams
-    n0s_val = N0S3 * lax.pow(qs_ratio, 4.0 - 3.0 * bet_sn) / (alf_sn * alf_sn * alf_sn)
+    n0s_val = N0S3 * _fast_pow(qs_ratio, 4.0 - 3.0 * bet_sn) / (alf_sn * alf_sn * alf_sn)
     y_sn = jnp.exp(N0S2 * tc_sn)
     n0smn = jnp.maximum(N0S4 * y_sn, N0S5)
     n0smx = jnp.minimum(N0S6 * y_sn, N0S7)
@@ -106,7 +114,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     LMD_0 = 1.0e10
     BX_LAM = 1.0 / (const.bms + 1.0)
     l_snow = lax.select(
-        q.s > qmin, lax.pow(A2_LAM * n_snow / (q.s * rho + 1e-30), BX_LAM), jnp.full_like(t, LMD_0)
+        q.s > qmin, _fast_pow(A2_LAM * n_snow / (q.s * rho + 1e-30), BX_LAM), jnp.full_like(t, LMD_0)
     )
 
     # ============================================================
@@ -135,8 +143,8 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     KAPPA = 2.4e-2
     B_DF = 1.94
     A_DF = const.als * const.als / (KAPPA * rv)
-    CX_DF = 2.22e-5 * lax.pow(tmelt, -B_DF) * 101325.0
-    x_df = CX_DF / const.rd * lax.pow(t, B_DF - 1.0)
+    CX_DF = 2.22e-5 * _fast_pow(tmelt, -B_DF) * 101325.0
+    x_df = CX_DF / const.rd * _fast_pow(t, B_DF - 1.0)
     eta = lax.select(
         t_below_tmelt & is_sig_present,
         x_df / (1.0 + A_DF * x_df * qvsi / (t * t)),
@@ -162,7 +170,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     AU_KERNEL = X1 / (20.0 * X2) * (X3 + 2.0) * (X3 + 4.0) / ((X3 + 1.0) * (X3 + 1.0))
 
     tau_cr = jnp.maximum(TAU_MIN, jnp.minimum(1.0 - q.c / (q.c + q.r + 1e-30), TAU_MAX))
-    phi_cr = lax.pow(tau_cr, B_PHI)
+    phi_cr = _fast_pow(tau_cr, B_PHI)
     one_minus_phi = 1.0 - phi_cr
     phi_cr = A_PHI * phi_cr * one_minus_phi * one_minus_phi * one_minus_phi
     qc_ratio = q.c * q.c / (qnc + 1e-30)
@@ -189,7 +197,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     sx2x_r_v = lax.select(
         (q.r > qmin) & (dvsw + q.c <= 0.0),
         jnp.minimum(
-            A1_RV * (A2_RV + A3_RV * lax.pow(qr_rho, B1_RV)) * (-dvsw) * lax.pow(qr_rho, B2_RV),
+            A1_RV * (A2_RV + A3_RV * _fast_pow(qr_rho, B1_RV)) * (-dvsw) * _fast_pow(qr_rho, B2_RV),
             evap_max,
         ),
         zero,
@@ -207,7 +215,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     C_RIM_CS = 2.61 * ECS * const.v0s
     sx2x_c_s = lax.select(
         (jnp.minimum(q.c, q.s) > qmin) & (t > tfrz_hom),
-        C_RIM_CS * n_snow * q.c * lax.pow(l_snow, B_RIM_CS),
+        C_RIM_CS * n_snow * q.c * _fast_pow(l_snow, B_RIM_CS),
         zero,
     )
 
@@ -216,7 +224,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_RIM_CG = 0.94878
     sx2x_c_g = lax.select(
         (jnp.minimum(q.c, q.g) > qmin) & (t > tfrz_hom),
-        A_RIM_CG * q.c * lax.pow(q.g * rho + 1e-30, B_RIM_CG),
+        A_RIM_CG * q.c * _fast_pow(q.g * rho + 1e-30, B_RIM_CG),
         zero,
     )
 
@@ -225,7 +233,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_EXP_VI = -0.67
     A_FACT_VI = 4.0 * AMI ** (-1.0 / 3.0)
 
-    vi_raw = (A_FACT_VI * eta) * rho * q.i * lax.pow(m_ice + 1e-30, B_EXP_VI) * dvsi
+    vi_raw = (A_FACT_VI * eta) * rho * q.i * _fast_pow(m_ice + 1e-30, B_EXP_VI) * dvsi
     vi_raw = lax.select(
         vi_raw > 0.0,
         jnp.minimum(vi_raw, dvsi / dt),
@@ -254,7 +262,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
         q.i > qmin,
         jnp.maximum(0.0, ice_dep)
         * B_DEP
-        / (lax.pow(M0_S / (m_ice + 1e-30), B_DEP) - XCRIT + 1e-30),
+        / (_fast_pow(M0_S / (m_ice + 1e-30), B_DEP) - XCRIT + 1e-30),
         zero,
     )
 
@@ -269,7 +277,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
         * (
             dac
             + C_IAU * jnp.maximum(0.0, q.i - QI0)
-            + q.i * C_AGG_IS * n_snow * lax.pow(l_snow, B_AGG_IS)
+            + q.i * C_AGG_IS * n_snow * _fast_pow(l_snow, B_AGG_IS)
         ),
         zero,
     )
@@ -281,11 +289,11 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_AGG_IG = 0.94878
     ig_agg = lax.select(
         (q.i > qmin) & (q.g > qmin),
-        x_ice * q.i * C_AGG_IG * lax.pow(rho * q.g + 1e-30, B_AGG_IG),
+        x_ice * q.i * C_AGG_IG * _fast_pow(rho * q.g + 1e-30, B_AGG_IG),
         zero,
     )
     ig_coll = lax.select(
-        (q.i > qmin) & (q.r > qmin), A_CT_IG * q.i * lax.pow(rho * q.r + 1e-30, B_CT_IG), zero
+        (q.i > qmin) & (q.r > qmin), A_CT_IG * q.i * _fast_pow(rho * q.r + 1e-30, B_CT_IG), zero
     )
     sx2x_i_g = lax.select(t_below_tmelt & is_sig_present, ig_agg + ig_coll, zero)
 
@@ -294,7 +302,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_RIM_SG = 0.75
     sx2x_s_g = lax.select(
         (jnp.minimum(q.c, q.s) > qmin) & (t > tfrz_hom) & t_below_tmelt & is_sig_present,
-        A_RIM_SG * q.c * lax.pow(q.s * rho + 1e-30, B_RIM_SG),
+        A_RIM_SG * q.c * _fast_pow(q.s * rho + 1e-30, B_RIM_SG),
         zero,
     )
 
@@ -314,13 +322,13 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
 
     rg_imm = lax.select(
         mask_rg & (t > tfrz_hom) & maskinner_rg,
-        (jnp.exp(C2_RG * (TFRZ_RAIN - t)) - C3_RG) * A1_RG * lax.pow(q.r * rho + 1e-30, B1_RG),
+        (jnp.exp(C2_RG * (TFRZ_RAIN - t)) - C3_RG) * A1_RG * _fast_pow(q.r * rho + 1e-30, B1_RG),
         zero,
     )
     rg_hom = lax.select(mask_rg & (t <= tfrz_hom), q.r / dt, zero)
     rg_coll = lax.select(
         (jnp.minimum(q.i, q.r) > qmin) & (q.s > QS_CRIT),
-        A2_RG * (q.i / (m_ice + 1e-30)) * lax.pow(rho * q.r + 1e-30, B2_RG),
+        A2_RG * (q.i / (m_ice + 1e-30)) * _fast_pow(rho * q.r + 1e-30, B2_RG),
         zero,
     )
     sx2x_r_g = lax.select(
@@ -343,15 +351,15 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
 
     vs_cold = (
         (CNX_VS * n_snow * eta / rho)
-        * (A0_VS + A1_VS * lax.pow(l_snow, A2_VS))
+        * (A0_VS + A1_VS * _fast_pow(l_snow, A2_VS))
         * dvsi
         / (l_snow * l_snow + EPS_VS)
     )
     vs_cold = lax.select(vs_cold > 0.0, jnp.minimum(vs_cold, dvsi / dt - ice_dep), vs_cold)
     vs_cold = lax.select(q.s <= QS_LIM, jnp.minimum(vs_cold, 0.0), vs_cold)
 
-    vs_warm = (C1_VS / p + C2_VS) * jnp.minimum(0.0, dvsw0) * lax.pow(q.s * rho + 1e-30, B_VS)
-    vs_mid = (C3_VS + C4_VS * p) * dvsw * lax.pow(q.s * rho + 1e-30, B_VS)
+    vs_warm = (C1_VS / p + C2_VS) * jnp.minimum(0.0, dvsw0) * _fast_pow(q.s * rho + 1e-30, B_VS)
+    vs_mid = (C3_VS + C4_VS * p) * dvsw * _fast_pow(q.s * rho + 1e-30, B_VS)
 
     sx2x_v_s_raw = lax.select(
         t < tmelt, vs_cold, lax.select(t > (tmelt - const.tx * dvsw0), vs_warm, vs_mid)
@@ -374,7 +382,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_VG = 0.6
 
     qg_rho = q.g * rho + 1e-30
-    qg_pow = lax.pow(qg_rho, B_VG)
+    qg_pow = _fast_pow(qg_rho, B_VG)
     vg_cold = (A1_VG + A2_VG * t + A3_VG / p + A4_VG * p) * dvsi * qg_pow
     vg_warm = (A5_VG + A6_VG * p) * jnp.minimum(0.0, dvsw0) * qg_pow
     vg_mid = (A7_VG + A8_VG * p) * dvsw * qg_pow
@@ -395,7 +403,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     B_SR = 0.8
     sx2x_s_r = lax.select(
         (t > jnp.maximum(tmelt, tmelt - const.tx * dvsw0)) & (q.s > qmin) & is_sig_present,
-        (C1_SR / p + C2_SR) * (t - tmelt + A_SR * dvsw0) * lax.pow(q.s * rho + 1e-30, B_SR),
+        (C1_SR / p + C2_SR) * (t - tmelt + A_SR * dvsw0) * _fast_pow(q.s * rho + 1e-30, B_SR),
         zero,
     )
 
@@ -406,7 +414,7 @@ def q_t_update_fused(t, p, rho, q, dt, qnc):
     C2_MELT = 7.39441e-5
     sx2x_g_r = lax.select(
         (t > jnp.maximum(tmelt, tmelt - const.tx * dvsw0)) & (q.g > qmin) & is_sig_present,
-        (C1_MELT / p + C2_MELT) * (t - tmelt + A_MELT * dvsw0) * lax.pow(q.g * rho + 1e-30, B_MELT),
+        (C1_MELT / p + C2_MELT) * (t - tmelt + A_MELT * dvsw0) * _fast_pow(q.g * rho + 1e-30, B_MELT),
         zero,
     )
 
