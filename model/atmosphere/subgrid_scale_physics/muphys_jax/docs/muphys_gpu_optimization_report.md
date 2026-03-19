@@ -31,7 +31,8 @@ The GT4Py DaCe GPU backend achieves **<10ms** on GH200 for the same physics beca
 | + transposed layout (nlev, ncells) | GH200 | Santis | ~45 | Jan 2026 | Coalesced memory access |
 | + StableHLO injection (precip only) | GH200 | Santis | ~35 | Feb 2026 | Custom primitive + merged HLO |
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Feb 2026 | Single HLO module, best on GH200 |
-| Combined StableHLO (XLA ROCm) | MI300A | Beverin | ~23 | Mar 2026 | Same HLO module, best overall |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | ~13 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
+| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | ~23 | Mar 2026 | Same config, ~79% slower due to JAX version regression |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | ~35 | Mar 2026 | ~6 kernels for precip scan |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | Mar 2026 | 1 kernel for precip scan |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
@@ -177,6 +178,13 @@ The 23ms result assumes pre-transposed `(nlev, ncells)` layout. Adding transpose
 - IREE's CUDA backend receives limited upstream attention; HIP/ROCm is better supported
 - **Status:** low priority, not actively investigated
 
+### JAX version regression (0.6.0 → 0.9.2: 13ms → 23ms)
+
+- Same code, same GPU (MI300A/Beverin), same StableHLO module: **13ms on JAX 0.6.0 vs 23ms on JAX 0.9.2** (~79% regression)
+- Root cause unknown — likely XLA compiler changes between versions affecting fusion, scheduling, or memory allocation
+- This means performance is fragile and version-dependent; pinning JAX versions for production is essential
+- Need to investigate which JAX/XLA change caused the regression and whether it can be worked around
+
 ---
 
 ## Reproducibility
@@ -237,7 +245,7 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 
 ### Software versions
 
-- JAX: 0.9.1 (Santis GH200), 0.9.2 (Beverin MI300A)
+- JAX: 0.9.1 (Santis GH200), 0.6.0 and 0.9.2 (Beverin MI300A — significant performance difference, see Risks)
 - CUDA: 12.6.0 (Santis)
 - ROCm: 6.x (Beverin)
 - IREE: built from source (main branch, Mar 2026)
@@ -256,7 +264,8 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 | Fused q_t_update (lax.select/lax.pow) | GH200 | ~80 kernels → 2 | **Adopted** |
 | StableHLO injection (precip only) | GH200 | 51ms → 35ms | **Adopted** |
 | Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
-| Combined StableHLO (XLA ROCm) | MI300A | 23ms, best overall | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **13ms**, best overall | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23ms (JAX version regression) | **Adopted** |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
 | IREE CUDA | GH200 | Functional but slower | Low priority |

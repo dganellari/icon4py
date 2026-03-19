@@ -12,7 +12,8 @@
 
 After extensive exploration across multiple optimization strategies, the current best results are:
 
-- **23ms** on MI300A (Beverin) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA ROCm
+- **13ms** on MI300A (Beverin) — combined StableHLO injection + transposed layout, XLA ROCm, JAX 0.6.0 (best overall, approaching <10ms target)
+- **23ms** on MI300A (Beverin) — same config but JAX 0.9.2 (~79% regression from JAX version change)
 - **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA CUDA
 - **33ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (SerialScan mode, single GPU kernel for precipitation scan)
 - **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
@@ -26,7 +27,8 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 | JAX baseline (original) | GH200 | Santis | ~51 | ~186 kernels for precip scan |
 | + transposed layout + StableHLO injection | GH200 | Santis | ~35 | Unrolled but coalesced |
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Single HLO module, best current result on GH200 |
-| Combined StableHLO (XLA ROCm) | MI300A | Beverin | ~23 | Same HLO module on MI300A, best overall result |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | ~13 | **Best overall**, approaching GT4Py DaCe target |
+| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | ~23 | ~79% slower due to JAX version regression |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | 1 kernel for precip scan (replaces StableHLO injection) |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Correctness bug, not yet optimized |
@@ -199,7 +201,9 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 | Triton-JAX | GH200 | Kernel improvement, but DLPack overhead negates gains | Abandoned |
 | Memory transpose (nlev, ncells) | GH200 | Significant improvement | **Adopted** |
 | StableHLO injection (precip only) | GH200 | 51ms to 35ms | **Adopted** |
-| Combined StableHLO (q_t_update + precip) | GH200 | 35ms to 29ms | **Adopted** |
+| Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **13ms**, best overall | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23ms (JAX version regression) | **Adopted** |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
