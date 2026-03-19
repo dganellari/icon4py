@@ -9,17 +9,19 @@ either while loops or single-kernel serial scan fusions.
 unrolled into ~186 separate GPU kernels -> 1-2 kernels.
 
 **Two modes**:
-- `kWhileLoop` — emits an HLO while loop; XLA fuses the body into ~6 kernels
-- `kSerialScan` — emits a custom fusion with a single GPU kernel containing
-  `scf.forall` (parallel over cells) + `scf.for` (serial over levels)
+- `kWhileLoop` — emits an HLO while loop; XLA fuses the body into ~6 kernels.
+  Working and correct, but slower than baseline due to host-device sync overhead.
+- `kSerialScan` — intended to emit a custom fusion with a single GPU kernel.
+  Currently **blocked** by XLA's MLIR lowering pipeline (see below).
 
 **Performance (R2B06, GH200)**:
 - Baseline (StableHLO injection + fused q_t_update): ~29ms
-- WhileLoop mode: ~35ms (correct, ~6 kernels for precip scan)
-- SerialScan mode: ~33ms (correct, 1 kernel for precip scan)
+- WhileLoop mode: 32.99ms (correct, validated, max diff 2.17e-06)
+- SerialScan mode: blocked — XLA's GPU MLIR pipeline requires custom `xla_gpu.loop` ops
 
-> **Note**: `kSerialScan` is the current focus. It produces a single kernel but
-> is still ~4ms slower than the hand-optimized StableHLO injection baseline.
+> **Recommendation**: Use `kWhileLoop` mode for now. It produces correct results
+> but is ~4ms slower than the unrolled baseline due to WhileThunk host-device
+> synchronization (90 round-trips per iteration).
 
 ## Files
 
@@ -142,8 +144,8 @@ In `FusionPipeline()`, add **before** `PriorityFusion`:
 
 ```cpp
   fusion.AddPass<LoopifyUnrolledSlices>(
-      /*min_iterations=*/4, /*unroll_factor=*/1,
-      LoopifyUnrolledSlices::Mode::kSerialScan);
+      /*min_iterations=*/4, /*unroll_factor=*/10,
+      LoopifyUnrolledSlices::Mode::kWhileLoop);
 ```
 
 Also add to the `deps` in `xla/service/gpu/BUILD` for the `fusion_pipeline`
@@ -153,8 +155,14 @@ target:
 "//xla/service/gpu/transforms/loopify:loopify_unrolled_slices",
 ```
 
-> For while-loop mode only, use `Mode::kWhileLoop` (default) and skip
-> patches 3a-3d.
+> **WhileLoop mode** only requires this patch (3e) plus the include and BUILD dep.
+> Patches 3a-3d are only needed for SerialScan mode (currently blocked).
+>
+> **SerialScan mode** (`Mode::kSerialScan`) is blocked: XLA's GPU MLIR lowering
+> does not support standard `scf.for`/`tensor.extract`/`tensor.insert` inside
+> emitters. XLA uses custom `EmitXlaLoopOp` → `xla_gpu.loop` ops that have
+> special bufferization support. A sequential scan does not fit this per-element
+> model. Unblocking requires writing a custom `xla_gpu` dialect op.
 
 ## Step 4. Build JAX with modified XLA
 
@@ -293,6 +301,30 @@ FusionBackendConfig* fc = gpu_config.mutable_fusion_backend_config();
 fc->set_kind("__serial_scan");
 fc->mutable_custom_fusion_config()->set_name(metadata);
 TF_RETURN_IF_ERROR(fusion_inst->set_backend_config(gpu_config));
+```
+
+### `Shape::rank()` not found
+
+Older XLA versions use `dimensions_size()` instead of `rank()`:
+```cpp
+// Instead of: param->shape().rank()
+param->shape().dimensions_size()
+```
+
+### `HloOpcodeString` returns `string_view` not `string`
+
+If you get a conversion error from `absl::string_view` to `std::string`:
+```cpp
+// Instead of: return HloOpcodeString(opcode);
+return std::string(HloOpcodeString(opcode));
+```
+
+### `MakeInstructionPostOrder` returns non-const vector
+
+If you get a const/non-const mismatch:
+```cpp
+// Instead of: std::vector<const HloInstruction*> order = comp->MakeInstructionPostOrder();
+auto order = comp->MakeInstructionPostOrder();
 ```
 
 ### `RunImpl` vs `Run` override error
