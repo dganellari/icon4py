@@ -12,7 +12,8 @@
 
 After extensive exploration across multiple optimization strategies, the current best results are:
 
-- **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed memory layout
+- **23ms** on MI300A (Beverin) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA ROCm
+- **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA CUDA
 - **33ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (SerialScan mode, single GPU kernel for precipitation scan)
 - **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
 
@@ -25,6 +26,7 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 | JAX baseline (original) | GH200 | Santis | ~51 | ~186 kernels for precip scan |
 | + transposed layout + StableHLO injection | GH200 | Santis | ~35 | Unrolled but coalesced |
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Single HLO module, best current result on GH200 |
+| Combined StableHLO (XLA ROCm) | MI300A | Beverin | ~23 | Same HLO module on MI300A, best overall result |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | 1 kernel for precip scan (replaces StableHLO injection) |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Correctness bug, not yet optimized |
