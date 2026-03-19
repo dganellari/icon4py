@@ -31,8 +31,8 @@ The GT4Py DaCe GPU backend achieves **<10ms** on GH200 for the same physics beca
 | + transposed layout (nlev, ncells) | GH200 | Santis | ~45 | Jan 2026 | Coalesced memory access |
 | + StableHLO injection (precip only) | GH200 | Santis | ~35 | Feb 2026 | Custom primitive + merged HLO |
 | + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Feb 2026 | Single HLO module, best on GH200 |
-| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | ~13 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
-| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | ~23 | Mar 2026 | Same config, ~79% slower due to JAX version regression |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | **Best overall**, approaching GT4Py DaCe target |
+| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | 23.32 | Mar 2026 | Same config, ~79% slower due to JAX version regression |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | ~35 | Mar 2026 | ~6 kernels for precip scan |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | ~33 | Mar 2026 | 1 kernel for precip scan |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
@@ -83,7 +83,7 @@ A reusable technique for replacing arbitrary parts of JAX-traced computation wit
 
 - Custom primitive mechanism (see above) to inject pre-generated StableHLO
 - First applied to precipitation scans only: 51ms → 35ms
-- Extended to combined module (q_t_update + precip): 35ms → 29ms on GH200, **23ms on MI300A**
+- Extended to combined module (q_t_update + precip): 35ms → 29ms on GH200, **12.97ms on MI300A** (JAX 0.6.0), 23.32ms (JAX 0.9.2)
 - Benefits only visible after transpose fix (Track 1)
 
 ### Track 3: XLA Compiler Pass — LoopifyUnrolledSlices (Mar 2026)
@@ -110,7 +110,7 @@ Custom XLA HLO pass that detects the unrolled 90-level `slice → compute → co
 
 ---
 
-## Gap Analysis: Where Do the Remaining 23ms Go? (MI300A)
+## Gap Analysis: Where Do the Remaining Milliseconds Go? (MI300A)
 
 Based on nsys profiling at the 35ms stage on GH200 (MI300A breakdown not yet profiled):
 
@@ -121,7 +121,7 @@ Based on nsys profiling at the 35ms stage on GH200 (MI300A breakdown not yet pro
 | Kernel launch overhead | ~3-5 | ~186 kernels still present for precip |
 | Other overhead (scheduling, memory) | ~2-3 | To be profiled |
 
-**To reach <10ms**, the precipitation scan must become 1-2 kernels (as in the XLA SerialScan pass) AND q_t_update fusion must be further improved. An nsys profile on MI300A with the current 23ms result is needed for a precise breakdown.
+**To reach <10ms**, the precipitation scan must become 1-2 kernels (as in the XLA SerialScan pass) AND q_t_update fusion must be further improved. An nsys profile on MI300A is needed for a precise breakdown.
 
 ---
 
@@ -131,14 +131,14 @@ Based on nsys profiling at the 35ms stage on GH200 (MI300A breakdown not yet pro
 
 | Track | Pros | Cons | Recommendation |
 |:---|:---|:---|:---|
-| StableHLO injection | Best current result (23ms), no C++ needed, works with stock JAX/XLA | Still unrolled (~186 kernels), limited by kernel launch overhead, requires pre-generated HLO | **Keep as baseline** — it works and is easy to maintain |
+| StableHLO injection | Best current result (12.97ms on JAX 0.6.0), no C++ needed, works with stock JAX/XLA | Still unrolled (~186 kernels), limited by kernel launch overhead, requires pre-generated HLO, sensitive to JAX version | **Keep as baseline** — it works and is easy to maintain |
 | XLA LoopifyUnrolledSlices | 1 kernel for precip scan, principled solution, correctness proven | Requires building JAX/XLA from source, 4ms slower than injection | **Invest** — this is the path to <10ms on GH200; needs body optimization |
 | IREE HIP preprocessing pass | Targets MI300A directly, single kernel, IREE has better AMD support | Correctness bug (fix identified), requires building IREE from source | **Invest** — this is the path to <10ms on MI300A; fix is straightforward |
 | Pure MLIR rewrite | Maximum control, no JAX overhead | Requires rewriting all physics in MLIR, large effort | **Future idea** — only if other tracks plateau |
 
 **Short-term (next 2 weeks):**
 1. Fix IREE preprocessing pass correctness (port `depends_on_slice` from XLA pass)
-2. Profile the 23ms MI300A result with nsys to understand breakdown
+2. Profile the 12.97ms MI300A result with nsys to understand breakdown
 3. Run XLA SerialScan on MI300A for comparison
 
 **Medium-term (next 1-2 months):**
@@ -152,7 +152,7 @@ Based on nsys profiling at the 35ms stage on GH200 (MI300A breakdown not yet pro
 
 ### Transpose overhead (45ms on MI300A)
 
-The 23ms result assumes pre-transposed `(nlev, ncells)` layout. Adding transposes at runtime costs 45ms (total 68ms), making it **slower than doing nothing**. In production, the data must either:
+The 12.97ms result assumes pre-transposed `(nlev, ncells)` layout. Adding transposes at runtime costs ~19ms (total 32.42ms on JAX 0.6.0), significantly degrading end-to-end performance. In production, the data must either:
 - Be stored in `(nlev, ncells)` layout natively (requires upstream changes)
 - Be transposed once at initialization (amortized over many timesteps)
 - Be eliminated by a compiler pass (XLA does not do this automatically; investigated, not promising)
@@ -178,9 +178,9 @@ The 23ms result assumes pre-transposed `(nlev, ncells)` layout. Adding transpose
 - IREE's CUDA backend receives limited upstream attention; HIP/ROCm is better supported
 - **Status:** low priority, not actively investigated
 
-### JAX version regression (0.6.0 → 0.9.2: 13ms → 23ms)
+### JAX version regression (0.6.0 → 0.9.2: 12.97ms → 23.32ms)
 
-- Same code, same GPU (MI300A/Beverin), same StableHLO module: **13ms on JAX 0.6.0 vs 23ms on JAX 0.9.2** (~79% regression)
+- Same code, same GPU (MI300A/Beverin), same StableHLO module: **12.97ms on JAX 0.6.0 vs 23.32ms on JAX 0.9.2** (~79% regression)
 - Root cause unknown — likely XLA compiler changes between versions affecting fusion, scheduling, or memory allocation
 - This means performance is fragile and version-dependent; pinning JAX versions for production is essential
 - Need to investigate which JAX/XLA change caused the regression and whether it can be worked around
@@ -264,8 +264,8 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 | Fused q_t_update (lax.select/lax.pow) | GH200 | ~80 kernels → 2 | **Adopted** |
 | StableHLO injection (precip only) | GH200 | 51ms → 35ms | **Adopted** |
 | Combined StableHLO (q_t_update + precip) | GH200 | 35ms → 29ms | **Adopted** |
-| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **13ms**, best overall | **Adopted** |
-| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23ms (JAX version regression) | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | **12.97ms**, best overall | **Adopted** |
+| Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23.32ms (JAX version regression) | **Adopted** |
 | XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 35ms, correct, ~6 kernels | **Working** |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | 33ms, correct, 1 kernel | **Working** |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
