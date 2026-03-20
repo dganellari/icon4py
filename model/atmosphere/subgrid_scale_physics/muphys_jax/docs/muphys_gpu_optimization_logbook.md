@@ -43,7 +43,7 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 
 | Configuration | GPU | Cluster | Time (ms) | Date | Notes |
 |:---|:---:|:---:|:---:|:---:|:---|
-| IREE CUDA + LoopifyInsertSliceChain (nsys on H100) | H100 | Santis | ~104 | Mar 2026 | 85% transpose overhead; function splitting adds overhead |
+| IREE CUDA + LoopifyInsertSliceChain (nsys on H100) | H100 | Santis | ~104 | Mar 2026 | 85% is transpose dispatch overhead (from stablehlo_xla pipeline). Separate issue: JIT memory errors require function splitting. |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Mar 2026 | Correctness bug, not yet optimized |
 
