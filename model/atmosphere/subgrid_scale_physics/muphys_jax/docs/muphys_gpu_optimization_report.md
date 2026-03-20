@@ -105,7 +105,7 @@ Custom XLA HLO pass that detects the unrolled 90-level `slice → compute → co
 
 **kWhileLoop mode (working):**
 - Creates a while loop with all accumulators as iter_args
-- Result: **32.99ms** on GH200 (correct, validated against baseline, max diff 2.17e-06)
+- Result: **29.89ms** on GH200 (with fast_pow StableHLO, correct, validated against baseline, max diff 2.17e-06)
 - Slower than 29ms baseline due to WhileThunk host-device synchronization per iteration (90 round-trips)
 - This overhead is fundamental to XLA's while-loop execution model
 
@@ -183,14 +183,14 @@ Based on nsys profiling at the 35ms stage on GH200 (MI300A breakdown not yet pro
 | Pure MLIR rewrite | Maximum control, no JAX overhead | Requires rewriting all physics in MLIR, large effort | **Future idea** — only if other tracks plateau |
 
 **Short-term (next 2 weeks):**
-1. Profile the 12.97ms MI300A XLA result to understand remaining overhead
-2. Analyze and optimize the combined StableHLO to push below 12.97ms
+1. Push below 11ms: profile the 11.15ms result to find remaining overhead
+2. XLA pass on MI300A (ROCm): build JAX/XLA from source on Beverin to test LoopifyUnrolledSlices — WhileLoop mode may benefit from MI300A's unified memory
 3. Investigate JAX 0.6.0 → 0.9.2 regression root cause
 
 **Medium-term (next 1-2 months):**
-1. Unblock XLA SerialScan emitter by implementing support for sequential scans using `xla_gpu` dialect ops (requires deep XLA codegen work)
-2. Investigate transpose elimination for production integration
-3. If IREE upstream fixes stablehlo_xla transpose issue, revisit IREE path
+1. Unblock XLA SerialScan emitter — only path to eliminate concat/slice overhead (~3ms); requires `xla_gpu` dialect work
+2. Investigate transpose elimination for production integration (~19ms overhead at runtime)
+3. IREE preprocessing pass: fix iter1 boundary construction for correctness on MI300A
 
 ---
 

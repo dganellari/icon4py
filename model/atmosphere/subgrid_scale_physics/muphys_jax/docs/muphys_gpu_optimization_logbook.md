@@ -278,3 +278,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 ## Future Ideas
 
 - **Pure MLIR rewrite:** write graupel code directly with MLIR core dialects (no stencils), bypassing JAX entirely. Exploratory; not currently active.
+
+---
+
+*This logbook was restructured and maintained with the help of Claude (Anthropic).*
