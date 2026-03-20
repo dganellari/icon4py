@@ -30,12 +30,13 @@ The GT4Py DaCe GPU backend achieves **<10ms** on GH200 for the same physics beca
 | JAX baseline (original) | GH200 | Santis | ~51 | Dec 2025 | ~186 kernels for precip scan |
 | + transposed layout (nlev, ncells) | GH200 | Santis | ~45 | Jan 2026 | Coalesced memory access |
 | + StableHLO injection (precip only) | GH200 | Santis | ~35 | Feb 2026 | Custom primitive + merged HLO |
-| + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Feb 2026 | Single HLO module, best on GH200 |
+| + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | Feb 2026 | Single HLO module |
+| + fast_pow + XLA flag tuning | GH200 | Santis | 27.09 | Mar 2026 | JAX 0.6.2, best on GH200 |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | Default XLA flags |
 | + fast_pow + XLA flag tuning | MI300A | Beverin | 11.15 | Mar 2026 | **Best overall**, within DaCe target range |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | Beverin | 23.32 | Mar 2026 | Same config, ~79% slower due to JAX version regression |
 | StableHLO while loop (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 25.25 | Mar 2026 | WhileThunk host-device sync overhead, not useful |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 32.99 | Mar 2026 | Correct results, slower due to host-device sync (90 round-trips) |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 29.89 | Mar 2026 | Correct, with fast_pow StableHLO (host-device sync, 90 round-trips) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | Mar 2026 | **Blocked**: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | 45 | Mar 2026 | Best IREE result, 37+ dispatches with transpose overhead |
 | IREE HIP + LoopifyInsertSliceChain | MI300A | Beverin | 80 | Mar 2026 | **Worse than baseline** — pass prevents IREE's own fusion |
@@ -339,7 +340,7 @@ HIP_VISIBLE_DEVICES=0 JAX_ENABLE_X64=1 \
 | + fast_pow + XLA flag tuning | MI300A | **11.15ms**, best overall | **Adopted** |
 | Combined StableHLO (XLA ROCm, JAX 0.9.2) | MI300A | 23.32ms (JAX version regression) | **Adopted** |
 | StableHLO while loop (XLA ROCm) | MI300A | 25.25ms (host-device sync) | Not useful |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 32.99ms, correct, host-device sync overhead | **Working** (not useful — slower than baseline) |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 29.89ms, correct, host-device sync overhead | **Working** (not useful — slower than baseline) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Blocked by XLA MLIR lowering | **Blocked** |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
 | IREE HIP baseline (no pass) | MI300A | 45ms, correct | Best IREE result |

@@ -2,7 +2,7 @@
 
 > Optimizing JAX-compiled graupel microphysics via XLA and IREE compiler backends towards GT4Py DaCe GPU performance on NVIDIA GH200 and AMD MI300A.
 > Target: reduce per-iteration time from ~51ms to <10ms (GT4Py DaCe GPU baseline).
-> JAX alone cannot reach the target; the strategy relies on custom XLA and IREE compiler passes to re-roll unrolled loops into efficient GPU kernels.
+> JAX alone cannot reach the target; the strategy combines StableHLO injection with power-op decomposition, XLA flag tuning, and custom XLA/IREE compiler passes to re-roll unrolled loops into efficient GPU kernels.
 
 ---
 
@@ -13,35 +13,39 @@
 After extensive exploration across multiple optimization strategies, the current best results are:
 
 - **11.15ms** on MI300A (Beverin) — combined StableHLO injection + fast_pow + optimized XLA flags, JAX 0.6.0 (best overall, within <10ms target range)
-- **29ms** on GH200 (Santis) — combined StableHLO injection (q_t_update + precip) + transposed layout, XLA CUDA
-- **32.99ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (WhileLoop mode, correct results, slower due to host-device sync)
+- **27.09ms** on GH200 (Santis) — combined StableHLO injection + fast_pow + XLA flags, JAX 0.6.2, XLA CUDA
+- **29.89ms** on GH200 (Santis) — custom XLA `LoopifyUnrolledSlices` pass (WhileLoop mode, with fast_pow, correct results, slower due to host-device sync)
 - **47ms** on MI300A (Beverin) — IREE HIP baseline; custom preprocessing pass (`LoopifyInsertSliceChain`) in progress
 
 The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA unrolls this into ~186 separate GPU kernels, spending most time on kernel launch overhead. The optimization work focuses on re-rolling these into 1-2 kernels via custom compiler passes or StableHLO injection.
 
-### Current Performance (R2B06)
+### Reference Performance
+
+| Configuration | GPU | Cluster | Time (ms) | Notes |
+|:---|:---:|:---:|:---:|:---|
+| GT4Py DaCe GPU | GH200 | Santis | <10 | Target |
+
+### Current Performance — XLA (R2B06)
 
 | Configuration | GPU | Cluster | Time (ms) | Date | Notes |
 |:---|:---:|:---:|:---:|:---:|:---|
-| JAX baseline (original) | GH200 | Santis | ~51 | Dec 2025 | ~186 kernels for precip scan |
+| JAX baseline (pure JAX) | GH200 | Santis | ~51 | Dec 2025 | ~186 kernels for precip scan |
 | + transposed layout + StableHLO injection | GH200 | Santis | ~35 | early Feb 2026 | Unrolled but coalesced |
-| + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | mid Feb 2026 | Single HLO module, best current result on GH200 |
+| + combined StableHLO (q_t_update + precip) | GH200 | Santis | ~29 | mid Feb 2026 | Single HLO module |
+| Combined StableHLO (XLA CUDA, JAX 0.6.2) | GH200 | Santis | 27.09 | Mar 2026 | fast_pow + XLA flags, best on GH200 |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 29.89 | Mar 2026 | Correct, with fast_pow StableHLO (host-device sync) |
+| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | mid Mar 2026 | Blocked: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | Beverin | 12.97 | Mar 2026 | Default XLA flags |
 | + fast_pow + XLA flag tuning | MI300A | Beverin | **11.15** | Mar 2026 | **Best overall**, within DaCe target range |
 | StableHLO while loop (XLA ROCm) | MI300A | Beverin | 25.25 | Mar 2026 | WhileThunk host-device sync, not useful |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | Santis | 32.99 | mid Mar 2026 | Correct, but slower than baseline (host-device sync, 90 round-trips) |
-| XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Santis | — | mid Mar 2026 | Blocked: XLA MLIR lowering requires custom `xla_gpu.loop` ops |
+
+### Current Performance — IREE (R2B06)
+
+| Configuration | GPU | Cluster | Time (ms) | Date | Notes |
+|:---|:---:|:---:|:---:|:---:|:---|
+| IREE CUDA (split JIT, nsys on H100) | H100 | Santis | ~104 | Mar 2026 | 85% transpose overhead; function splitting adds overhead |
 | IREE HIP baseline (no custom pass) | MI300A | Beverin | ~47 | Mar 2026 | ~186 dispatches for precip scan |
 | IREE HIP + LoopifyInsertSliceChain (WIP) | MI300A | Beverin | ~80 | Mar 2026 | Correctness bug, not yet optimized |
-| GT4Py DaCe GPU target | GH200 | Santis | <10 | — | — |
-
-### Performance Breakdown (nsys profile, GH200, at the 35ms configuration stage)
-
-| Component | Time (ms) | Notes |
-|:---|:---:|:---|
-| q_t_update kernel | 10.5 | 2 fused kernels (down from ~80) |
-| Injected precipitation scan | 11.3 | StableHLO-injected unrolled scan |
-| Unexplained overhead | ~13 | Kernel launch overhead, to be investigated |
 
 ### Correctness
 
@@ -103,22 +107,23 @@ The core bottleneck is the precipitation scan over 90 vertical levels. JAX/XLA u
 - The precipitation scan over 90 vertical levels remains the bottleneck
 - JAX/XLA sees 90 independent slice-compute-concat chains and creates ~186 separate GPU kernels
 - Each kernel is tiny; most time spent on kernel launch overhead rather than computation
+- Earlier nsys profiling on GH200 at the 35ms stage showed: q_t_update ~10.5ms, precipitation scan ~11.3ms, overhead ~13ms (later identified as concat/slice + transposes + kernel launch overhead via MI300A rocprofv3, see below)
 
 ### Profiling (rocprofv3, MI300A, Mar 2026)
 
-Per-invocation breakdown (applied to 12.97ms baseline):
+Per-invocation breakdown (applied to 12.97ms baseline, before fast_pow fix):
 
-| Category | % of total | Est. per run (ms) |
-|:---|:---:|:---:|
-| Precip scan body computation | 20.2% | 2.6 |
-| Concatenation (4 kernels) | 22.8% | 3.0 |
-| q_t_update (with power ops) | 8.8% | 1.1 |
-| Per-level compute kernels | ~22% | 2.9 |
-| Dynamic slicing | 7.1% | 0.9 |
-| Transposes | ~11% | 1.4 |
-| Copies + broadcasts + other | ~8% | 1.0 |
+| Category | % of total | Est. per run (ms) | Status |
+|:---|:---:|:---:|:---|
+| Precip scan body computation | 20.2% | 2.6 | |
+| Concatenation (4 kernels) | 22.8% | 3.0 | |
+| q_t_update (power ops) | 8.8% | 1.1 | Fixed: replaced with exp/log (fast_pow) |
+| Per-level compute kernels | ~22% | 2.9 | |
+| Dynamic slicing | 7.1% | 0.9 | |
+| Transposes | ~11% | 1.4 | |
+| Copies + broadcasts + other | ~8% | 1.0 | |
 
-Key finding: concatenation (23%) + dynamic slicing (7%) = 30% of runtime is pure overhead from the unrolled scan pattern.
+Key finding: concatenation (23%) + dynamic slicing (7%) = 30% of runtime is pure overhead from the unrolled scan pattern. The power ops (9%) were fixed by the fast_pow change, contributing to the 12.97ms → 11.15ms improvement.
 
 ### XLA Flag Tuning (MI300A, JAX 0.6.0)
 
@@ -174,11 +179,12 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 - Pass compiles and is integrated into JAX (built from source within modified XLA)
 - All 10 output concatenates correctly grouped into a single while loop
 - Correctness verified: all output fields match reference data (max diff 2.17e-06)
-- Result: **32.99ms** on GH200 — slower than 29ms baseline due to WhileThunk host-device synchronization per iteration (90 round-trips). This overhead is fundamental to XLA's while-loop execution model.
+- Result: **29.89ms** on GH200 (with fast_pow StableHLO) — slower than 27ms baseline due to WhileThunk host-device synchronization per iteration (90 round-trips). This overhead is fundamental to XLA's while-loop execution model.
 - Benchmark progression (all on NVIDIA GH200, R2B06):
   - 29.63ms — baseline (unrolled, with StableHLO injection + fused q_t_update)
   - 42.96ms — first attempt (only 1 of 11 chains loopified)
   - 32.99ms — after fixing chain grouping (all chains, while-loop mode)
+  - 29.89ms — with fast_pow StableHLO
 - See [INTEGRATION.md](../xla_passes/INTEGRATION.md) for build/integration instructions
 
 **kSerialScan mode — blocked by XLA MLIR lowering:**
@@ -202,7 +208,6 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 
 - Successfully running IREE on Beverin cluster (AMD MI300A, gfx942)
 - Baseline runtime (no custom pass): **47ms** for 1 iteration
-- Not directly comparable to GH200/Santis numbers (different GPU architecture)
 - AMD backend is more complete than CUDA backend
 
 ### IREE Compiler Pass (Preprocessing Level)
@@ -250,7 +255,7 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 | Combined StableHLO (XLA ROCm, JAX 0.6.0) | MI300A | 12.97ms (default flags) | **Adopted** |
 | + fast_pow + XLA flag tuning | MI300A | **11.15ms**, best overall | **Adopted** |
 | StableHLO while loop | MI300A | 25.25ms (host-device sync) | Not useful |
-| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 32.99ms, correct, host-device sync overhead | Working (not useful — slower than baseline) |
+| XLA LoopifyUnrolledSlices (WhileLoop) | GH200 | 29.89ms, correct, host-device sync overhead | Working (not useful — slower than baseline) |
 | XLA LoopifyUnrolledSlices (SerialScan) | GH200 | Blocked by XLA MLIR lowering | Blocked |
 | IREE CUDA | GH200 | Functional but slower | Low priority |
 | IREE HIP baseline | MI300A | 47ms | Baseline established |
@@ -262,10 +267,11 @@ Detect the unrolled 90-level slice-compute-concat pattern in XLA HLO and re-roll
 ## Next Steps
 
 1. **Push below 11ms:** profile the 11.15ms result to find remaining overhead; look for further fusion opportunities
-2. **JAX version regression:** investigate why JAX 0.9.2 regresses to 23.32ms (vs 11.15ms on JAX 0.6.0)
-3. **XLA SerialScan emitter:** only path to eliminate concat/slice overhead (~3ms); requires `xla_gpu` dialect work
-4. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
-5. **Transpose elimination:** remove pre-transpose step entirely (~19ms overhead at runtime)
+2. **XLA pass on MI300A (ROCm):** build JAX/XLA from source on Beverin to test LoopifyUnrolledSlices on MI300A — WhileLoop mode may benefit more from MI300A's unified memory and lower host-device sync latency
+3. **JAX version regression:** investigate why JAX 0.9.2 regresses to 23.32ms (vs 11.15ms on JAX 0.6.0)
+4. **XLA SerialScan emitter:** only path to eliminate concat/slice overhead (~3ms); requires `xla_gpu` dialect work
+5. **IREE preprocessing pass:** fix iter1 boundary construction (port `depends_on_slice` from XLA pass) to achieve correctness on AMD MI300A
+6. **Transpose elimination:** remove pre-transpose step entirely (~19ms overhead at runtime)
 
 ---
 
