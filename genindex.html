@@ -80,7 +80,6 @@
 
 <div class="genindex-jumpbox">
  <a href="#A"><strong>A</strong></a>
- | <a href="#B"><strong>B</strong></a>
  | <a href="#C"><strong>C</strong></a>
  | <a href="#D"><strong>D</strong></a>
  | <a href="#E"><strong>E</strong></a>
@@ -110,14 +109,6 @@
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticParams.advection_implicit_weight_parameter">advection_implicit_weight_parameter (NonHydrostaticParams attribute)</a>
 </li>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.IntermediateFields.allocate">allocate() (IntermediateFields class method)</a>
-</li>
-  </ul></td>
-</tr></table>
-
-<h2 id="B">B</h2>
-<table style="width: 100%" class="indextable genindextable"><tr>
-  <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.MetricStateNonHydro.bdy_halo_c">bdy_halo_c (MetricStateNonHydro attribute)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -167,13 +158,13 @@
 </li>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.MetricStateNonHydro.ddz_of_reference_exner_at_cells_on_half_levels">ddz_of_reference_exner_at_cells_on_half_levels (MetricStateNonHydro attribute)</a>
 </li>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.DiagnosticStateNonHydro">DiagnosticStateNonHydro (class in icon4py.model.atmosphere.dycore.dycore_states)</a>
+      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.deepatmos_mode">deepatmos_mode (NonHydrostaticConfig attribute)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.divdamp_order">divdamp_order (NonHydrostaticConfig attribute)</a>
+      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.DiagnosticStateNonHydro">DiagnosticStateNonHydro (class in icon4py.model.atmosphere.dycore.dycore_states)</a>
 </li>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.divdamp_trans_start">divdamp_trans_start (NonHydrostaticConfig attribute)</a>
+      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.divdamp_order">divdamp_order (NonHydrostaticConfig attribute)</a>
 </li>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.divdamp_type">divdamp_type (NonHydrostaticConfig attribute)</a>
 </li>
@@ -291,7 +282,7 @@
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.iadv_rhotheta">iadv_rhotheta (NonHydrostaticConfig attribute)</a>
 </li>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.iau_wgt_dyn">iau_wgt_dyn (NonHydrostaticConfig attribute)</a>
+      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.iau_init">iau_init (NonHydrostaticConfig attribute)</a>
 </li>
       <li>
     icon4py
@@ -431,13 +422,6 @@
 
       <ul>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.apply_4th_order_divergence_damping">module</a>
-</li>
-      </ul></li>
-      <li>
-    icon4py.model.atmosphere.dycore.stencils.apply_hydrostatic_correction_to_horizontal_gradient_of_exner_pressure
-
-      <ul>
-        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.apply_hydrostatic_correction_to_horizontal_gradient_of_exner_pressure">module</a>
 </li>
       </ul></li>
       <li>
@@ -702,13 +686,6 @@
 </li>
       </ul></li>
       <li>
-    icon4py.model.atmosphere.dycore.stencils.compute_theta_and_exner
-
-      <ul>
-        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.compute_theta_and_exner">module</a>
-</li>
-      </ul></li>
-      <li>
     icon4py.model.atmosphere.dycore.stencils.compute_virtual_potential_temperatures_and_pressure_gradient
 
       <ul>
@@ -870,10 +847,10 @@
 </li>
       </ul></li>
       <li>
-    icon4py.model.atmosphere.dycore.stencils.update_theta_v
+    icon4py.model.atmosphere.dycore.stencils.update_theta_and_exner_in_halo
 
       <ul>
-        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.update_theta_v">module</a>
+        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.update_theta_and_exner_in_halo">module</a>
 </li>
       </ul></li>
       <li>
@@ -908,8 +885,6 @@
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.InterpolationState">InterpolationState (class in icon4py.model.atmosphere.dycore.dycore_states)</a>
 </li>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.MetricStateNonHydro.inv_ddqz_z_full">inv_ddqz_z_full (MetricStateNonHydro attribute)</a>
-</li>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.solve_nonhydro.NonHydrostaticConfig.is_iau_active">is_iau_active (NonHydrostaticConfig attribute)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -980,8 +955,6 @@
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.apply_2nd_order_divergence_damping">icon4py.model.atmosphere.dycore.stencils.apply_2nd_order_divergence_damping</a>
 </li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.apply_4th_order_divergence_damping">icon4py.model.atmosphere.dycore.stencils.apply_4th_order_divergence_damping</a>
-</li>
-        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.apply_hydrostatic_correction_to_horizontal_gradient_of_exner_pressure">icon4py.model.atmosphere.dycore.stencils.apply_hydrostatic_correction_to_horizontal_gradient_of_exner_pressure</a>
 </li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.apply_rayleigh_damping_mechanism">icon4py.model.atmosphere.dycore.stencils.apply_rayleigh_damping_mechanism</a>
 </li>
@@ -1057,8 +1030,6 @@
 </li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.compute_tangential_wind">icon4py.model.atmosphere.dycore.stencils.compute_tangential_wind</a>
 </li>
-        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.compute_theta_and_exner">icon4py.model.atmosphere.dycore.stencils.compute_theta_and_exner</a>
-</li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.compute_virtual_potential_temperatures_and_pressure_gradient">icon4py.model.atmosphere.dycore.stencils.compute_virtual_potential_temperatures_and_pressure_gradient</a>
 </li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.compute_vn_on_lateral_boundary">icon4py.model.atmosphere.dycore.stencils.compute_vn_on_lateral_boundary</a>
@@ -1105,7 +1076,7 @@
 </li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.update_mass_volume_flux">icon4py.model.atmosphere.dycore.stencils.update_mass_volume_flux</a>
 </li>
-        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.update_theta_v">icon4py.model.atmosphere.dycore.stencils.update_theta_v</a>
+        <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.update_theta_and_exner_in_halo">icon4py.model.atmosphere.dycore.stencils.update_theta_and_exner_in_halo</a>
 </li>
         <li><a href="_source/icon4py.model.atmosphere.dycore.stencils.html#module-icon4py.model.atmosphere.dycore.stencils.update_wind">icon4py.model.atmosphere.dycore.stencils.update_wind</a>
 </li>
@@ -1147,8 +1118,6 @@
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.DiagnosticStateNonHydro.perturbed_exner_at_cells_on_model_levels">perturbed_exner_at_cells_on_model_levels (DiagnosticStateNonHydro attribute)</a>
-</li>
-      <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.MetricStateNonHydro.pg_edgeidx_dsl">pg_edgeidx_dsl (MetricStateNonHydro attribute)</a>
 </li>
       <li><a href="_source/icon4py.model.atmosphere.dycore.html#icon4py.model.atmosphere.dycore.dycore_states.MetricStateNonHydro.pg_exdist">pg_exdist (MetricStateNonHydro attribute)</a>
 </li>
