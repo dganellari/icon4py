@@ -454,6 +454,22 @@ def _vel_scale_factor_ice_scalar(
 
 
 @gtx.field_operator
+def _vel_scale_factor_ice_scalar(
+    xrho: ta.wpfloat,
+) -> ta.wpfloat:
+    """
+    Compute the velocity scaling factor of ice
+
+    Args:
+        xrho:              sqrt(rho_00/rho)
+
+    Result:                velocity scaling factor of ice
+    """
+    B_I = 0.66666666666666667
+    return power(xrho, B_I)
+
+
+@gtx.field_operator
 def _vel_scale_factor_snow(
     xrho: fa.CellKField[ta.wpfloat],
     rho: fa.CellKField[ta.wpfloat],

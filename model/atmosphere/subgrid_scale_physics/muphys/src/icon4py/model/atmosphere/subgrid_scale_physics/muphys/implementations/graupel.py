@@ -116,6 +116,18 @@ def precip_qx_level_update(
         activated=current_level_activated,
     )
 
+    if current_level_activated:
+        x = (zeta * (flx_eff - flx_partial)) / ((1.0 + zeta * vt) * rho)  # q update
+        p = (x * rho * vt + flx_partial) * 0.5  # flux
+    else:
+        x = q
+        p = 0.0
+    return PrecipStateQx(
+        x=x,
+        p=p,
+        vc=vc,
+        activated=current_level_activated,
+    )
 
 @gtx.field_operator
 def _temperature_update(
@@ -287,6 +299,24 @@ def _precip_and_t(
         pflx_tot=s_update.p + i_update.p + g_update.p + r_update.p,
     )
 
+    qliq = q.c + r_update.x
+    qice = s_update.x + i_update.x + g_update.x
+    kmin_rsig = mask_r | mask_s | mask_i | mask_g
+
+    t_update = _temperature_update(
+        previous_level.t_state,
+        t=t,
+        t_kp1=t_kp1,
+        pr=r_update.p,
+        pflx_tot=s_update.p + i_update.p + g_update.p,
+        q=q,
+        qliq=qliq,
+        qice=qice,
+        rho=rho,
+        dz=dz,
+        dt=dt,
+        mask=kmin_rsig,
+    )
 
 @gtx.field_operator
 def symmetric(
