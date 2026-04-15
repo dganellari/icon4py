@@ -16,6 +16,7 @@ from gt4py import next as gtx
 
 from icon4py.model.atmosphere.subgrid_scale_physics.muphys.driver import common, run_full_muphys
 from icon4py.model.common import dimension as dims, model_backends
+from icon4py.model.testing import test_utils
 from icon4py.model.testing.fixtures.datatest import backend_like
 
 from . import utils
@@ -28,15 +29,15 @@ class Experiments:
     # https://polybox.ethz.ch/index.php/s/5oNtcQFDcCaNxHH/download/r2b04.tar.gz
     # https://polybox.ethz.ch/index.php/s/mBeAWAQQHSKTkF7/download/r2b04_maxfrac.tar.gz
     # https://polybox.ethz.ch/index.php/s/mBrpE3iBoeek5wc/download/r2b05.tar.gz
+    # Note: don't use the 'tiny' experiment from graupel_only,
+    # as it is not sensitive to saturation adjustment
+    # TODO(havogt): double-check that all other experiments actually are sensitive,
+    # i.e. reference of full_muphys and graupel_only differ significantly.
     MINI: Final = utils.MuphysExperiment(
         name="mini",
         type=utils.ExperimentType.FULL_MUPHYS,
         uri="https://polybox.ethz.ch/index.php/s/F8bK2C8tkpf8Xy2/download?files=mini.tar.gz",
     )
-    # Note: don't use the 'tiny' experiment from graupel_only,
-    # as it is not sensitive to saturation adjustment
-    # TODO(havogt): double-check that all other experiments actually are sensitive,
-    # i.e. reference of full_muphys and graupel_only differ significantly.
 
 
 @pytest.mark.uses_concat_where
@@ -58,9 +59,6 @@ def test_full_muphys(
     experiment: utils.MuphysExperiment,
     single_program: bool,
 ) -> None:
-    pytest.xfail(
-        "References and implementation needs to be checked, currently full_muphys is not verifying."
-    )
     assert experiment.type == utils.ExperimentType.FULL_MUPHYS
 
     if single_program:
@@ -78,9 +76,20 @@ def test_full_muphys(
         single_program=single_program,
     )
 
+    # We are passing the same buffers for `Q` as input and output. This is not best GT4Py practice,
+    # but save in this case as we are not reading the input with an offset.
     out = common.GraupelOutput.allocate(
         allocator=model_backends.get_allocator(backend_like),
         domain=gtx.domain({dims.CellDim: inp.ncells, dims.KDim: inp.nlev}),
+        references={
+            "qv": inp.qv,
+            "qc": inp.qc,
+            "qi": inp.qi,
+            "qr": inp.qr,
+            "qs": inp.qs,
+            "qg": inp.qg,
+            "t": inp.t,
+        },
     )
 
     muphys_program(
@@ -106,10 +115,10 @@ def test_full_muphys(
     rtol = 1e-14
     atol = 1e-16
 
-    np.testing.assert_allclose(ref.qv.asnumpy(), out.qv.asnumpy(), atol=atol, rtol=rtol)
-    np.testing.assert_allclose(ref.qc.asnumpy(), out.qc.asnumpy(), atol=atol, rtol=rtol)
-    np.testing.assert_allclose(ref.qi.asnumpy(), out.qi.asnumpy(), atol=atol, rtol=rtol)
-    np.testing.assert_allclose(ref.qr.asnumpy(), out.qr.asnumpy(), atol=atol, rtol=rtol)
-    np.testing.assert_allclose(ref.qs.asnumpy(), out.qs.asnumpy(), atol=atol, rtol=rtol)
-    np.testing.assert_allclose(ref.qg.asnumpy(), out.qg.asnumpy(), atol=atol, rtol=rtol)
-    np.testing.assert_allclose(ref.t.asnumpy(), out.t.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.qv.asnumpy(), out.qv.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.qc.asnumpy(), out.qc.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.qi.asnumpy(), out.qi.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.qr.asnumpy(), out.qr.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.qs.asnumpy(), out.qs.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.qg.asnumpy(), out.qg.asnumpy(), atol=atol, rtol=rtol)
+    test_utils.assert_dallclose(ref.t.asnumpy(), out.t.asnumpy(), atol=atol, rtol=rtol)

@@ -15,7 +15,7 @@ import gt4py.next.typing as gtx_typing
 from gt4py.next import backend as gtx_backend
 from gt4py.next.program_processors.runners.dace import transformations as gtx_transformations
 
-from icon4py.model.common import model_backends
+from icon4py.model.common import dimension as dims, model_backends
 
 
 log = logging.getLogger(__name__)
@@ -28,6 +28,7 @@ def dict_values_to_list(d: dict[str, Any]) -> dict[str, list]:
 def get_dace_options(
     program_name: str, **backend_descriptor: Any
 ) -> model_backends.BackendDescriptor:
+    is_rocm_device = backend_descriptor.get("device") == model_backends.DeviceType.ROCM
     optimization_args = backend_descriptor.get("optimization_args", {})
     optimization_hooks = optimization_args.get("optimization_hooks", {})
     if program_name in [
@@ -47,13 +48,37 @@ def get_dace_options(
             optimization_args["scan_loop_unrolling"] = True
         if "scan_loop_unrolling_factor" not in optimization_args:
             optimization_args["scan_loop_unrolling_factor"] = 0
+        if "blocking_dim" not in optimization_args:
+            optimization_args["blocking_dim"] = dims.KDim
+        if "blocking_size" not in optimization_args:
+            optimization_args["blocking_size"] = 4
+        if "promote_independent_memlets_for_blocking" not in optimization_args:
+            optimization_args["promote_independent_memlets_for_blocking"] = True
+        if "blocking_independent_node_threshold" not in optimization_args:
+            optimization_args["blocking_independent_node_threshold"] = 3
     # TODO(havogt): Eventually the option `use_zero_origin` should be removed and the default behavior should be `use_zero_origin=False`.
     # We keep it `True` for 'compute_rho_theta_pgrad_and_update_vn' as performance drops,
     # due to it falling into a less optimized code generation (on santis).
     if program_name == "compute_rho_theta_pgrad_and_update_vn":
         backend_descriptor["use_zero_origin"] = True
+    # TODO(AMD): For now disable problematic `hipMallocAsync` calls on each GT4Py Program call that have high runtime variability.
+    #            Needs to be fixed for realistic simulations due to increased memory footprint of persistent memory.
+    if backend_descriptor["device"] == model_backends.DeviceType.ROCM:
+        optimization_args["gpu_memory_pool"] = False
+        optimization_args["make_persistent"] = True
+        # AMD MI300A: ~7% speedup by fusing DaCe tasklet ops within map scopes.
+        optimization_args.setdefault("fuse_tasklets", True)
+        # AMD MI300A: skip gpu_maxnreg (causes 2.5x slowdown due to register
+        # spilling — occupancy is already maxed at 8 waves/SIMD).
+        optimization_args.setdefault("blocking_gpu_maxnreg", None)
+        # AMD MI300A: 256x1x1 blocks are 19% faster than 64x1x1 in synthetic
+        # benchmarks matching the solver's access pattern.
+        optimization_args.setdefault("blocking_gpu_block_size", (256, 1, 1))
     if program_name == "graupel_run":
-        backend_descriptor["use_zero_origin"] = True
+        optimization_args["fuse_tasklets"] = True
+        if not is_rocm_device:
+            optimization_args["gpu_maxnreg"] = 80
+            optimization_args["gpu_block_size_2d"] = (64, 6)
         optimization_args["gpu_memory_pool"] = False
         optimization_args["make_persistent"] = True
     if optimization_hooks:
@@ -99,7 +124,7 @@ def customize_backend(
     )
     backend_descriptor = get_options(program_name, **backend_descriptor)
     backend_descriptor["device"] = backend_descriptor.get(
-        "device", model_backends.DeviceType.CPU
+        "device", model_backends.CPU
     )  # set default device
     backend_factory = backend_descriptor.pop(
         "backend_factory", model_backends.make_custom_dace_backend
@@ -147,12 +172,12 @@ def setup_program(
     bound_static_args = {k: v for k, v in constant_args.items() if gtx.is_scalar_type(v)}
     static_args_program = program.with_backend(backend)
     if backend is not None:
+        static_args_program = static_args_program.with_compilation_options(enable_jit=False)
         static_args_program.compile(
             **dict_values_to_list(horizontal_sizes),
             **dict_values_to_list(vertical_sizes),
             **variants,
             **dict_values_to_list(bound_static_args),
-            enable_jit=False,
             offset_provider=offset_provider,
         )
 
