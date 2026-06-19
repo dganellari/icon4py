@@ -61,26 +61,33 @@ def get_dace_options(
         # AMD MI300A: per-program 2D thread block. The default (256,1,1) puts all
         # threads on the Cell dimension to maximize coalescing -- best for the
         # implicit solver and most cell-indexed kernels (~20% on the solver).
-        # A few edge/vertex-gather kernels have a scattered, K-invariant neighbor
-        # access pattern (e.g. field[E2C[edge], k+ikoffset]) and are instead faster
-        # with (32,8,1): a 64-lane wavefront then spans 2 adjacent K-levels of the
-        # same 32 edges, so the K-invariant connectivity + geometry (E2C index,
-        # normals, edge lengths, ...) is fetched once and reused across the K-pair
-        # instead of re-scattered per K-level. Measured per-program on MI300A
-        # (datatest-gated; full sweep in docs/THETARHO_32x8_RESULT.md):
-        #   compute_rho_theta_pgrad_and_update_vn:             -17.9%
-        #   compute_horizontal_velocity_quantities_and_fluxes: -11.6%
-        # Every other dycore program (incl. the solver) regresses with 32x8, so
-        # this is strictly per-program -- a global 32x8 would slow most of the
-        # dycore down. NB: 32x8 supersedes vertical loop blocking for these
-        # kernels; both restructure the K dimension and INTERFERE (32x8+VLB4
-        # regressed to ~-5%, worse than either alone), so 32x8 is used on its own.
-        if program_name in (
-            "compute_rho_theta_pgrad_and_update_vn",
-            "compute_horizontal_velocity_quantities_and_fluxes",
-        ):
-            optimization_args.setdefault("gpu_block_size_2d", (32, 8, 1))
-        optimization_args.setdefault("gpu_block_size_2d", (256, 1, 1))
+        # The heavy edge/vertex-gather kernels have a scattered, K-invariant neighbor
+        # access pattern (e.g. field[E2C[edge], k+ikoffset]) and are faster with a 2D
+        # block that groups several K-levels of the same edges, so the K-invariant
+        # connectivity + geometry (E2C index, normals, edge lengths, ...) is fetched
+        # once and reused across the K-group instead of re-scattered per K-level.
+        # The OPTIMAL shape differs per kernel -- measured per-program on REAL MI300A
+        # (gfx942, the `mi300` Slurm partition), datatest-gated, all shapes run back-
+        # to-back same-node (median gains vs the 256,1,1 default):
+        #   compute_rho_theta_pgrad_and_update_vn:             (32,8,1)   -10.0%
+        #   compute_horizontal_velocity_quantities_and_fluxes: (128,2,1)  -14.3%
+        #   compute_advection_in_horizontal_momentum:          (64,4,1)   -17.2%
+        #   compute_advection_in_corrector_vertical_momentum:  (128,2,1)  -12.5%
+        # (horizontal_momentum is measured with extra diffusion ON, the path the
+        # model always takes.) Every other dycore program (incl. the solver) regresses
+        # with these shapes, so this is strictly per-program -- a global non-default
+        # shape would slow most of the dycore down. NB: these shapes supersede vertical
+        # loop blocking for these kernels; both restructure the K dimension and
+        # INTERFERE, so the 2D block is used on its own.
+        _mi300a_block_2d = {
+            "compute_rho_theta_pgrad_and_update_vn": (32, 8, 1),
+            "compute_horizontal_velocity_quantities_and_fluxes": (128, 2, 1),
+            "compute_advection_in_horizontal_momentum": (64, 4, 1),
+            "compute_advection_in_corrector_vertical_momentum": (128, 2, 1),
+        }
+        optimization_args.setdefault(
+            "gpu_block_size_2d", _mi300a_block_2d.get(program_name, (256, 1, 1))
+        )
         # Setting a block size of (256,1,1) for 1D maps doesn't give a significant
         # speedup on MI300A but it doesn't hurt either
         optimization_args.setdefault("gpu_block_size_1d", (256, 1, 1))
