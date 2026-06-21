@@ -1,8 +1,37 @@
-# Thetarho 32×8 thread block — result and why it works
+# Thetarho / dycore 2D thread block — result and why it works
 
-**Date:** 2026-06-19 (beverin, MI300A). **Verdict: setting the 2D thread block to 32×8
-for `compute_rho_theta_pgrad_and_update_vn` gives a validated −17.9% — bigger than VLB4,
-and it already beats the colleague's current 256×1+VLB4 config.**
+## ⚠️ UPDATE 2026-06-21 — corrected to REAL MI300A, + block-SIZE win, + exner-AoS supersedes
+
+The original numbers below (−17.9% etc.) were later found to be measured on the beverin **LOGIN
+node = gfx90a (MI200), NOT MI300A** — they do not transfer. The *mechanism* (K-invariant reuse —
+why a K-grouping 2D block beats 256×1) is correct and arch-independent, but the magnitudes and the
+optimal blocks differ on real MI300A. Two further findings since: **block SIZE matters too** (a
+512-thread block holds more K-levels per block → more reuse), and for thetarho the **exner-AoS**
+optimization (−20%, validated, productionized — see `EXNER_AOS_OPTIMIZATION.md`) supersedes the
+block tuning.
+
+**Real MI300A (gfx942, `mi300` partition), datatest, back-to-back same-node — the committed
+`model_options.py` `_mi300a_block_2d` blocks (both SHAPE and SIZE tuned per program):**
+
+| kernel | committed block | 256-thr gain vs 256×1 | +512-thr gain |
+|---|---|---|---|
+| compute_rho_theta_pgrad_and_update_vn | **(32,16,1)** | −10% (32×8) | +6.5% (32×16); but exner-AoS −20% supersedes when `GT4PY_EXNER_AOS=1` |
+| compute_horizontal_velocity_quantities_and_fluxes | **(128,2,1)** | −14% | 512-thr only marginal |
+| compute_advection_in_horizontal_momentum (#8) | **(64,8,1)** | −17% (64×4) | +6.2% (64×8); prod path = extra-diff ON |
+| compute_advection_in_corrector_vertical_momentum (#7) | **(128,4,1)** | −12.5% (128×2) | +6.9% (128×4) |
+
+Corrections to the original write-up below: (1) #7/#8 (advection) do NOT regress — 32×8 hurts
+them, but their *own* optimal shapes (64×4 / 128×2, then 512-thread 64×8 / 128×4) are real wins;
+the old "only thetarho + hvel benefit" was incomplete. (2) 1024-thread blocks help #7 only
+marginally and HURT #8 → 512 is the sweet spot. (3) AoS was checked on #7/#8 and does NOT apply
+(single-field reductions, cache-friendly). The original (MI200) text is kept below for the
+mechanism explanation, which remains valid.
+
+---
+
+**Date:** 2026-06-19 (originally labeled MI300A — actually MI200, see update above). **Original
+verdict: setting the 2D thread block to 32×8 for `compute_rho_theta_pgrad_and_update_vn` gives
+−17.9% — bigger than VLB4, and it already beats the colleague's 256×1+VLB4 config.**
 
 Benchmark: stencil test `test_compute_theta_rho_face_values_and_pressure_gradient_and_update_vn`,
 variant `is_iau_active[False]-compile_time_domain`, 40 rounds × 10 iters, datatest-gated,

@@ -66,24 +66,25 @@ def get_dace_options(
         # block that groups several K-levels of the same edges, so the K-invariant
         # connectivity + geometry (E2C index, normals, edge lengths, ...) is fetched
         # once and reused across the K-group instead of re-scattered per K-level.
-        # The OPTIMAL shape differs per kernel -- measured per-program on REAL MI300A
-        # (gfx942, the `mi300` Slurm partition), datatest-gated, all shapes run back-
-        # to-back same-node (median gains vs the 256,1,1 default):
-        #   compute_rho_theta_pgrad_and_update_vn:             (32,8,1)   -10.0%
-        #   compute_horizontal_velocity_quantities_and_fluxes: (128,2,1)  -14.3%
-        #   compute_advection_in_horizontal_momentum:          (64,4,1)   -17.2%
-        #   compute_advection_in_corrector_vertical_momentum:  (128,2,1)  -12.5%
-        # (horizontal_momentum is measured with extra diffusion ON, the path the
-        # model always takes.) Every other dycore program (incl. the solver) regresses
-        # with these shapes, so this is strictly per-program -- a global non-default
-        # shape would slow most of the dycore down. NB: these shapes supersede vertical
-        # loop blocking for these kernels; both restructure the K dimension and
-        # INTERFERE, so the 2D block is used on its own.
+        # Both the SHAPE and the SIZE matter: a 512-thread 2D block (more K-levels per
+        # block) reuses the K-invariant data across MORE K-levels than a 256-thread one
+        # and wins a further ~6-7% on the gather-heavy kernels. Measured per-program on
+        # REAL MI300A (gfx942, the `mi300` Slurm partition), datatest-gated, back-to-back
+        # same-node. Each kernel's optimal block, and the 256-thread shape it supersedes:
+        #   compute_rho_theta_pgrad_and_update_vn:             (32,16,1)  512-thr, -6.5% over 32x8
+        #   compute_horizontal_velocity_quantities_and_fluxes: (128,2,1)  256-thr (512-thr only marginal)
+        #   compute_advection_in_horizontal_momentum:          (64,8,1)   512-thr, -6.2% over 64x4 (prod path, extra-diff ON)
+        #   compute_advection_in_corrector_vertical_momentum:  (128,4,1)  512-thr, -6.9% over 128x2
+        # The 256-thread shapes already beat 256x1 by -10..-17%; the 512-thread size adds
+        # ~6-7% on top for thetarho/#7/#8 (1024-thr helps only #7 marginally, hurts #8).
+        # Every other dycore program (incl. the solver) regresses with these blocks, so
+        # this is strictly per-program. NB: supersedes vertical loop blocking (both
+        # restructure K and INTERFERE), so the 2D block is used on its own.
         _mi300a_block_2d = {
-            "compute_rho_theta_pgrad_and_update_vn": (32, 8, 1),
+            "compute_rho_theta_pgrad_and_update_vn": (32, 16, 1),
             "compute_horizontal_velocity_quantities_and_fluxes": (128, 2, 1),
-            "compute_advection_in_horizontal_momentum": (64, 4, 1),
-            "compute_advection_in_corrector_vertical_momentum": (128, 2, 1),
+            "compute_advection_in_horizontal_momentum": (64, 8, 1),
+            "compute_advection_in_corrector_vertical_momentum": (128, 4, 1),
         }
         optimization_args.setdefault(
             "gpu_block_size_2d", _mi300a_block_2d.get(program_name, (256, 1, 1))
