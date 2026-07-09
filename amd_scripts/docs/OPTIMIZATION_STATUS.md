@@ -1,14 +1,19 @@
 # MI300A dycore optimization — status: what worked, what didn't
 
-**Updated: 2026-07-04.** Consolidated status of the AMD MI300A dycore optimization effort.
-Supersedes the scattered per-topic docs for a top-level view. All numbers are measured on the
+**Updated: 2026-07-09.** Consolidated status of the AMD MI300A dycore optimization effort.
+Supersedes the scattered per-topic docs for a top-level view. Numbers are measured on the
 `mi300` Slurm partition (gfx942 = MI300A), `icon_benchmark_regional` grid, same-job/same-node
 A/B, correctness-validated. See [HARDWARE_REFERENCE](HARDWARE_REFERENCE.md) and
-[CLUSTER_NODE_VARIANCE](CLUSTER_NODE_VARIANCE.md) for the ~3% node variance caveat.
+[CLUSTER_NODE_VARIANCE](CLUSTER_NODE_VARIANCE.md) for the run-to-run variance caveat.
 
-> **TL;DR:** two optimizations landed and are committed. Everything else tried on the heavy
-> dycore kernels measured net-negative or marginal on MI300A — the heavy kernels are at their
-> memory floor beyond these two.
+> **TL;DR (read this first):** at the **isolated-kernel** (stencil-test) level the wins are real —
+> **−10…−17%** from the block config and **−14.3%** from the exner-AoS. But at the **full
+> `solve_nonhydro` step** these dilute to **~−2% (inside the run-to-run noise)**, and the exner-AoS
+> **does not even apply to the full-model codegen** (fails closed → no effect). So: **keep the
+> block config** (real, free, per-kernel gains that just form a small fraction of the step);
+> **treat the exner-AoS as a validated proof-of-concept, not a shipped model win.** Everything else
+> tried was net-negative or marginal — the heavy kernels are at their HBM bandwidth floor. The
+> full-model measurement is in [§ Isolated kernel vs full model](#-isolated-kernel-vs-full-model--the-measured-dilution-2026-07-09).
 
 ---
 
@@ -35,7 +40,17 @@ kernels; a global flip regresses the solver ~+10% and divdamp ~+23%). Do **not**
 vertical loop blocking (both restructure K → interfere). Detail: [THETARHO_32x8_RESULT](THETARHO_32x8_RESULT.md).
 
 ### 2. exner-AoS in-kernel packing (thetarho)
-**Repo:** gt4py fork `extend_loopblocking` (in the sandbox as `gt4py_claude`) — commit `d53089f`.
+**Repo:** gt4py fork `extend_loopblocking` (sandbox: `gt4py_claude`; your fork: `dganellari/gt4py`) — commit `d53089f`.
+**Code (both files in `src/gt4py/next/program_processors/runners/dace/workflow/`):**
+- **`exner_aos.py`** — the transform. `apply_exner_aos()` does the whole thing: the `aos[i*3+f]`
+  interleaved layout, the coalesced `__repack_exner_aos_kernel` it injects, the `_READ_RE` regex
+  that redirects the 18 terrain reads, `_N_REGIONAL` (the hardcoded Cell·K), and the self-check
+  (`tot`) that returns `False` → no patch if anything doesn't match.
+- **`compilation.py`** — the pipeline hook (search `EXNER_AOS`). After `sdfg.compile()`: if
+  `GT4PY_EXNER_AOS=1` and `sdfg.name == exner_aos.PROGRAM`, it calls `apply_exner_aos(build_folder)`
+  then `dace.codegen.compiler.configure_and_compile` + `load_precompiled_sdfg` to recompile and
+  reload the patched `.so`.
+
 **Enable:** opt-in via `GT4PY_EXNER_AOS=1`. **Result: −14.3%** (1.266 → 1.085 ms), correctness-passing.
 
 thetarho's dominant cost is the doubly-indirect terrain gather of three separate cell fields
@@ -49,9 +64,66 @@ is **hardcoded to the regional grid** (auto-deriving it from the SDFG proved unr
 which is why it's opt-in, not default-on. Detail: `EXNER_AOS_OPTIMIZATION.md` (in the gt4py/sandbox
 docs).
 
+> **⚠️ Does NOT apply to the full model (measured 2026-07-09).** In the full `solve_nonhydro`
+> compile, thetarho's terrain-read expression differs from the isolated stencil test, so the
+> read-redirect regex matches **0 of 18 reads** → the transform fails closed (`MISMATCH`,
+> `reads:0`) → **no patch is applied, zero effect in a real run**. The −14.3% above is an
+> **isolated-stencil-only** result. Treat this as a validated *mechanism*, not a shipped feature;
+> a production version needs a proper SDFG/frontend transform (or a codegen-robust matcher). See
+> [§ Isolated kernel vs full model](#-isolated-kernel-vs-full-model--the-measured-dilution-2026-07-09).
+
 > **Overlap note:** exner-AoS and thetarho's 32×16 block attack the *same* gather. When
 > `GT4PY_EXNER_AOS=1` the exner-AoS dominates; 32×16 is the best block when it's off. They are not
 > additive.
+
+---
+
+## ⚠️ Isolated kernel vs full model — the measured dilution (2026-07-09)
+
+Everything in "Landed" above is an **isolated stencil-test** number: one gt4py program compiled and
+benchmarked alone. A full-model A/B on the complete `solve_nonhydro` dycore step (the integration
+benchmark `test_benchmark_solve_nonhydro`) shows how much of that survives into a real run.
+
+**Full `solve_nonhydro` step — same node, 1300+ rounds, `pytest-benchmark`:**
+
+| config | median | IQR | StdDev |
+|---|---|---|---|
+| baseline — `256×1` all kernels, `GT4PY_EXNER_AOS=0` | **8.223 ms** | 0.40 | 2.94 |
+| optimized — per-program blocks + `GT4PY_EXNER_AOS=1` | **8.066 ms** | 0.41 | 2.94 |
+| **Δ** | **−1.9%** | | |
+
+Two effects, both important:
+
+1. **The kernel gains dilute.** The four block-tuned kernels are only a *slice* of the step; the
+   **vertically-implicit solver dominates the step and is unchanged** (256×1 in both configs). So
+   −10…−17% on that slice → **~−2% on the whole step**. And the step carries **~36% run-to-run
+   variance** (StdDev 2.94 ms on an 8 ms median — the `hipMalloc`-per-program-call jitter noted in
+   `model_options.py`), so **−1.9% is barely above the noise**.
+
+2. **The exner-AoS does not apply at all.** The full-model thetarho compile emits a different
+   terrain-read expression than the isolated stencil, so the transform's read-redirect matched
+   **0 of 18 reads** and failed closed (`[exner_aos] … MISMATCH … reads:0`). No patch → the −14.3%
+   contributes **nothing** to the full run.
+
+**Per-kernel: what is genuinely real vs what dilutes**
+
+| kernel | isolated gain | in the full `solve_nonhydro` step |
+|---|---|---|
+| thetarho | −10% (block) / −14.3% (exner) | block: real but diluted; **exner-AoS did not apply** |
+| hvel | −14% (block) | real, diluted |
+| #8 hmom | −17% (block) | real, diluted |
+| #7 vmom | −12.5% (block) | real, diluted |
+| solver (biggest kernel) | 256×1 = −20.8% vs the 32×8 default | **global default — identical in both A/B configs, so not part of the Δ** |
+
+**How to read this for ICON:** the block config is a genuine, free per-kernel win — it just lands on
+a small fraction of a step the solver dominates, so the *step-level* number is ~2% and noise-limited.
+The exner-AoS is a **demonstrated mechanism that does not survive into production codegen** as
+implemented. To show the per-kernel gains *inside* the full run (instead of the noisy step total),
+use the per-program GT4Py timer: `benchmark_dycore.sh` emits `dycore_gt4py_program_metrics.json`
+(`DYCORE_GT4PY_PROGRAMS_TIMER_FILE`), printed via `amd_scripts/print_gt4py_timers.py`.
+
+**Reproduce:** `amd_scripts/model_ab.sh` (baseline vs optimized full-step A/B; toggles
+`ICON4PY_BLOCK2D=256x1` + `GT4PY_EXNER_AOS`).
 
 ---
 
