@@ -1,0 +1,13 @@
+diff --git a/src/gt4py/next/iterator/ir_utils/domain_utils.py b/src/gt4py/next/iterator/ir_utils/domain_utils.py
+index 6bd28f6d..bad2fe98 100644
+--- a/src/gt4py/next/iterator/ir_utils/domain_utils.py
++++ b/src/gt4py/next/iterator/ir_utils/domain_utils.py
+@@ -118,7 +118,7 @@ def _unstructured_translate_range_statically(
+             UserWarning(
+                 f"Translating '{expr}' using '{tag}' requires "
+                 f"computations on many additional points "
+-                f"({round((1 - fraction_accessed) * 100)}%) in order to get a contiguous "
++                f"({round(float((1 - fraction_accessed) * 100))}%) in order to get a contiguous "
+                 f"domain. Please consider reordering your mesh."
+             ),
+             stacklevel=2,

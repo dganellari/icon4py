@@ -1,0 +1,7 @@
+{
+  "original": "/capstor/scratch/cscs/gandanie/mi300_opt/gt4py/src/gt4py",
+  "overlay": "/capstor/scratch/cscs/gandanie/mi300_opt/icon4py/amd_scripts/theta_shared_timing_runs/amd_639200/compiler_overlay/gt4py",
+  "module": "next/program_processors/runners/dace/transformations/map_fusion_extended.py",
+  "original_sha256": "638f0b16ef5db02ed9949648957758d7d2c75a832ecfb66e277a1634efc8260f",
+  "patched_sha256": "b5ef3127f994ed9d07550cc4445313bafcb5ef68545afb4077e2a5c7947c0c1e"
+}

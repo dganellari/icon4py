@@ -1,0 +1,68 @@
+{
+  "graphs": {
+    "native": {
+      "gtir_tmp_27": {
+        "shape": [
+          "Max(0, horizontal_end - horizontal_start)",
+          "Max(0, vertical_end - vertical_start)"
+        ],
+        "storage": "StorageType.Default"
+      },
+      "gtir_tmp_38": {
+        "shape": [
+          "Max(0, horizontal_end - horizontal_start)",
+          "Max(0, vertical_end - vertical_start)"
+        ],
+        "storage": "StorageType.Default"
+      },
+      "gtir_tmp_47": {
+        "shape": [
+          "Max(0, horizontal_end - horizontal_start)",
+          "Max(0, vertical_end - vertical_start)"
+        ],
+        "storage": "StorageType.Default"
+      },
+      "gtir_tmp_55": {
+        "shape": [
+          "Max(0, horizontal_end - horizontal_start)",
+          "Max(0, vertical_end - vertical_start)"
+        ],
+        "storage": "StorageType.Default"
+      }
+    },
+    "fused": {}
+  },
+  "comparisons": [
+    {
+      "seed": 41,
+      "field": "z_q",
+      "max_abs_error": 0.0
+    },
+    {
+      "seed": 41,
+      "field": "w",
+      "max_abs_error": 0.0
+    },
+    {
+      "seed": 42,
+      "field": "z_q",
+      "max_abs_error": 0.0
+    },
+    {
+      "seed": 42,
+      "field": "w",
+      "max_abs_error": 0.0
+    },
+    {
+      "seed": 43,
+      "field": "z_q",
+      "max_abs_error": 0.0
+    },
+    {
+      "seed": 43,
+      "field": "w",
+      "max_abs_error": 0.0
+    }
+  ],
+  "status": "passed"
+}

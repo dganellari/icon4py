@@ -1,0 +1,2 @@
+# Preserve compiler-generated source fixtures byte for byte.
+fixtures/*.cpp -whitespace

@@ -1,0 +1,69 @@
+{
+  "verified_local_source_files": 16,
+  "comparisons": {
+    "compiler_vs_native": {
+      "granule_device": {
+        "raw_saved_ms": 0.11740033333333326,
+        "control_mean_ms": -0.00905125000000003,
+        "conservative_control_floor_ms": 0.04230935995285792,
+        "exceeds_control_floor": true,
+        "adjusted_ci95_ms": [
+          0.10605412540054909,
+          0.14684904126611747
+        ]
+      },
+      "theta_device": {
+        "raw_saved_ms": 0.12495147916666664,
+        "control_mean_ms": -0.002255145833333324,
+        "conservative_control_floor_ms": 0.012081459258053364,
+        "exceeds_control_floor": true,
+        "adjusted_ci95_ms": [
+          0.1224107881016969,
+          0.13200246189830303
+        ]
+      },
+      "granule_wall": {
+        "raw_saved_ms": 0.08177808333333347,
+        "control_mean_ms": -0.004973541666666821,
+        "conservative_control_floor_ms": 0.04238599989179512,
+        "exceeds_control_floor": true,
+        "adjusted_ci95_ms": [
+          0.06182658057881424,
+          0.11167666942118634
+        ]
+      }
+    },
+    "compiler_vs_python": {
+      "granule_device": {
+        "raw_saved_ms": 0.045675854166666786,
+        "control_mean_ms": -0.011276541666666843,
+        "conservative_control_floor_ms": 0.05391380058730092,
+        "exceeds_control_floor": false,
+        "adjusted_ci95_ms": [
+          0.03785941618376433,
+          0.07604537548290294
+        ]
+      },
+      "theta_device": {
+        "raw_saved_ms": 0.03767856249999999,
+        "control_mean_ms": -0.0019567916666666705,
+        "conservative_control_floor_ms": 0.015519198095054976,
+        "exceeds_control_floor": true,
+        "adjusted_ci95_ms": [
+          0.035355196547816575,
+          0.04391551178551675
+        ]
+      },
+      "granule_wall": {
+        "raw_saved_ms": 0.048862125000000235,
+        "control_mean_ms": -0.006125770833333544,
+        "conservative_control_floor_ms": 0.043871370681924364,
+        "exceeds_control_floor": true,
+        "adjusted_ci95_ms": [
+          0.03460457295364521,
+          0.07537121871302235
+        ]
+      }
+    }
+  }
+}

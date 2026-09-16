@@ -1,0 +1,20 @@
+{
+  "module": "next/program_processors/runners/dace/transformations/map_fusion_extended.py",
+  "accepted_installed_sha256": [
+    "638f0b16ef5db02ed9949648957758d7d2c75a832ecfb66e277a1634efc8260f",
+    "b5ef3127f994ed9d07550cc4445313bafcb5ef68545afb4077e2a5c7947c0c1e"
+  ],
+  "patched_sha256": "b5ef3127f994ed9d07550cc4445313bafcb5ef68545afb4077e2a5c7947c0c1e",
+  "domain_utils_sha256": "e397cd7ef4aa5d2499485211e34279f2e50557a5b428a2ee27a73defe37f5f0b",
+  "source_harness_sha256": {
+    "dycore_causal_core.py": "313df7fe9c623b16e8d429fcdf64f91a184ac560e09d58b2901c6d8cfcb78a5c",
+    "dycore_causal_plugin.py": "c774fcc9f0416c606a60cad65673168fcd2272558459e687420c9de942136626",
+    "run_dycore_causal.py": "b79d61e961fe3e48ef63142171f1ca07fd25cf884019db4e1c898cd56c0c75e3",
+    "analyze_dycore_causal.py": "e0d352b286fcabca583d1a48eef3d800d337887a03d0ed383d61d7e4feef88b9",
+    "amd_cache_counters.py": "7716636ed834d2920e93639ca057b28b3578393f44ac21e7787774a1aac83f62",
+    "analyze_cache_comparison.py": "7cbf6dfc68a9e575a89278f52777a6c28ce27450573058ef483125f0040fdcd8",
+    "dycore_profile_window.py": "909e39778b2086b21d7117d18e0e328a564b763e4c2749d905632a269934fb67",
+    "causal_cmake.py": "c9fb5cfd6cc0b60dd8f586576572cc8efd30b6470f8d44893ebeaba568bf6d1b",
+    "collect_dycore_profile_metadata.py": "bf811ced06e9c10d792c4842c339a67a7a8ba631c7a23fa4f97e74e0b392308b"
+  }
+}

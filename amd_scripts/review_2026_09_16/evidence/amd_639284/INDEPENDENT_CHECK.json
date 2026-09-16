@@ -1,0 +1,38 @@
+{
+  "granule_device": {
+    "saved_ms": 0.1812916666666667,
+    "adjusted_ci95_ms": [
+      0.16783583086918935,
+      0.2206831274641443
+    ],
+    "conservative_control_floor_ms": 0.07383817070201867,
+    "clears_control_floor": true
+  },
+  "solvers_device": {
+    "saved_ms": 0.16544499999999993,
+    "adjusted_ci95_ms": [
+      0.15449944312460168,
+      0.1807244318753981
+    ],
+    "conservative_control_floor_ms": 0.03126312879411704,
+    "clears_control_floor": true
+  },
+  "theta_device": {
+    "saved_ms": 0.0017653958333333126,
+    "adjusted_ci95_ms": [
+      -0.0004523593501947337,
+      0.010273609350194774
+    ],
+    "conservative_control_floor_ms": 0.017598712025414135,
+    "clears_control_floor": false
+  },
+  "granule_wall": {
+    "saved_ms": 0.19296304166666664,
+    "adjusted_ci95_ms": [
+      0.17053592210108937,
+      0.24173607789891038
+    ],
+    "conservative_control_floor_ms": 0.08673898665972597,
+    "clears_control_floor": true
+  }
+}

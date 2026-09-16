@@ -1,0 +1,5 @@
+{
+  "source": "model/atmosphere/dycore/src/icon4py/model/atmosphere/dycore/stencils/solve_tridiagonal_matrix_for_w_forward_sweep.py",
+  "original_sha256": "ea7974ece6278c00a181cd795474b98700091a2ac0724346f5f0c91f8aac65e6",
+  "change": "Move a,b,c,d coefficient arithmetic into forward scan, preserving casts and operation order."
+}
