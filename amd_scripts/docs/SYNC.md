@@ -24,6 +24,11 @@ this is a pointer, not a place to reason.
 
 ---
 
+## 2026-09-16  Codex — one runnable, focused optimisation branch
+Created `dycore-optimizations` from upstream main in `/Users/gandanie/scratch/santis/review/icon4py-optimizations/`: 10 changed files covering solver code/tests, GT4Py transformation+tests as a compact patch, dycore analysis and small replay launchers. `fork` points to dganellari/icon4py; nothing pushed. Original experiment checkouts preserved; extra temporary branch names removed without discarding their worktrees.
+Replay runs directly from the new branch and stages experiment commit `cdc034acb` privately for theta, solver-increment or combined timing; both branches must be available to fetch. Pinned GPU environments/input data are required. Combined ~5.34% is still an estimate. The current-main solver port passes six isolated double-precision CPU comparisons, but GPU validation/timing and full local pytest collection remain pending (Serialbox missing; mixed precision fails in an unchanged scan annotation). GT4Py: 22 focused tests/pre-commit passed; launcher: four local safety tests passed.
+Supersedes: using all of `mi300_opt` as the optimisation PR, separate branches per optimisation, or requiring a branch switch to launch reproduction. No cluster transfer/submission; prior transfer blockers unresolved.
+
 ## 2026-09-16  Codex — direct combined benefit, both GPUs
 Prepared isolated `amd_scripts/combined_fusion/`: A is original theta and both original solvers; B enables compiler theta fusion plus both solver scans. Regional/120, 12 paired quartets and interleaved A/A controls, numerical/source/generated-code checks; retains each vendor's native launch settings. No counters or changes to measured source snapshots.
 Recipes: Beverin `sbatch amd_scripts/combined_fusion/run_amd.sh`; Santis `sbatch amd_scripts/combined_fusion/run_nvidia.sh`. Results under `amd_scripts/combined_fusion_runs/{amd,nvidia}_<job>/`. User submits jobs; do not change their source trees while running. Combined saving and GH200 validation remain pending.
