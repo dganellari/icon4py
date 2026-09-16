@@ -24,6 +24,11 @@ this is a pointer, not a place to reason.
 
 ---
 
+## 2026-09-16  Codex — explain the 48% and expose the GT4Py change
+Expanded `dycore-optimizations`' analysis with exact timing methodology, a recomputed 1.8577545 ms program-gap breakdown, matched-scope cache evidence, traffic/latency limits and the earlier measured 9.23% Python-fusion vendor-gap closure (distinct from the new compiler/solver gains). No new performance claims or code changes.
+GT4Py now has local branch `dycore-shared-output-fusion`, commit `857e718d`, in `review/gt4py-fusion/`: only transformation and regression tests, identical to the Icon4Py review patch. Added GT4Py `fork` remote dganellari/gt4py. Nothing pushed. This extra branch is in the separate compiler repository; Icon4Py still has just `mi300_opt` and `dycore-optimizations`.
+Supersedes: the review analysis's abbreviated treatment of the 48% gap and GT4Py being available only as a patch. Measurement results and reproduction recipes are unchanged.
+
 ## 2026-09-16  Codex — one runnable, focused optimisation branch
 Created `dycore-optimizations` from upstream main in `/Users/gandanie/scratch/santis/review/icon4py-optimizations/`: 10 changed files covering solver code/tests, GT4Py transformation+tests as a compact patch, dycore analysis and small replay launchers. `fork` points to dganellari/icon4py; nothing pushed. Original experiment checkouts preserved; extra temporary branch names removed without discarding their worktrees.
 Replay runs directly from the new branch and stages experiment commit `cdc034acb` privately for theta, solver-increment or combined timing; both branches must be available to fetch. Pinned GPU environments/input data are required. Combined ~5.34% is still an estimate. The current-main solver port passes six isolated double-precision CPU comparisons, but GPU validation/timing and full local pytest collection remain pending (Serialbox missing; mixed precision fails in an unchanged scan annotation). GT4Py: 22 focused tests/pre-commit passed; launcher: four local safety tests passed.
