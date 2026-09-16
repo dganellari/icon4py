@@ -24,6 +24,11 @@ this is a pointer, not a place to reason.
 
 ---
 
+## 2026-09-16  Codex — direct combined benefit, both GPUs
+Prepared isolated `amd_scripts/combined_fusion/`: A is original theta and both original solvers; B enables compiler theta fusion plus both solver scans. Regional/120, 12 paired quartets and interleaved A/A controls, numerical/source/generated-code checks; retains each vendor's native launch settings. No counters or changes to measured source snapshots.
+Recipes: Beverin `sbatch amd_scripts/combined_fusion/run_amd.sh`; Santis `sbatch amd_scripts/combined_fusion/run_nvidia.sh`. Results under `amd_scripts/combined_fusion_runs/{amd,nvidia}_<job>/`. User submits jobs; do not change their source trees while running. Combined saving and GH200 validation remain pending.
+Supersedes: using the cross-node ~5.34% estimate as a substitute for a direct combined measurement. Earlier 2.13% theta and 3.28% incremental solver results are unchanged.
+
 ## 2026-09-16  Codex — review package on the September branch
 Prepared `amd_scripts/review_2026_09_16/`: plain-language story/code guide, four focused patches (levels, GPU scalar conversion, GT4Py fusion + tests, solver candidate), pinned revisions and compressed original evidence for jobs 639200/639284. Offline `verify_evidence.py` reconstructs statistics and checks artifact/source hashes. Measured source snapshots stay unchanged; readable solver copy is AST-identical.
 Updated `DYCORE_GRANULE_ANALYSIS.md` to the actual completed results, preserving its September 11 text in an explicitly historical file. Next step is code review, then original-versus-combined timing on AMD/GH200; no new job is submitted and no production optimisation is enabled.
